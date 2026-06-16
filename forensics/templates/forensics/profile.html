@@ -1,0 +1,76 @@
+{% extends "forensics/base.html" %}
+
+{% block title %}Profile · Goggles{% endblock %}
+
+{% block breadcrumb %}
+  <svg class="icon" aria-hidden="true"><use href="#i-chevron-right"/></svg>
+  <span class="crumb is-current">Profile</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Account</p>
+    <h1>Profile</h1>
+  </div>
+</section>
+
+<section class="card profile-card">
+  <header class="card__header">
+    <span class="card__title">Account</span>
+  </header>
+  <div class="card__body">
+    <div class="field">
+      <label>Username</label>
+      <p class="profile-readonly">{{ request.user.username }}</p>
+      <p class="field-hint">Your username can't be changed here.</p>
+    </div>
+  </div>
+</section>
+
+<section class="card profile-card">
+  <header class="card__header">
+    <span class="card__title">Change password</span>
+  </header>
+  <form method="post" class="card__body profile-form" autocomplete="off">
+    {% csrf_token %}
+    {% if form.non_field_errors %}
+      <div class="form-error">{{ form.non_field_errors.0 }}</div>
+    {% endif %}
+
+    <div class="field">
+      <label for="{{ form.old_password.id_for_label }}">Current password</label>
+      <input class="input" type="password" name="{{ form.old_password.html_name }}"
+             id="{{ form.old_password.id_for_label }}" autocomplete="current-password" required>
+      {% if form.old_password.errors %}
+        <p class="field-error">{{ form.old_password.errors.0 }}</p>
+      {% endif %}
+    </div>
+
+    <div class="field">
+      <label for="{{ form.new_password1.id_for_label }}">New password</label>
+      <input class="input" type="password" name="{{ form.new_password1.html_name }}"
+             id="{{ form.new_password1.id_for_label }}" autocomplete="new-password" required>
+      {% if form.new_password1.errors %}
+        <p class="field-error">{{ form.new_password1.errors.0 }}</p>
+      {% endif %}
+      {% if form.new_password1.help_text %}
+        <div class="field-hint">{{ form.new_password1.help_text|safe }}</div>
+      {% endif %}
+    </div>
+
+    <div class="field">
+      <label for="{{ form.new_password2.id_for_label }}">Confirm new password</label>
+      <input class="input" type="password" name="{{ form.new_password2.html_name }}"
+             id="{{ form.new_password2.id_for_label }}" autocomplete="new-password" required>
+      {% if form.new_password2.errors %}
+        <p class="field-error">{{ form.new_password2.errors.0 }}</p>
+      {% endif %}
+    </div>
+
+    <div class="profile-form__actions">
+      <button type="submit" class="btn btn--primary">Update password</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

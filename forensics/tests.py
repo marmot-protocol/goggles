@@ -1598,3 +1598,88 @@ class GroupDetailTimelineViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 12)
+
+
+class ProfileTests(TestCase):
+    OLD_PASSWORD = "correct horse battery staple"
+    NEW_PASSWORD = "n3w-passphrase-galaxy"
+
+    def make_user(self):
+        return User.objects.create_user(username="analyst", password=self.OLD_PASSWORD)
+
+    def test_profile_requires_login(self):
+        response = self.client.get(reverse("profile"))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+
+    def test_profile_shows_username_and_password_form(self):
+        self.make_user()
+        self.client.login(username="analyst", password=self.OLD_PASSWORD)
+
+        response = self.client.get(reverse("profile"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "analyst")
+        self.assertContains(response, 'name="old_password"')
+        self.assertContains(response, 'name="new_password1"')
+        self.assertContains(response, 'name="new_password2"')
+        # Username must not be editable from this page.
+        self.assertNotContains(response, 'name="username"')
+
+    def test_user_can_change_their_own_password(self):
+        user = self.make_user()
+        self.client.login(username="analyst", password=self.OLD_PASSWORD)
+
+        response = self.client.post(
+            reverse("profile"),
+            data={
+                "old_password": self.OLD_PASSWORD,
+                "new_password1": self.NEW_PASSWORD,
+                "new_password2": self.NEW_PASSWORD,
+            },
+            follow=True,
+        )
+
+        self.assertRedirects(response, reverse("profile"))
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(self.NEW_PASSWORD))
+        # The change keeps the current session authenticated.
+        self.assertEqual(int(self.client.session["_auth_user_id"]), user.pk)
+        # The redirect target surfaces a success banner.
+        self.assertContains(response, "message--success")
+        self.assertContains(response, "Your password has been updated.")
+
+    def test_wrong_current_password_is_rejected(self):
+        user = self.make_user()
+        self.client.login(username="analyst", password=self.OLD_PASSWORD)
+
+        response = self.client.post(
+            reverse("profile"),
+            data={
+                "old_password": "not the password",
+                "new_password1": self.NEW_PASSWORD,
+                "new_password2": self.NEW_PASSWORD,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(self.OLD_PASSWORD))
+
+    def test_profile_does_not_change_username(self):
+        user = self.make_user()
+        self.client.login(username="analyst", password=self.OLD_PASSWORD)
+
+        self.client.post(
+            reverse("profile"),
+            data={
+                "username": "renamed",
+                "old_password": self.OLD_PASSWORD,
+                "new_password1": self.NEW_PASSWORD,
+                "new_password2": self.NEW_PASSWORD,
+            },
+        )
+
+        user.refresh_from_db()
+        self.assertEqual(user.username, "analyst")

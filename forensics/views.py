@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig
 from django.db.models import Count, Q
 from django.http import HttpRequest, JsonResponse
-from django.shortcuts import get_object_or_404, render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
@@ -105,6 +108,27 @@ def audit_file_detail(request: HttpRequest, pk: int):
             "groups": groups_for_audit_file(audit_file),
         },
     )
+
+
+@login_required
+def profile(request: HttpRequest):
+    """Let a signed-in user change their own password.
+
+    Usernames are intentionally not editable here: the form only ever touches
+    the password of ``request.user``, so a user can never modify another
+    account or rename their own.
+    """
+    if request.method == "POST":
+        form = PasswordChangeForm(request.user, request.POST)
+        if form.is_valid():
+            user = form.save()
+            # Keep the current session authenticated after the hash rotates.
+            update_session_auth_hash(request, user)
+            messages.success(request, "Your password has been updated.")
+            return redirect("profile")
+    else:
+        form = PasswordChangeForm(request.user)
+    return render(request, "forensics/profile.html", {"form": form})
 
 
 @csrf_exempt
