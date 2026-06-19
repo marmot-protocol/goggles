@@ -366,6 +366,47 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(bad_event.raw_line, "{not-json}")
         self.assertIn("JSON", bad_event.validation_error)
 
+    def test_deeply_nested_json_line_is_quarantined_not_500(self):
+        # A single deeply-nested JSON line makes json.loads recurse until it
+        # raises RecursionError (a RuntimeError subclass, not a JSONDecodeError).
+        # Unfixed, that exception escapes parse_jsonl()/ingest_audit_log_bytes()
+        # and the view, 500ing the request *before* any AuditFile is created --
+        # so the raw evidence is lost. It must instead be treated like any other
+        # malformed JSON: a 400 with a saved, quarantined AuditFile that
+        # preserves the raw upload and the offending raw line. Regression for
+        # marmot-protocol/goggles#24.
+        #
+        # The nesting depth here is chosen to exceed CPython's recursion limit
+        # in the C json scanner (which tolerates a few thousand levels), so the
+        # test genuinely reproduces the RecursionError escape on the unfixed
+        # parser rather than merely hitting the "not a JSON object" path.
+        raw_token, _token = UploadToken.issue("ios test client")
+        deep_line = "[" * 100000 + "]" * 100000
+        bad_body = representative_audit_log() + deep_line + "\n"
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=bad_body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("line 3", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, "invalid")
+        # Raw upload text is preserved intact, not lost.
+        self.assertEqual(audit_file.raw_text, bad_body)
+        self.assertIn("line 3", audit_file.validation_error)
+        self.assertEqual(audit_file.events.count(), 3)
+        bad_event = audit_file.events.get(line_number=3)
+        self.assertEqual(bad_event.parse_status, "invalid")
+        # The offending raw line is preserved verbatim as evidence.
+        self.assertEqual(bad_event.raw_line, deep_line)
+        self.assertIn("invalid JSON", bad_event.validation_error)
+
     def test_overlong_normalized_value_returns_400_and_is_quarantined(self):
         raw_token, _token = UploadToken.issue("ios test client")
         body = jsonl(
