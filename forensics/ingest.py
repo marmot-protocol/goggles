@@ -118,28 +118,6 @@ def iter_jsonl_record_lines(raw_text: str) -> Iterator[str]:
         yield raw_line
 
 
-def first_group_ref_from_audit_log_bytes(dump_bytes: bytes) -> str | None:
-    try:
-        raw_text = dump_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-    for raw_line in iter_jsonl_record_lines(raw_text):
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        try:
-            loaded = loads_audit_json(raw_line)
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(loaded, dict):
-            continue
-        group_ref = loaded.get("group_ref")
-        if is_hex(group_ref, even=True):
-            return group_ref
-    return None
-
-
 def ingest_audit_log_bytes(
     *,
     dump_bytes: bytes,
