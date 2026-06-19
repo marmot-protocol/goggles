@@ -13,6 +13,7 @@ from .analysis import (
     audit_files_for_group,
     display_group_ref,
     group_list_rows,
+    human_action_groups_for_group,
     timeline_payload_for_group,
     valid_events_for_group,
 )
@@ -1019,6 +1020,122 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(event.event_type, "future_transport_detail")
         self.assertEqual(event.human_action_action, "update_group_profile")
         self.assertEqual(event.raw_kind["shape"], "new")
+
+
+class HumanActionGroupingTests(TestCase):
+    """Regression coverage for goggles#30.
+
+    Human-action events that share no operation_id must NOT be merged solely on
+    action type; each operation_id-less action should be its own group.
+    """
+
+    def _human_action(self, action="send_message"):
+        return {
+            "action": action,
+            "origin": "local_user",
+            "fields": ["body"],
+            "component_ids": [32769],
+        }
+
+    def test_same_type_actions_without_operation_id_are_distinct_groups(self):
+        # Two send_message human actions, neither carrying an operation_id.
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    context={"human_action": self._human_action()},
+                ),
+                audit_event(
+                    1,
+                    wall_time_ms=T0 + 86_400_000,  # a day later
+                    context={"human_action": self._human_action()},
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        events = list(valid_events_for_group(group))
+
+        # Sanity: neither event carries an operation_id.
+        self.assertTrue(all(not e.context_operation_id for e in events))
+
+        action_groups = human_action_groups_for_group(events)
+
+        # Each operation_id-less action is its own card (today's bug produced 1).
+        self.assertEqual(len(action_groups), 2)
+        # Per-action windows are not stretched across the whole span.
+        self.assertEqual(action_groups[0]["first_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["last_wall_time_ms"], T0)
+        self.assertEqual(action_groups[1]["first_wall_time_ms"], T0 + 86_400_000)
+        self.assertEqual(action_groups[1]["last_wall_time_ms"], T0 + 86_400_000)
+
+    def test_actions_sharing_real_operation_id_still_merge(self):
+        # Two events with the SAME real operation_id remain one group.
+        shared = {"operation_id": "op-shared", "human_action": self._human_action()}
+        ingest_body(
+            jsonl(
+                audit_event(0, wall_time_ms=T0, context=shared),
+                audit_event(1, wall_time_ms=T0 + 1000, context=shared),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        events = list(valid_events_for_group(group))
+
+        action_groups = human_action_groups_for_group(events)
+
+        self.assertEqual(len(action_groups), 1)
+        self.assertEqual(action_groups[0]["operation_id"], "op-shared")
+        self.assertEqual(action_groups[0]["first_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["last_wall_time_ms"], T0 + 1000)
+
+    def test_operationless_event_does_not_collide_with_event_prefixed_operation_id(self):
+        # Regression for the fallback-key collision: a real operation_id of the
+        # literal form "event:<pk>" must not merge with the synthetic key of an
+        # operation_id-less event whose DB pk happens to equal <pk>. The two
+        # actions are unrelated and must stay in separate groups.
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    context={"human_action": self._human_action()},
+                )
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        operationless = valid_events_for_group(group).get()
+        # Sanity: the first event carries no operation_id.
+        self.assertFalse(operationless.context_operation_id)
+
+        # Second event carries a real operation_id that collides with the old
+        # flat fallback key f"event:{pk}" of the first event.
+        colliding_operation_id = f"event:{operationless.pk}"
+        ingest_body(
+            jsonl(
+                audit_event(
+                    1,
+                    wall_time_ms=T0 + 1000,
+                    context={
+                        "operation_id": colliding_operation_id,
+                        "human_action": self._human_action(),
+                    },
+                )
+            )
+        )
+        events = list(valid_events_for_group(group))
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1].context_operation_id, colliding_operation_id)
+
+        action_groups = human_action_groups_for_group(events)
+
+        # Two distinct actions → two groups (the flat-string key produced 1).
+        self.assertEqual(len(action_groups), 2)
+        self.assertEqual(action_groups[0]["first_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["last_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["operation_id"], "")
+        self.assertEqual(action_groups[1]["first_wall_time_ms"], T0 + 1000)
+        self.assertEqual(action_groups[1]["last_wall_time_ms"], T0 + 1000)
+        self.assertEqual(action_groups[1]["operation_id"], colliding_operation_id)
 
 
 class DashboardTests(TestCase):
