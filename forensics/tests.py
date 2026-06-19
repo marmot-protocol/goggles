@@ -100,6 +100,70 @@ def representative_audit_log(engine_id=ENGINE_ALICE):
     )
 
 
+class UploadTokenHashKeyTests(TestCase):
+    """Token hashing is keyed on GOGGLES_TOKEN_HASH_KEY, not SECRET_KEY.
+
+    Rotating Django's SECRET_KEY is a recommended security action and must not
+    silently invalidate every issued upload token (regression for #22).
+    """
+
+    def test_token_survives_secret_key_rotation_with_dedicated_hash_key(self):
+        with override_settings(
+            SECRET_KEY="signing-key-v1",
+            GOGGLES_TOKEN_HASH_KEY="dedicated-token-hash-key",
+        ):
+            raw_token, token = UploadToken.issue("ios qa device")
+
+        # Rotate ONLY the Django signing key; the dedicated hash key is stable.
+        with override_settings(
+            SECRET_KEY="signing-key-v2-rotated",
+            GOGGLES_TOKEN_HASH_KEY="dedicated-token-hash-key",
+        ):
+            authenticated = UploadToken.authenticate(raw_token)
+
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(authenticated.pk, token.pk)
+
+    def test_rotating_token_hash_key_invalidates_tokens(self):
+        with override_settings(
+            SECRET_KEY="signing-key-v1",
+            GOGGLES_TOKEN_HASH_KEY="dedicated-token-hash-key-v1",
+        ):
+            raw_token, _token = UploadToken.issue("ios qa device")
+
+        # Rotating the dedicated key DOES invalidate tokens, as documented.
+        with override_settings(
+            SECRET_KEY="signing-key-v1",
+            GOGGLES_TOKEN_HASH_KEY="dedicated-token-hash-key-v2",
+        ):
+            self.assertIsNone(UploadToken.authenticate(raw_token))
+
+    def test_hash_is_keyed_on_token_hash_key_not_secret_key(self):
+        import hashlib
+        import hmac
+
+        secret = "entropy-rich-secret"
+        with override_settings(
+            SECRET_KEY="some-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="distinct-token-hash-key",
+        ):
+            produced = UploadToken.hash_secret(secret)
+
+        expected = hmac.new(
+            b"distinct-token-hash-key",
+            secret.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(produced, expected)
+
+        secret_key_hash = hmac.new(
+            b"some-signing-key",
+            secret.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertNotEqual(produced, secret_key_hash)
+
+
 class AuditLogIngestionTests(TestCase):
     def test_bearer_token_post_stores_valid_jsonl_and_normalizes_events(self):
         raw_token, token = UploadToken.issue("ios test client")

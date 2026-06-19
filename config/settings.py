@@ -23,6 +23,16 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
 if not DEBUG and (not SECRET_KEY or SECRET_KEY == "dev-only-change-me"):
     raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0.")
 
+# Key used to HMAC upload-token secrets. This is intentionally decoupled
+# from the Django signing key: rotating that key (sessions, CSRF, password
+# reset) must not silently invalidate every previously issued upload token.
+# Set GOGGLES_TOKEN_HASH_KEY to a dedicated, stable secret in production so
+# the two rotation lifecycles stay independent. When it is unset we fall back
+# to the Django signing key, which preserves historical behavior and keeps
+# existing token hashes verifiable for deployments that have not yet
+# provisioned a dedicated key.
+GOGGLES_TOKEN_HASH_KEY = os.environ.get("GOGGLES_TOKEN_HASH_KEY") or SECRET_KEY
+
 ALLOWED_HOSTS = env_list(
     "DJANGO_ALLOWED_HOSTS",
     "127.0.0.1,localhost" if DEBUG else "",

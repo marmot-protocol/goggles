@@ -56,7 +56,12 @@ class UploadToken(models.Model):
 
     @classmethod
     def hash_secret(cls, secret: str) -> str:
-        key = settings.SECRET_KEY.encode("utf-8")
+        # Keyed on GOGGLES_TOKEN_HASH_KEY (a dedicated, independently
+        # rotatable secret) rather than SECRET_KEY, so rotating the Django
+        # signing key does not invalidate every issued upload token. The
+        # setting falls back to SECRET_KEY when unset, preserving existing
+        # hashes for deployments that have not provisioned a dedicated key.
+        key = settings.GOGGLES_TOKEN_HASH_KEY.encode("utf-8")
         return hmac.new(key, secret.encode("utf-8"), hashlib.sha256).hexdigest()
 
     @classmethod

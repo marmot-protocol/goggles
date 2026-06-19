@@ -97,6 +97,7 @@ Copy `.env.example` to `.env` and replace every secret:
 ```dotenv
 DJANGO_DEBUG=0
 DJANGO_SECRET_KEY=replace-with-output-of-python-secrets-token-urlsafe-64
+GOGGLES_TOKEN_HASH_KEY=replace-with-output-of-python-secrets-token-urlsafe-64
 DJANGO_ALLOWED_HOSTS=goggles.ipf.dev
 DJANGO_CSRF_TRUSTED_ORIGINS=https://goggles.ipf.dev
 DJANGO_SECURE_SSL_REDIRECT=0
@@ -206,6 +207,17 @@ Invalid JSONL is saved as a quarantined upload and returns `400`.
 - Web UI access uses Django users; there is no public signup.
 - Uploads require bearer tokens generated with `create_upload_token`.
 - Upload token secrets are shown once and stored only as keyed hashes.
+- Upload token hashes are keyed on `GOGGLES_TOKEN_HASH_KEY`, a dedicated
+  secret that is **independent of `DJANGO_SECRET_KEY`**. Provision a stable
+  `GOGGLES_TOKEN_HASH_KEY` in production so that rotating Django's signing
+  key (sessions, CSRF, password reset) does **not** invalidate every issued
+  upload token. If `GOGGLES_TOKEN_HASH_KEY` is unset it falls back to
+  `DJANGO_SECRET_KEY`, which preserves existing token hashes but recouples
+  the two lifecycles — in that case rotating `DJANGO_SECRET_KEY` will
+  silently break every upload token, with no migration path because the raw
+  secrets were shown once and never stored. Treat `GOGGLES_TOKEN_HASH_KEY`
+  itself as long-lived: rotating it has the same token-invalidating effect,
+  so only change it deliberately and re-issue tokens afterward.
 - Rotate tokens by creating a new token, updating clients, then disabling the old token in Django admin or with:
 
 ```sh
