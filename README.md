@@ -126,6 +126,28 @@ Use the same database password in `DATABASE_URL` and `POSTGRES_PASSWORD`. If the
 database password contains URL punctuation such as `@`, `/`, or `:`, URL-encode
 the password portion in `DATABASE_URL`.
 
+> **Existing deployments — migrating to `GOGGLES_TOKEN_HASH_KEY`.** Upload
+> tokens issued before `GOGGLES_TOKEN_HASH_KEY` existed were hashed under
+> `DJANGO_SECRET_KEY` (the historical fallback). Setting a **fresh**
+> `GOGGLES_TOKEN_HASH_KEY` on such a deployment immediately invalidates every
+> one of those tokens, because `UploadToken.authenticate()` only computes the
+> new-key hash and the raw secrets were shown once and never stored. Pick the
+> migration path deliberately:
+>
+> - **Zero-downtime cutover (preserve existing tokens):** set
+>   `GOGGLES_TOKEN_HASH_KEY` to the **current** `DJANGO_SECRET_KEY` value. This
+>   reproduces the fallback hash exactly, so existing tokens keep working. You
+>   can now rotate `DJANGO_SECRET_KEY` freely without breaking uploads. Later,
+>   to fully decouple onto a fresh token-hash key, issue replacement tokens and
+>   roll clients over **before** changing `GOGGLES_TOKEN_HASH_KEY`, then disable
+>   the old tokens.
+> - **Clean cutover (reissue everything):** generate a fresh
+>   `GOGGLES_TOKEN_HASH_KEY`, accept that all existing tokens break at that
+>   moment, and reissue tokens to every client as part of the cutover.
+>
+> A brand-new deployment has no pre-existing tokens, so generate a fresh
+> `GOGGLES_TOKEN_HASH_KEY` directly with the command below.
+
 First run:
 
 ```sh
@@ -217,7 +239,10 @@ Invalid JSONL is saved as a quarantined upload and returns `400`.
   silently break every upload token, with no migration path because the raw
   secrets were shown once and never stored. Treat `GOGGLES_TOKEN_HASH_KEY`
   itself as long-lived: rotating it has the same token-invalidating effect,
-  so only change it deliberately and re-issue tokens afterward.
+  so only change it deliberately and re-issue tokens afterward. When adopting
+  `GOGGLES_TOKEN_HASH_KEY` on an **existing** deployment, follow the migration
+  runbook under "Production Deployment" above — setting a fresh key without it
+  invalidates every previously issued token at once.
 - Rotate tokens by creating a new token, updating clients, then disabling the old token in Django admin or with:
 
 ```sh
