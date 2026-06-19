@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -104,13 +105,26 @@ class ParsedLine:
     errors: list[str]
 
 
+def iter_jsonl_record_lines(raw_text: str) -> Iterator[str]:
+    """Yield JSONL records split only on the LF record delimiter.
+
+    ``str.splitlines()`` treats Unicode separators such as U+2028 and U+2029 as
+    line breaks, but JSONL records are delimited by ``\n``. Keep those
+    characters inside JSON strings while still tolerating CRLF uploads.
+    """
+    for raw_line in raw_text.split("\n"):
+        if raw_line.endswith("\r"):
+            raw_line = raw_line[:-1]
+        yield raw_line
+
+
 def first_group_ref_from_audit_log_bytes(dump_bytes: bytes) -> str | None:
     try:
         raw_text = dump_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return None
 
-    for raw_line in raw_text.splitlines():
+    for raw_line in iter_jsonl_record_lines(raw_text):
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -278,7 +292,7 @@ def save_invalid_upload(
 
 def parse_jsonl(raw_text: str) -> list[ParsedLine]:
     parsed_lines = []
-    for line_number, raw_line in enumerate(raw_text.splitlines(), start=1):
+    for line_number, raw_line in enumerate(iter_jsonl_record_lines(raw_text), start=1):
         raw_line = raw_line.strip()
         if not raw_line:
             continue
