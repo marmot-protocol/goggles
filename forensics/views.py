@@ -39,7 +39,7 @@ def healthz(_request: HttpRequest):
 @login_required
 def group_list(request: HttpRequest):
     groups = group_list_rows()
-    total_logs = sum(group.audit_file_count for group in groups)
+    total_logs = AuditFile.objects.count()
     return render(
         request,
         "forensics/group_list.html",
