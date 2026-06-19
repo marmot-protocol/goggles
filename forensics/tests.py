@@ -1,13 +1,19 @@
+import contextlib
 import json
+import os
 from io import StringIO
+from pathlib import Path
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+
+from config import settings as settings_module
 
 from .analysis import (
     audit_files_for_group,
@@ -2170,3 +2176,93 @@ class AuditFileAdminTests(TestCase):
         # for the bounded preview, but reject anything approaching the raw size.
         self.assertLess(huge_len - small_len, 50_000)
         self.assertLess(huge_len, 200_000)
+
+
+class DebugFailClosedSettingsTests(SimpleTestCase):
+    """Regression tests for goggles#20.
+
+    A missing ``DJANGO_DEBUG`` must fail *closed* (production-safe), so an
+    operator has to opt in to debug mode rather than opt out of it. We
+    re-execute the real ``config/settings.py`` source in an isolated namespace
+    under a controlled environment, which lets us probe the ``DEBUG`` default
+    and the production guards without disturbing the already-imported
+    process-wide ``django.conf.settings``.
+    """
+
+    SETTINGS_PATH = Path(settings_module.__file__).resolve()
+
+    # Environment keys the settings module reads; cleared for a clean slate so a
+    # stray DJANGO_* var in the test runner's environment can't mask the default.
+    _MANAGED_PREFIXES = ("DJANGO_",)
+    _MANAGED_KEYS = ("DATABASE_URL",)
+
+    # A representative production-style environment, deliberately missing
+    # DJANGO_DEBUG so we can assert the default rather than an explicit value.
+    _PROD_ENV = {
+        "DJANGO_SECRET_KEY": "x" * 64,
+        "DJANGO_ALLOWED_HOSTS": "goggles.example.com",
+        "DJANGO_CSRF_TRUSTED_ORIGINS": "https://goggles.example.com",
+        "DATABASE_URL": "postgres://goggles:secret@db:5432/goggles",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._settings_code = compile(cls.SETTINGS_PATH.read_text(), str(cls.SETTINGS_PATH), "exec")
+
+    @contextlib.contextmanager
+    def _clean_env(self, **overrides):
+        saved = dict(os.environ)
+        try:
+            for key in list(os.environ):
+                if key.startswith(self._MANAGED_PREFIXES) or key in self._MANAGED_KEYS:
+                    del os.environ[key]
+            for key, value in overrides.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def _load_settings(self):
+        namespace = {
+            "__file__": str(self.SETTINGS_PATH),
+            "__name__": "config._settings_under_test",
+        }
+        exec(self._settings_code, namespace)  # noqa: S102 - trusted in-repo source
+        return namespace
+
+    def test_missing_django_debug_fails_closed_to_production(self):
+        # The core guarantee: with a complete production-style environment but
+        # DJANGO_DEBUG entirely unset, the app must NOT boot in debug mode.
+        with self._clean_env(**self._PROD_ENV):
+            ns = self._load_settings()
+        self.assertIs(ns["DEBUG"], False)
+        # Production cookie/HSTS hardening must follow from the safe default.
+        self.assertTrue(ns["SESSION_COOKIE_SECURE"])
+        self.assertTrue(ns["CSRF_COOKIE_SECURE"])
+        self.assertEqual(ns["SECURE_HSTS_SECONDS"], 31536000)
+
+    def test_missing_django_debug_keeps_production_guards_active(self):
+        # With DJANGO_DEBUG unset and the production secrets absent, the guards
+        # gated on `not DEBUG` must fire instead of silently booting with the
+        # dev SECRET_KEY and SQLite fallback.
+        with self._clean_env():
+            with self.assertRaises(ImproperlyConfigured):
+                self._load_settings()
+
+    def test_explicit_opt_in_enables_debug(self):
+        # Local development / CI opt in with DJANGO_DEBUG=1; that must still work
+        # and must not trip the production guards.
+        with self._clean_env(DJANGO_DEBUG="1"):
+            ns = self._load_settings()
+        self.assertIs(ns["DEBUG"], True)
+
+    def test_explicit_opt_out_value_disables_debug(self):
+        # An explicit falsey value is honored just like an absent var (closed).
+        with self._clean_env(DJANGO_DEBUG="0", **self._PROD_ENV):
+            ns = self._load_settings()
+        self.assertIs(ns["DEBUG"], False)

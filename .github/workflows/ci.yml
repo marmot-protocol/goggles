@@ -12,6 +12,11 @@ jobs:
   django:
     name: Django tests and checks
     runs-on: ubuntu-latest
+    # DEBUG now fails closed (defaults to False) when DJANGO_DEBUG is unset.
+    # CI exercises the app in debug mode, matching local development, so opt in
+    # explicitly for every manage.py step below.
+    env:
+      DJANGO_DEBUG: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

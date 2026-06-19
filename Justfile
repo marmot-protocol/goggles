@@ -1,5 +1,10 @@
 set dotenv-load := true
 
+# Local development runs in Django debug mode by default. The app now fails closed
+# (DEBUG=False) when DJANGO_DEBUG is unset, so opt in here for the SQLite/dev-secret
+# local workflow. An explicit DJANGO_DEBUG in the environment or .env still wins.
+export DJANGO_DEBUG := env_var_or_default("DJANGO_DEBUG", "1")
+
 dev_db := env_var_or_default("GOGGLES_DEV_DB", "var/goggles-dev.sqlite3")
 database_url := "sqlite:///" + justfile_directory() + "/" + dev_db
 port := env_var_or_default("GOGGLES_DEV_PORT", "8000")
