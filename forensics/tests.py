@@ -1823,9 +1823,10 @@ class AuditFileAdminTests(TestCase):
             response_large = self.client.get(self.change_url(large))
         self.assertEqual(response_large.status_code, 200)
 
-        # The page must not issue (or render) one query/row per event. The only
-        # event-related query is a single COUNT for the link label, so query
-        # volume is identical for a 2-event and a 200-event file.
+        # The page must not issue (or render) one query/row per event. The
+        # events link uses a static label, so there is not even a COUNT query
+        # that scales with events: query volume is identical for a 2-event and
+        # a 200-event file.
         self.assertEqual(len(small_queries), len(large_queries))
 
     def test_change_page_does_not_render_a_row_per_event(self):
@@ -1833,9 +1834,8 @@ class AuditFileAdminTests(TestCase):
         response = self.client.get(self.change_url(audit_file))
         content = response.content.decode()
         # An inline formset would emit one management-form row per event; the
-        # link-out approach renders the file's raw lines once but never 50
-        # editable event rows. Guard against the per-event line numbers leaking
-        # into editable inline inputs.
+        # link-out approach never renders editable event rows. Guard against
+        # the per-event line numbers leaking into editable inline inputs.
         self.assertNotIn('name="events-50-id"', content)
         self.assertNotIn('id="id_events-TOTAL_FORMS"', content)
 
@@ -1846,13 +1846,23 @@ class AuditFileAdminTests(TestCase):
         changelist = reverse("admin:forensics_auditevent_changelist")
         expected = f"{changelist}?audit_file__id__exact={audit_file.pk}"
         self.assertIn(expected, content)
-        self.assertIn("View 3 events", content)
+        # The label is intentionally static ("View events") so no per-event
+        # COUNT query runs on every change-page render (goggles#34).
+        self.assertIn("View events", content)
 
-    def test_event_link_label_is_singular_for_one_event(self):
-        audit_file = self.make_audit_file(1)
+    def test_event_link_label_does_not_run_a_count_query(self):
+        """The events link must not COUNT events on every render.
+
+        A per-event ``count()`` scales with the number of events, which is the
+        same unbounded cost we removed by dropping the inline. Asserting on the
+        rendered label keeps the static-link contract enforced.
+        """
+        audit_file = self.make_audit_file(7)
         response = self.client.get(self.change_url(audit_file))
-        self.assertContains(response, "View 1 event")
-        self.assertNotContains(response, "View 1 events")
+        content = response.content.decode()
+        self.assertIn("View events", content)
+        # No dynamic count is embedded in the label.
+        self.assertNotIn("View 7 event", content)
 
     def test_filtered_event_changelist_is_reachable_and_scoped(self):
         target = self.make_audit_file(3, source_name="target")
@@ -1873,3 +1883,66 @@ class AuditFileAdminTests(TestCase):
         from .admin import AuditEventAdmin
 
         self.assertIn("audit_file", AuditEventAdmin.list_filter)
+
+    # --- raw_text bounding (goggles#34, adversarial review follow-up) -------
+    #
+    # Removing the event inline alone did not make the change page bounded:
+    # ``AuditFile.raw_text`` is a TextField holding the entire uploaded JSONL,
+    # and the default model form rendered it into one editable textarea, so a
+    # 50 MB upload still produced a huge response. The change form must exclude
+    # the editable raw_text field and only show a bounded preview.
+
+    @staticmethod
+    def make_file_with_raw_text(raw_text, **kwargs):
+        import hashlib
+
+        digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        return AuditFile.objects.create(
+            file_sha256=digest,
+            byte_size=len(raw_text.encode("utf-8")),
+            raw_text=raw_text,
+            **kwargs,
+        )
+
+    def test_change_form_excludes_editable_raw_text(self):
+        from .admin import AuditFileAdmin
+
+        self.assertIn("raw_text", AuditFileAdmin.exclude)
+        audit_file = self.make_file_with_raw_text("line one\nline two\n")
+        response = self.client.get(self.change_url(audit_file))
+        content = response.content.decode()
+        # No editable raw_text textarea/input may appear on the change page.
+        self.assertNotIn('name="raw_text"', content)
+        self.assertNotIn('id="id_raw_text"', content)
+
+    def test_change_page_renders_bounded_raw_text_preview(self):
+        from .admin import RAW_TEXT_PREVIEW_CHARS
+
+        marker = "ZRAWMARKER"
+        # A line every ~10 chars, far past the preview cap.
+        big_raw = "\n".join(f"{i}-{marker}" for i in range(50000))
+        self.assertGreater(len(big_raw), RAW_TEXT_PREVIEW_CHARS)
+        audit_file = self.make_file_with_raw_text(big_raw)
+        response = self.client.get(self.change_url(audit_file))
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        # The preview label is present...
+        self.assertIn("Raw text (preview)", content)
+        # ...but only the first RAW_TEXT_PREVIEW_CHARS of raw text are emitted,
+        # so the last line of a huge file never reaches the page.
+        self.assertNotIn(f"49999-{marker}", content)
+        # The first line does appear in the preview.
+        self.assertIn(f"0-{marker}", content)
+
+    def test_change_page_html_is_bounded_regardless_of_file_size(self):
+        small = self.make_file_with_raw_text("only one line\n")
+        huge_raw = "x" * 5_000_000  # ~5 MB of raw text
+        huge = self.make_file_with_raw_text(huge_raw)
+
+        small_len = len(self.client.get(self.change_url(small)).content)
+        huge_len = len(self.client.get(self.change_url(huge)).content)
+
+        # The huge file must not balloon the change page. Allow generous slack
+        # for the bounded preview, but reject anything approaching the raw size.
+        self.assertLess(huge_len - small_len, 50_000)
+        self.assertLess(huge_len, 200_000)
