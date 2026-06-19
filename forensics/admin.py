@@ -1,6 +1,16 @@
 from django.contrib import admin
+from django.urls import reverse
+from django.utils.html import format_html
+from django.utils.http import urlencode
 
 from .models import AnalysisRun, AuditEvent, AuditFile, AuditGroup, UploadToken
+
+# Hard cap on how much of an audit file's raw JSONL the change page renders.
+# A single upload can be tens of megabytes (hundreds of thousands of lines),
+# so the full ``raw_text`` is never emitted into the admin form; operators see
+# a bounded preview here and reach the complete evidence through the events
+# changelist / the stored file.
+RAW_TEXT_PREVIEW_CHARS = 2000
 
 
 @admin.register(AuditGroup)
@@ -18,24 +28,6 @@ class UploadTokenAdmin(admin.ModelAdmin):
     readonly_fields = ("token_prefix", "token_hash", "created_at", "last_used_at")
 
 
-class AuditEventInline(admin.TabularInline):
-    model = AuditEvent
-    extra = 0
-    fields = (
-        "line_number",
-        "parse_status",
-        "event_type",
-        "account_ref",
-        "engine_id",
-        "group_ref",
-        "msg_id",
-        "wall_time_ms",
-        "validation_error",
-    )
-    readonly_fields = fields
-    can_delete = False
-
-
 @admin.register(AuditFile)
 class AuditFileAdmin(admin.ModelAdmin):
     list_display = (
@@ -48,7 +40,7 @@ class AuditFileAdmin(admin.ModelAdmin):
         "duplicate_event_count",
         "created_at",
     )
-    list_filter = ("validation_status", "schema_versions")
+    list_filter = ("validation_status",)
     search_fields = (
         "source_name",
         "source_account_label",
@@ -59,8 +51,66 @@ class AuditFileAdmin(admin.ModelAdmin):
         "engine_ids",
         "group_refs",
     )
-    readonly_fields = ("file_sha256", "byte_size", "created_at")
-    inlines = [AuditEventInline]
+    # ``raw_text`` is excluded from the change form: it holds the entire
+    # uploaded JSONL (potentially tens of MB), and Django's default model form
+    # would render it into one editable textarea, making the page unbounded by
+    # file size (goggles#34). Operators see a bounded ``raw_text_preview``
+    # instead and reach the full content through the events changelist.
+    exclude = ("raw_text",)
+    readonly_fields = (
+        "file_sha256",
+        "byte_size",
+        "created_at",
+        "raw_text_preview",
+        "events_link",
+    )
+
+    @admin.display(description="Raw text (preview)")
+    def raw_text_preview(self, obj):
+        """Bounded, read-only preview of the uploaded JSONL.
+
+        The full ``raw_text`` is never rendered on the change page (a single
+        upload can be tens of megabytes / hundreds of thousands of lines). We
+        show at most ``RAW_TEXT_PREVIEW_CHARS`` characters plus the total size,
+        so the page stays usable no matter how large the file is.
+        """
+        if obj is None or obj.pk is None:
+            return "\u2014"
+        raw = obj.raw_text or ""
+        total_chars = len(raw)
+        preview = raw[:RAW_TEXT_PREVIEW_CHARS]
+        if total_chars > RAW_TEXT_PREVIEW_CHARS:
+            notice = format_html(
+                "<p><em>Showing first {} of {} characters "
+                "({} bytes). Full content is preserved in storage; "
+                "use the events list for line-level detail.</em></p>",
+                RAW_TEXT_PREVIEW_CHARS,
+                total_chars,
+                obj.byte_size,
+            )
+        else:
+            notice = format_html("<p><em>{} characters.</em></p>", total_chars)
+        return format_html(
+            '{}<pre style="max-height: 24em; overflow: auto; white-space: pre-wrap;">{}</pre>',
+            notice,
+            preview,
+        )
+
+    @admin.display(description="Events")
+    def events_link(self, obj):
+        """Link out to the filtered AuditEvent changelist instead of inlining.
+
+        A single audit file can hold hundreds of thousands of events, so we
+        never render them as an inline formset (no pagination, unbounded query
+        and HTML). Operators reach the events through the paginated
+        ``AuditEventAdmin`` changelist, pre-filtered to this file. The label is
+        static so the change page issues no per-event COUNT query.
+        """
+        if obj is None or obj.pk is None:
+            return "\u2014"
+        url = reverse("admin:forensics_auditevent_changelist")
+        query = urlencode({"audit_file__id__exact": obj.pk})
+        return format_html('<a href="{}?{}">View events</a>', url, query)
 
 
 @admin.register(AuditEvent)
@@ -74,7 +124,14 @@ class AuditEventAdmin(admin.ModelAdmin):
         "msg_id",
         "wall_time_ms",
     )
-    list_filter = ("parse_status", "event_type", "outcome", "outcome_kind", "new_state")
+    list_filter = (
+        "parse_status",
+        "event_type",
+        "outcome",
+        "outcome_kind",
+        "new_state",
+        "audit_file",
+    )
     search_fields = (
         "account_ref",
         "engine_id",

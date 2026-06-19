@@ -1753,3 +1753,196 @@ class ProfileTests(TestCase):
 
         user.refresh_from_db()
         self.assertEqual(user.username, "analyst")
+
+
+class AuditFileAdminTests(TestCase):
+    """Regression coverage for goggles#34.
+
+    Opening an ``AuditFile`` in the admin must stay usable no matter how many
+    events the file holds. Events are reached through the paginated
+    ``AuditEventAdmin`` changelist, never rendered as an unbounded inline
+    formset.
+    """
+
+    def setUp(self):
+        self.admin_user = User.objects.create_superuser(
+            username="root", email="root@example.com", password="pass123"
+        )
+        self.client.force_login(self.admin_user)
+
+    @staticmethod
+    def make_audit_file(event_count, **kwargs):
+        audit_file = AuditFile.objects.create(
+            file_sha256=f"{event_count:064x}",
+            byte_size=event_count * 100,
+            raw_text="\n".join(f"line {i}" for i in range(event_count)),
+            valid_event_count=event_count,
+            **kwargs,
+        )
+        AuditEvent.objects.bulk_create(
+            AuditEvent(
+                audit_file=audit_file,
+                line_number=i + 1,
+                line_hash=f"{i:064x}",
+                raw_line=f"line {i}",
+                event_type="ingest_entry",
+                engine_id=ENGINE_ALICE,
+                account_ref=ACCOUNT_ALICE,
+            )
+            for i in range(event_count)
+        )
+        return audit_file
+
+    def change_url(self, audit_file):
+        return reverse("admin:forensics_auditfile_change", args=[audit_file.pk])
+
+    def test_audit_file_admin_has_no_event_inline(self):
+        from .admin import AuditFileAdmin
+
+        inline_models = [inline.model for inline in AuditFileAdmin.inlines]
+        self.assertNotIn(AuditEvent, inline_models)
+        self.assertEqual(list(AuditFileAdmin.inlines), [])
+
+    def test_admin_module_defines_no_event_inline(self):
+        from forensics import admin as forensics_admin
+
+        self.assertFalse(
+            hasattr(forensics_admin, "AuditEventInline"),
+            "The unbounded AuditEventInline must not exist (goggles#34).",
+        )
+
+    def test_change_page_query_count_is_bounded_regardless_of_events(self):
+        small = self.make_audit_file(2)
+        large = self.make_audit_file(200, source_name="big")
+
+        with CaptureQueriesContext(connection) as small_queries:
+            response_small = self.client.get(self.change_url(small))
+        self.assertEqual(response_small.status_code, 200)
+
+        with CaptureQueriesContext(connection) as large_queries:
+            response_large = self.client.get(self.change_url(large))
+        self.assertEqual(response_large.status_code, 200)
+
+        # The page must not issue (or render) one query/row per event. The
+        # events link uses a static label, so there is not even a COUNT query
+        # that scales with events: query volume is identical for a 2-event and
+        # a 200-event file.
+        self.assertEqual(len(small_queries), len(large_queries))
+
+    def test_change_page_does_not_render_a_row_per_event(self):
+        audit_file = self.make_audit_file(50)
+        response = self.client.get(self.change_url(audit_file))
+        content = response.content.decode()
+        # An inline formset would emit one management-form row per event; the
+        # link-out approach never renders editable event rows. Guard against
+        # the per-event line numbers leaking into editable inline inputs.
+        self.assertNotIn('name="events-50-id"', content)
+        self.assertNotIn('id="id_events-TOTAL_FORMS"', content)
+
+    def test_change_page_links_to_filtered_event_changelist(self):
+        audit_file = self.make_audit_file(3)
+        response = self.client.get(self.change_url(audit_file))
+        content = response.content.decode()
+        changelist = reverse("admin:forensics_auditevent_changelist")
+        expected = f"{changelist}?audit_file__id__exact={audit_file.pk}"
+        self.assertIn(expected, content)
+        # The label is intentionally static ("View events") so no per-event
+        # COUNT query runs on every change-page render (goggles#34).
+        self.assertIn("View events", content)
+
+    def test_event_link_label_does_not_run_a_count_query(self):
+        """The events link must not COUNT events on every render.
+
+        A per-event ``count()`` scales with the number of events, which is the
+        same unbounded cost we removed by dropping the inline. Asserting on the
+        rendered label keeps the static-link contract enforced.
+        """
+        audit_file = self.make_audit_file(7)
+        response = self.client.get(self.change_url(audit_file))
+        content = response.content.decode()
+        self.assertIn("View events", content)
+        # No dynamic count is embedded in the label.
+        self.assertNotIn("View 7 event", content)
+
+    def test_filtered_event_changelist_is_reachable_and_scoped(self):
+        target = self.make_audit_file(3, source_name="target")
+        other = self.make_audit_file(5, source_name="other")
+        changelist = reverse("admin:forensics_auditevent_changelist")
+        response = self.client.get(changelist, {"audit_file__id__exact": target.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["cl"].result_count, 3)
+        self.assertNotEqual(other.pk, target.pk)
+
+    def test_schema_versions_not_in_audit_file_list_filter(self):
+        from .admin import AuditFileAdmin
+
+        self.assertNotIn("schema_versions", AuditFileAdmin.list_filter)
+        self.assertIn("validation_status", AuditFileAdmin.list_filter)
+
+    def test_audit_event_admin_filterable_by_audit_file(self):
+        from .admin import AuditEventAdmin
+
+        self.assertIn("audit_file", AuditEventAdmin.list_filter)
+
+    # --- raw_text bounding (goggles#34, adversarial review follow-up) -------
+    #
+    # Removing the event inline alone did not make the change page bounded:
+    # ``AuditFile.raw_text`` is a TextField holding the entire uploaded JSONL,
+    # and the default model form rendered it into one editable textarea, so a
+    # 50 MB upload still produced a huge response. The change form must exclude
+    # the editable raw_text field and only show a bounded preview.
+
+    @staticmethod
+    def make_file_with_raw_text(raw_text, **kwargs):
+        import hashlib
+
+        digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        return AuditFile.objects.create(
+            file_sha256=digest,
+            byte_size=len(raw_text.encode("utf-8")),
+            raw_text=raw_text,
+            **kwargs,
+        )
+
+    def test_change_form_excludes_editable_raw_text(self):
+        from .admin import AuditFileAdmin
+
+        self.assertIn("raw_text", AuditFileAdmin.exclude)
+        audit_file = self.make_file_with_raw_text("line one\nline two\n")
+        response = self.client.get(self.change_url(audit_file))
+        content = response.content.decode()
+        # No editable raw_text textarea/input may appear on the change page.
+        self.assertNotIn('name="raw_text"', content)
+        self.assertNotIn('id="id_raw_text"', content)
+
+    def test_change_page_renders_bounded_raw_text_preview(self):
+        from .admin import RAW_TEXT_PREVIEW_CHARS
+
+        marker = "ZRAWMARKER"
+        # A line every ~10 chars, far past the preview cap.
+        big_raw = "\n".join(f"{i}-{marker}" for i in range(50000))
+        self.assertGreater(len(big_raw), RAW_TEXT_PREVIEW_CHARS)
+        audit_file = self.make_file_with_raw_text(big_raw)
+        response = self.client.get(self.change_url(audit_file))
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        # The preview label is present...
+        self.assertIn("Raw text (preview)", content)
+        # ...but only the first RAW_TEXT_PREVIEW_CHARS of raw text are emitted,
+        # so the last line of a huge file never reaches the page.
+        self.assertNotIn(f"49999-{marker}", content)
+        # The first line does appear in the preview.
+        self.assertIn(f"0-{marker}", content)
+
+    def test_change_page_html_is_bounded_regardless_of_file_size(self):
+        small = self.make_file_with_raw_text("only one line\n")
+        huge_raw = "x" * 5_000_000  # ~5 MB of raw text
+        huge = self.make_file_with_raw_text(huge_raw)
+
+        small_len = len(self.client.get(self.change_url(small)).content)
+        huge_len = len(self.client.get(self.change_url(huge)).content)
+
+        # The huge file must not balloon the change page. Allow generous slack
+        # for the bounded preview, but reject anything approaching the raw size.
+        self.assertLess(huge_len - small_len, 50_000)
+        self.assertLess(huge_len, 200_000)
