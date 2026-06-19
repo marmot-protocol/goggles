@@ -5,10 +5,11 @@ import os
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from django.contrib.auth.models import User
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import connection
@@ -34,6 +35,7 @@ from .ingest import (
     ingest_audit_log_bytes,
 )
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
+from .views import audit_bytes_from_request
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
 ENGINE_ALICE = "0123456789abcdef0123456789abcdef"
@@ -368,6 +370,53 @@ class AuditLogIngestionTests(TestCase):
             data="x" * 11,
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"], "audit log exceeds maximum upload size")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+
+    @override_settings(GOGGLES_MAX_DUMP_BYTES=10)
+    def test_multipart_upload_size_limit_rejects_before_reading_file(self):
+        class OversizedUpload(SimpleUploadedFile):
+            def read(self, *args, **kwargs):
+                raise AssertionError("oversized upload should be rejected before read()")
+
+            def chunks(self, *args, **kwargs):
+                raise AssertionError("oversized upload should be rejected before chunks()")
+
+        upload_file = OversizedUpload(
+            "audit-too-large.jsonl",
+            b"x" * 11,
+            content_type="application/x-ndjson",
+        )
+        request = SimpleNamespace(
+            FILES={"audit_log": upload_file},
+            body=b"",
+            content_type="multipart/form-data",
+        )
+
+        with self.assertRaises(RequestDataTooBig):
+            audit_bytes_from_request(request)
+
+    @override_settings(
+        GOGGLES_MAX_DUMP_BYTES=10,
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+        FILE_UPLOAD_MAX_MEMORY_SIZE=1024,
+    )
+    def test_api_rejects_oversized_multipart_upload_without_saving(self):
+        raw_token, _token = UploadToken.issue("ios test client")
+        upload_file = SimpleUploadedFile(
+            "audit-too-large.jsonl",
+            b"x" * 11,
+            content_type="application/x-ndjson",
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data={"audit_log": upload_file},
+            HTTP_AUTHORIZATION="Bearer " + raw_token,
         )
 
         self.assertEqual(response.status_code, 413)
