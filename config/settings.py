@@ -18,7 +18,11 @@ def env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
 
-DEBUG = env_bool("DJANGO_DEBUG", True)
+# Fail closed: an absent DJANGO_DEBUG must default to production-safe (DEBUG=False)
+# so a missing/commented-out env var does not silently boot the app in debug mode
+# with the dev SECRET_KEY and SQLite fallback. Operators must opt in to debug mode
+# explicitly (DJANGO_DEBUG=1); the local `just` workflow and CI set it for development.
+DEBUG = env_bool("DJANGO_DEBUG", False)
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
 if not DEBUG and (not SECRET_KEY or SECRET_KEY == "dev-only-change-me"):
     raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0.")
