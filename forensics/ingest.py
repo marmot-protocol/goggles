@@ -27,6 +27,66 @@ HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 # quarantine anything past it like other schema violations.
 MAX_WALL_TIME_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
 
+# Maximum bracket/brace nesting depth we will hand to ``json.loads``. The audit
+# schema is shallow (event -> kind/context -> at most a small nested object or
+# list), so a few hundred levels is far more headroom than any legitimate line
+# needs while staying well below Python's recursion limit. Deeply-nested input
+# (e.g. ``[[[[...]]]]`` thousands of levels deep) makes ``json.loads`` recurse
+# until it raises ``RecursionError`` -- which is *not* a ``JSONDecodeError`` --
+# and would otherwise escape the parser as an uncaught 500, losing the raw
+# upload instead of quarantining it. We reject such lines up front with a clear
+# validation error so they are quarantined like any other malformed JSON.
+MAX_JSON_NESTING_DEPTH = 200
+
+
+def max_json_nesting_depth(raw: str) -> int:
+    """Return the maximum bracket/brace nesting depth of a JSON text.
+
+    Scans the raw characters, ignoring brackets that appear inside string
+    literals (so a ``[`` inside a ``"..."`` value does not inflate the count).
+    This is a cheap O(n) pre-check used to reject pathologically deep input
+    *before* ``json.loads`` ever recurses into it, making the guard
+    deterministic regardless of the interpreter's recursion limit.
+    """
+    depth = 0
+    max_depth = 0
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > max_depth:
+                max_depth = depth
+        elif ch in "]}":
+            if depth > 0:
+                depth -= 1
+    return max_depth
+
+
+def loads_audit_json(raw: str) -> Any:
+    """Parse one JSONL line, rejecting pathologically deep nesting.
+
+    Behaves like ``json.loads`` for ordinary input but raises ``ValueError``
+    (the base class of ``json.JSONDecodeError``) when the input nests deeper
+    than :data:`MAX_JSON_NESTING_DEPTH`, so callers that already handle
+    malformed JSON via ``except ValueError`` / ``except json.JSONDecodeError``
+    treat over-nested input the same way instead of letting a ``RecursionError``
+    escape.
+    """
+    if max_json_nesting_depth(raw) > MAX_JSON_NESTING_DEPTH:
+        raise ValueError(f"nesting exceeds maximum depth of {MAX_JSON_NESTING_DEPTH}")
+    return json.loads(raw)
+
 
 @dataclass(frozen=True)
 class IngestionResult:
@@ -55,8 +115,8 @@ def first_group_ref_from_audit_log_bytes(dump_bytes: bytes) -> str | None:
         if not raw_line:
             continue
         try:
-            loaded = json.loads(raw_line)
-        except json.JSONDecodeError:
+            loaded = loads_audit_json(raw_line)
+        except (ValueError, RecursionError):
             continue
         if not isinstance(loaded, dict):
             continue
@@ -225,13 +285,20 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
         data = None
         errors = []
         try:
-            loaded = json.loads(raw_line)
+            loaded = loads_audit_json(raw_line)
             if not isinstance(loaded, dict):
                 errors.append("line must be a JSON object")
             else:
                 data = loaded
         except json.JSONDecodeError as exc:
             errors.append(f"invalid JSON: {exc.msg}")
+        except (ValueError, RecursionError) as exc:
+            # ValueError covers the depth-limit guard in loads_audit_json();
+            # RecursionError is a belt-and-suspenders catch in case the
+            # interpreter's recursion limit is hit before the depth guard.
+            # Neither is a JSONDecodeError, so without this they would escape
+            # parse_jsonl() as an uncaught 500 and lose the raw upload.
+            errors.append(f"invalid JSON: {exc}")
 
         normalized: dict[str, Any] = {}
         if data is not None:
