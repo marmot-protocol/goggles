@@ -99,7 +99,14 @@ def file_rows_for_group(audit_files, group):
             "valid_event_count": audit_file.valid_event_count,
             "invalid_event_count": audit_file.invalid_event_count,
             "duplicate_event_count": audit_file.duplicate_event_count,
-            "group_event_count": audit_file.events.filter(group=group).count(),
+            # Count in memory over the events prefetched by
+            # audit_files_for_group (`prefetch_related("events__group")`).
+            # `events.filter(group=group)` would bypass that prefetch cache and
+            # issue a fresh COUNT query per file (an N+1; goggles#18), so count
+            # from the already-loaded rows by comparing group_id directly.
+            "group_event_count": sum(
+                1 for event in audit_file.events.all() if event.group_id == group.id
+            ),
             "account_refs": audit_file.account_refs,
             "engine_ids": audit_file.engine_ids,
             "group_refs": audit_file.group_refs,
