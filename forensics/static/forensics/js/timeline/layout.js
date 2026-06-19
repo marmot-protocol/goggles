@@ -20,12 +20,37 @@ export const colInnerW = COLW - 16;
 
 // ---- formatting (string-pure, UTC) ----
 
-export const clockOf = (ms) => new Date(ms).toISOString().slice(11, 19);
+// A "—" placeholder for timestamps that cannot be rendered. A ms value can be
+// non-finite (null/NaN) or out of JS Date's range (abs ms > 8.64e15), in which
+// case `new Date(ms).toISOString()` throws `RangeError: Invalid time value`.
+// Ingest bounds wall_time_ms to a sane epoch range, but data stored before
+// that guard (or any future bug) could still reach here; one bad value must
+// never throw mid-render() and blank the whole timeline + rail. Degrade to a
+// placeholder instead.
+const TIME_PLACEHOLDER = "—";
 
-export const dayOf = (ms) =>
-  new Date(ms).toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" });
+const safeDate = (ms) => {
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return null;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
 
-export const dateOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+export const clockOf = (ms) => {
+  const d = safeDate(ms);
+  return d ? d.toISOString().slice(11, 19) : TIME_PLACEHOLDER;
+};
+
+export const dayOf = (ms) => {
+  const d = safeDate(ms);
+  return d
+    ? d.toLocaleDateString("en", { month: "short", day: "numeric", timeZone: "UTC" })
+    : TIME_PLACEHOLDER;
+};
+
+export const dateOf = (ms) => {
+  const d = safeDate(ms);
+  return d ? d.toISOString().slice(0, 10) : TIME_PLACEHOLDER;
+};
 
 export function fmtGap(min) {
   if (min < 60) return `${Math.round(min)} min`;

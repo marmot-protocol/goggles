@@ -149,12 +149,26 @@ def group_list_rows():
         group.search_ref = search_ref
         group.display_ref = display_group_ref(search_ref)
         group.divergent_count = divergent.get(group.pk, 0)
-        group.last_activity = (
-            datetime.fromtimestamp(group.last_activity_ms / 1000, tz=UTC)
-            if group.last_activity_ms is not None
-            else None
-        )
+        group.last_activity = _last_activity_datetime(group.last_activity_ms)
     return groups
+
+
+def _last_activity_datetime(last_activity_ms):
+    """Build a ``datetime`` from a ``wall_time_ms`` value, defensively.
+
+    Ingest bounds ``wall_time_ms`` to a sane epoch range, but data already in
+    the database (uploaded before that guard, or via a future bug) could carry
+    an out-of-range value. ``datetime.fromtimestamp`` raises for those (year
+    > 9999), and this runs for the groups landing page (also
+    ``LOGIN_REDIRECT_URL``), so one bad event must never 500 the page for
+    every analyst. Degrade to ``None`` ("unknown time") instead.
+    """
+    if last_activity_ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(last_activity_ms / 1000, tz=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def display_group_ref(value: str) -> str:

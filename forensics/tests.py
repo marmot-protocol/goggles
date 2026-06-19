@@ -461,6 +461,42 @@ class AuditLogIngestionTests(TestCase):
         self.assertIsNone(event.seq)
         self.assertIn("seq must be a non-negative integer within range", event.validation_error)
 
+    def test_out_of_range_wall_time_ms_returns_400_and_is_quarantined(self):
+        # wall_time_ms = 1e17 fits the bigint column (< 9.2e18) so it stores
+        # fine and was previously normalized as *valid*, but it is nonsense as
+        # a millis-since-epoch instant (year 3170843). Downstream the server
+        # builds a datetime (the groups landing 500) and the timeline JS a Date
+        # (blank render). Ingest must bound it to a sane epoch range and
+        # quarantine the event instead.
+        raw_token, _token = UploadToken.issue("ios test client")
+        body = jsonl(audit_event(0, wall_time_ms=100_000_000_000_000_000))
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn(
+            "wall_time_ms must be a non-negative integer within range",
+            response.json()["error"],
+        )
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        # Raw evidence is preserved rather than lost to a 500.
+        self.assertEqual(audit_file.raw_text, body)
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIsNone(event.wall_time_ms)
+        self.assertIn(
+            "wall_time_ms must be a non-negative integer within range",
+            event.validation_error,
+        )
+
     def test_out_of_range_integer_field_returns_400_and_is_quarantined(self):
         # target_count -> human_action_target_count is a PositiveIntegerField
         # (32-bit integer column, max 2,147,483,647). 5e9 fits a bigint but not
@@ -1730,6 +1766,36 @@ class GroupListAnnotationTests(TestCase):
             rows["legacy-ref"].display_ref,
             f"{long_ref[:32]}...{long_ref[-32:]}",
         )
+
+    def test_out_of_range_stored_wall_time_ms_does_not_500_group_list(self):
+        # Defense-in-depth for data stored before the ingest bound existed (or
+        # via a future bug): an AuditEvent already in the DB with an
+        # out-of-range wall_time_ms. last_activity_ms = Max(wall_time_ms) feeds
+        # datetime.fromtimestamp(), which raises "year ... is out of range".
+        # The groups landing page is LOGIN_REDIRECT_URL, so an uncaught error
+        # 500s it for *every* analyst. It must degrade to "unknown time"
+        # instead.
+        self.seed_fork_group()
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        # Force a stored value past the year-2100 ingest bound (1e17 -> year
+        # 3170843), bypassing ingest validation as legacy data would.
+        updated = (
+            AuditEvent.objects.filter(group=group)
+            .order_by("-wall_time_ms")
+            .values_list("id", flat=True)[:1]
+        )
+        AuditEvent.objects.filter(id__in=list(updated)).update(wall_time_ms=100_000_000_000_000_000)
+
+        # group_list_rows() itself must not raise.
+        rows = {row.slug: row for row in group_list_rows()}
+        self.assertIsNone(rows[GROUP_REF].last_activity)
+        self.assertEqual(rows[GROUP_REF].last_activity_ms, 100_000_000_000_000_000)
+
+        # And the actual landing view returns 200, not 500.
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        response = self.client.get(reverse("group-list"))
+        self.assertEqual(response.status_code, 200)
 
     def test_group_list_view_query_count_is_bounded(self):
         self.seed_fork_group()

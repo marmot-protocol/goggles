@@ -16,6 +16,17 @@ from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 AUDIT_SCHEMA_VERSION = "marmot-forensics-audit/v1"
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
+# Upper bound for millisecond epoch timestamps (``wall_time_ms``). A value can
+# fit the ``bigint`` column (~9.2e18) and still be nonsense as a millis-since-
+# epoch instant. Downstream consumers materialize it: the server builds a
+# ``datetime`` (year must be <= 9999, i.e. ms < ~2.534e14) and the timeline JS
+# builds a ``Date`` (abs ms <= 8.64e15). A garbage value past either ceiling
+# would crash a shared page (the groups landing 500) or a per-group timeline
+# (blank render). Bound ingest at the year-2100 mark -- comfortably inside both
+# ceilings and far beyond any plausible real audit-log timestamp -- and
+# quarantine anything past it like other schema violations.
+MAX_WALL_TIME_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
+
 
 @dataclass(frozen=True)
 class IngestionResult:
@@ -271,6 +282,11 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if normalized["wall_time_ms"] is None:
         errors.append("wall_time_ms must be a non-negative integer")
     elif int_exceeds_model_limit("wall_time_ms", normalized["wall_time_ms"], errors):
+        normalized["wall_time_ms"] = None
+    elif normalized["wall_time_ms"] > MAX_WALL_TIME_MS:
+        errors.append(
+            f"wall_time_ms must be a non-negative integer within range (at most {MAX_WALL_TIME_MS})"
+        )
         normalized["wall_time_ms"] = None
     if normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
         errors.append("account_ref must be 32 hex characters when present")
