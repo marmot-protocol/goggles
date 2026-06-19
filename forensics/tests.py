@@ -5,6 +5,7 @@ import os
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured
@@ -18,6 +19,7 @@ from django.utils import timezone
 
 from config import settings as settings_module
 
+from . import ingest as ingest_module
 from .analysis import (
     audit_files_for_group,
     display_group_ref,
@@ -548,6 +550,58 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(bad_event.parse_status, "invalid")
         self.assertEqual(bad_event.raw_line, "{not-json}")
         self.assertIn("JSON", bad_event.validation_error)
+
+    def test_invalid_utf8_upload_file_sha256_race_returns_existing_audit_file(self):
+        # save_invalid_upload() does the same check-then-create on file_sha256
+        # as the valid ingestion path. If a concurrent request inserts the same
+        # non-UTF-8 payload after the existence check but before create(), the
+        # losing request must resolve to the winning AuditFile instead of
+        # propagating IntegrityError and dropping the raw evidence. Regression
+        # for marmot-protocol/goggles#35.
+        dump_bytes = b"\xff\xfeinvalid marmot audit bytes"
+        raw_text = dump_bytes.decode("utf-8", errors="replace")
+        file_sha256 = hashlib.sha256(dump_bytes).hexdigest()
+        original_group_for_slug = ingest_module.group_for_slug
+        race_winner = {}
+
+        def insert_race_winner(slug, name=""):
+            group = original_group_for_slug(slug, name)
+            if "audit_file" not in race_winner:
+                race_winner["audit_file"] = AuditFile.objects.create(
+                    file_sha256=file_sha256,
+                    byte_size=len(dump_bytes),
+                    raw_text=raw_text,
+                    validation_status=AuditFile.STATUS_INVALID,
+                    validation_error="winner preserved invalid UTF-8 evidence",
+                    total_line_count=1,
+                    invalid_event_count=1,
+                )
+                AuditEvent.objects.create(
+                    group=group,
+                    audit_file=race_winner["audit_file"],
+                    line_number=1,
+                    line_hash=hashlib.sha256(
+                        raw_text.encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                    raw_line=raw_text,
+                    parse_status=AuditEvent.STATUS_INVALID,
+                    validation_error="winner preserved invalid UTF-8 evidence",
+                )
+            return group
+
+        with mock.patch.object(ingest_module, "group_for_slug", side_effect=insert_race_winner):
+            result = ingest_audit_log_bytes(
+                dump_bytes=dump_bytes,
+                fallback_group_slug="mobile-qa",
+                fallback_group_name="Mobile QA",
+            )
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.audit_file, race_winner["audit_file"])
+        self.assertEqual(AuditFile.objects.count(), 1)
+        self.assertEqual(AuditEvent.objects.count(), 1)
+        self.assertEqual(result.audit_file.file_sha256, file_sha256)
+        self.assertEqual(result.audit_file.raw_text, raw_text)
 
     def test_deeply_nested_json_line_is_quarantined_not_500(self):
         # A single deeply-nested JSON line makes json.loads recurse until it
