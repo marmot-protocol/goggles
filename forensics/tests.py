@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 from datetime import timedelta
@@ -270,6 +271,55 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(events[1].event_type, "ingest_outcome")
         self.assertEqual(events[1].outcome_kind, "processed")
         self.assertEqual(events[1].epoch, 7)
+
+    def test_unicode_line_separator_inside_json_string_does_not_split_jsonl_record(self):
+        separators = (
+            ("NEL (U+0085)", "\u0085"),
+            ("LINE SEPARATOR (U+2028)", "\u2028"),
+            ("PARAGRAPH SEPARATOR (U+2029)", "\u2029"),
+        )
+
+        for separator_index, (separator_name, separator) in enumerate(separators):
+            with self.subTest(separator=separator_name):
+                raw_token, _token = UploadToken.issue(f"ios test client {separator_name}")
+                first_event = audit_event(separator_index * 2)
+                first_event["context"]["operation_id"] = f"before{separator}after"
+                first_line = json.dumps(
+                    first_event,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                second_line = json.dumps(
+                    audit_event(separator_index * 2 + 1),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                body = f"{first_line}\n{second_line}\n"
+
+                self.assertNotIn("\n", first_line)
+                self.assertIn(separator, first_line)
+
+                response = self.client.post(
+                    reverse("api-audit-log-upload"),
+                    data=body,
+                    content_type="application/x-ndjson",
+                    HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+                )
+
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(response.json()["validation_status"], AuditFile.STATUS_VALID)
+                self.assertEqual(response.json()["event_count"], 2)
+
+                audit_file = AuditFile.objects.get(raw_text=body)
+                self.assertEqual(audit_file.validation_status, AuditFile.STATUS_VALID)
+                events = list(audit_file.events.order_by("line_number"))
+                self.assertEqual([event.line_number for event in events], [1, 2])
+                self.assertEqual([event.parse_status for event in events], ["valid", "valid"])
+                self.assertEqual(events[0].raw_line, first_line)
+                expected_hash = hashlib.sha256(first_line.encode("utf-8")).hexdigest()
+                self.assertEqual(events[0].line_hash, expected_hash)
+                self.assertEqual(events[0].context_operation_id, f"before{separator}after")
+                self.assertEqual(events[1].raw_line, second_line)
 
     def test_api_rejects_upload_without_valid_token(self):
         for authorization in ("", "Bearer invalid-token"):
