@@ -351,7 +351,12 @@ def human_action_groups_for_group(events):
         group["component_ids"] = sorted(
             set(group["component_ids"]) | set(event.human_action_component_ids or [])
         )
-        group["target_count"] = group["target_count"] or event.human_action_target_count
+        # Nullable integer: a real 0 must survive. ``X or Y`` would drop a
+        # genuine target_count of 0 (or overwrite it with a later positive
+        # value), so preserve the existing group value unless it is None.
+        group["target_count"] = first_present(
+            group["target_count"], event.human_action_target_count
+        )
         group["from_epoch"] = (
             group["from_epoch"] if group["from_epoch"] is not None else event.from_epoch
         )
@@ -430,7 +435,7 @@ def event_summary(event: AuditEvent) -> str:
     if event.event_type == "fork_resolution":
         return f"{event.winner} at source epoch {event.source_epoch}"
     if event.event_type == "convergence_decision":
-        return f"tip {event.current_tip_epoch} -> {event.selected_tip_epoch or '-'}"
+        return f"tip {event.current_tip_epoch} -> {int_or_dash(event.selected_tip_epoch)}"
     if event.event_type == "epoch_confirmed":
         return f"epoch {event.from_epoch} -> {event.to_epoch}"
     if event.event_type == "epoch_rolled_back":
@@ -441,7 +446,7 @@ def event_summary(event: AuditEvent) -> str:
     if event.event_type == "message_state_changed":
         return f"{event.msg_id} -> {event.new_state}"
     if event.event_type == "ingest_outcome":
-        return f"{event.outcome_kind} epoch {event.epoch or '-'}"
+        return f"{event.outcome_kind} epoch {int_or_dash(event.epoch)}"
     if event.event_type == "send_outcome":
         return f"{event.intent_kind} -> {event.result_kind}"
     return event.event_type
@@ -464,14 +469,36 @@ def event_tone(event: AuditEvent) -> str:
     return tone
 
 
+def first_present(*values):
+    """First value that is not ``None``.
+
+    Unlike an ``X or Y`` chain, this preserves falsy-but-real integers such as
+    epoch ``0`` or ``seq`` ``0``. Stored integer fields are nullable, so ``None``
+    (not falsiness) is the only sentinel for "absent".
+    """
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def int_or_dash(value, dash: str = "-"):
+    """Render an integer field, preserving a real ``0``.
+
+    ``value or dash`` would collapse epoch/seq ``0`` to the dash; ``None`` is the
+    only "absent" sentinel for these nullable integer columns.
+    """
+    return dash if value is None else value
+
+
 def event_epoch(event: AuditEvent):
-    return (
-        event.epoch
-        or event.source_epoch
-        or event.to_epoch
-        or event.pending_epoch
-        or event.current_tip_epoch
-        or event.selected_tip_epoch
+    return first_present(
+        event.epoch,
+        event.source_epoch,
+        event.to_epoch,
+        event.pending_epoch,
+        event.current_tip_epoch,
+        event.selected_tip_epoch,
     )
 
 
@@ -530,7 +557,7 @@ def secondary_action_label(event: AuditEvent) -> str:
     if event.human_action_fields:
         parts.append(", ".join(event.human_action_fields))
     if event.from_epoch is not None or event.to_epoch is not None:
-        parts.append(f"epoch {event.from_epoch or '-'} -> {event.to_epoch or '-'}")
+        parts.append(f"epoch {int_or_dash(event.from_epoch)} -> {int_or_dash(event.to_epoch)}")
     return " · ".join(parts)
 
 

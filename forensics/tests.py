@@ -1214,6 +1214,42 @@ class HumanActionGroupingTests(TestCase):
         self.assertEqual(action_groups[1]["last_wall_time_ms"], T0 + 1000)
         self.assertEqual(action_groups[1]["operation_id"], colliding_operation_id)
 
+    def test_shared_operation_target_count_zero_is_preserved(self):
+        # Regression for goggles#16: a real target_count of 0 must survive the
+        # grouping merge. The old ``group[...] or event...`` chain dropped a
+        # falsy-but-real 0 — either replacing it with a later None (rendered as
+        # the en dash) or overwriting it with a subsequent positive value.
+        shared = {"operation_id": "op-target-zero"}
+
+        def action(target_count):
+            ha = self._human_action(action="remove_member")
+            ha["target_count"] = target_count
+            return {**shared, "human_action": ha}
+
+        # First event carries a genuine target_count of 0; the second omits it
+        # (target_count=None) and a third carries a positive count. The merged
+        # group must keep the genuine 0 rather than letting None or 3 win.
+        ingest_body(
+            jsonl(
+                audit_event(0, wall_time_ms=T0, context=action(0)),
+                audit_event(1, wall_time_ms=T0 + 1000, context=action(None)),
+                audit_event(2, wall_time_ms=T0 + 2000, context=action(3)),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        events = list(valid_events_for_group(group))
+
+        # Sanity: the genuine 0 round-trips through ingest as a real 0, not None.
+        self.assertEqual(events[0].human_action_target_count, 0)
+        self.assertIsNone(events[1].human_action_target_count)
+
+        action_groups = human_action_groups_for_group(events)
+
+        # All three share one operation_id -> one merged group.
+        self.assertEqual(len(action_groups), 1)
+        # The genuine first-seen 0 is preserved, not dropped or overwritten.
+        self.assertEqual(action_groups[0]["target_count"], 0)
+
 
 class DashboardTests(TestCase):
     def test_upload_log_list_requires_login(self):
@@ -1649,6 +1685,42 @@ class TimelinePayloadTests(TestCase):
         ep = payload_for(group)["epochs"][0]
 
         self.assertEqual(ep["message_event_count"], 1)
+
+    def test_epoch_zero_message_event_buckets_under_epoch_zero(self):
+        # Regression for goggles#16: a real epoch of 0 (MLS genesis epoch) must
+        # be treated as present. The old `X or Y` chain in event_epoch() dropped
+        # the falsy 0, so the message event was lost from message_event_count and
+        # the timeline item's epoch came out as None.
+        ingest_body(
+            jsonl(
+                # Confirms epoch 0, creating the epoch-0 bucket.
+                epoch_confirmed(0, ENGINE_ALICE, 0, 0, T0),
+                # Message event whose only epoch field is the genuine 0.
+                audit_event(
+                    1,
+                    kind={
+                        "type": "ingest_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome_kind": "processed",
+                        "epoch": 0,
+                    },
+                    wall_time_ms=T0 + 10,
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        payload = payload_for(group)
+        ep = payload["epochs"][0]
+
+        # Bucket is epoch 0 and the epoch-0 message event is counted there.
+        self.assertEqual(ep["epoch"], 0)
+        self.assertEqual(ep["message_event_count"], 1)
+
+        # The timeline item for the epoch-0 event renders epoch 0, not None.
+        outcome_items = [item for item in payload["items"] if item["type"] == "ingest_outcome"]
+        self.assertEqual(len(outcome_items), 1)
+        self.assertEqual(outcome_items[0]["epoch"], 0)
 
     def test_null_wall_time_event_excluded_with_count(self):
         ingest_body(jsonl(audit_event(0, wall_time_ms=T0)))

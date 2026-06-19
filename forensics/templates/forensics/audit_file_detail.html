@@ -99,8 +99,8 @@
                 <span class="badge badge--danger">invalid</span>
               {% endif %}
             </td>
-            <td class="is-right is-mono is-muted">{{ event.seq|default:"–" }}</td>
-            <td class="is-mono is-muted">{{ event.wall_time_ms|default:"–" }}</td>
+            <td class="is-right is-mono is-muted">{{ event.seq|default_if_none:"–" }}</td>
+            <td class="is-mono is-muted">{{ event.wall_time_ms|default_if_none:"–" }}</td>
             <td class="is-mono is-muted">{{ event.account_ref|default:"–"|truncatechars:9 }}</td>
             <td class="is-mono is-muted">{{ event.engine_id|default:"–"|truncatechars:9 }}</td>
             <td class="is-mono is-muted">
