@@ -433,6 +433,76 @@ class AuditLogIngestionTests(TestCase):
         self.assertIsNone(event.wall_time_ms)
         self.assertIsNone(event.payload_len)
 
+    def test_out_of_range_bigint_returns_400_and_is_quarantined(self):
+        # seq exceeds the bigint column ceiling (9.2e18). Previously this
+        # passed value_if_int(), was normalized as valid, and only blew up at
+        # bulk_create() with an uncaught DataError -> 500 and lost raw text.
+        raw_token, _token = UploadToken.issue("ios test client")
+        body = jsonl(audit_event(100_000_000_000_000_000_000))
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("seq must be a non-negative integer within range", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        # Raw evidence is preserved rather than lost to a 500.
+        self.assertEqual(audit_file.raw_text, body)
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIsNone(event.seq)
+        self.assertIn("seq must be a non-negative integer within range", event.validation_error)
+
+    def test_out_of_range_integer_field_returns_400_and_is_quarantined(self):
+        # target_count -> human_action_target_count is a PositiveIntegerField
+        # (32-bit integer column, max 2,147,483,647). 5e9 fits a bigint but not
+        # this column, so it must be rejected even though it is well below the
+        # bigint ceiling -- a value a buggy client could plausibly emit.
+        raw_token, _token = UploadToken.issue("ios test client")
+        body = jsonl(
+            audit_event(
+                0,
+                human_action={
+                    "action": "update_group_profile",
+                    "origin": "local_user",
+                    "fields": ["name"],
+                    "target_count": 5_000_000_000,
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn(
+            "target_count must be a non-negative integer within range",
+            response.json()["error"],
+        )
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(audit_file.raw_text, body)
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIsNone(event.human_action_target_count)
+        self.assertIn(
+            "target_count must be a non-negative integer within range",
+            event.validation_error,
+        )
+
     def test_mixed_engine_audit_log_returns_400_and_is_quarantined(self):
         raw_token, _token = UploadToken.issue("mixed client")
         body = jsonl(

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.db import IntegrityError, transaction
+from django.db.backends.base.operations import BaseDatabaseOperations
 from django.template.defaultfilters import slugify
 from django.utils import timezone
 
@@ -265,8 +266,12 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         )
     if normalized["seq"] is None:
         errors.append("seq must be a non-negative integer")
+    elif int_exceeds_model_limit("seq", normalized["seq"], errors):
+        normalized["seq"] = None
     if normalized["wall_time_ms"] is None:
         errors.append("wall_time_ms must be a non-negative integer")
+    elif int_exceeds_model_limit("wall_time_ms", normalized["wall_time_ms"], errors):
+        normalized["wall_time_ms"] = None
     if normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
         errors.append("account_ref must be 32 hex characters when present")
     if not is_hex(normalized["engine_id"], exact_len=32):
@@ -1008,6 +1013,8 @@ def copy_int(
     if value is None:
         errors.append(f"{field} must be a non-negative integer")
         return
+    if int_exceeds_model_limit(field, value, errors):
+        return
     normalized[field] = value
 
 
@@ -1023,6 +1030,8 @@ def copy_optional_int(
     value = value_if_int(kind.get(field))
     if value is None:
         errors.append(f"{field} must be a non-negative integer when present")
+        return
+    if int_exceeds_model_limit(field, value, errors, model_field=dest_field or field):
         return
     normalized[dest_field or field] = value
 
@@ -1043,6 +1052,38 @@ def string_exceeds_model_limit(field: str, value: str, errors: list[str]) -> boo
     max_length = AuditEvent._meta.get_field(field).max_length
     if max_length is not None and len(value) > max_length:
         errors.append(f"{field} must be at most {max_length} characters")
+        return True
+    return False
+
+
+def model_int_field_max(field: str) -> int | None:
+    """Logical max for an ``AuditEvent`` integer column.
+
+    Keyed off the field's internal type via the *base* backend ranges rather
+    than ``connection.ops.integer_field_range``: the latter is backend
+    dependent (SQLite reports the bigint range for every integer field), but
+    the column width is fixed by the schema, so the validation must enforce the
+    same range Postgres enforces regardless of which database the suite runs
+    against. This keeps the guard correct on the SQLite dev DB and in parity
+    with production Postgres.
+    """
+    internal_type = AuditEvent._meta.get_field(field).get_internal_type()
+    field_range = BaseDatabaseOperations.integer_field_ranges.get(internal_type)
+    if field_range is None:
+        return None
+    return field_range[1]
+
+
+def int_exceeds_model_limit(
+    field: str,
+    value: int,
+    errors: list[str],
+    *,
+    model_field: str | None = None,
+) -> bool:
+    max_value = model_int_field_max(model_field or field)
+    if max_value is not None and value > max_value:
+        errors.append(f"{field} must be a non-negative integer within range")
         return True
     return False
 
