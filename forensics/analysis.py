@@ -287,7 +287,12 @@ def human_action_groups_for_group(events):
     for event in events:
         if not event.human_action_action:
             continue
-        key = event.context_operation_id or f"action:{event.human_action_action}"
+        # Only merge events that share a real operation_id. Events with no
+        # operation_id must NOT collapse onto action type (goggles#30) — that
+        # would union every same-type human action across the group's history
+        # into one card. Fall back to a per-event unique key so each
+        # operation_id-less action becomes its own group.
+        key = event.context_operation_id or f"event:{event.pk}"
         if key not in groups:
             groups[key] = {
                 "order": next(sequence),
