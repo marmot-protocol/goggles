@@ -14,6 +14,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .analysis import (
+    agent_state_export_for_group,
     audit_files_for_group,
     event_row,
     file_rows_for_group,
@@ -91,6 +92,25 @@ def group_detail(request: HttpRequest, slug: str):
             "timeline_payload": timeline_payload_for_group(group, events, audit_files),
         },
     )
+
+
+@login_required
+def group_agent_export(request: HttpRequest, slug: str):
+    group = get_object_or_404(AuditGroup, slug=slug)
+    audit_files = list(audit_files_for_group(group))
+    events = list(valid_events_for_group(group))
+    pretty = request.GET.get("pretty", "").lower() in {"1", "true", "yes"}
+    json_dumps_params = {"sort_keys": True}
+    if pretty:
+        json_dumps_params["indent"] = 2
+    else:
+        json_dumps_params["separators"] = (",", ":")
+    response = JsonResponse(
+        agent_state_export_for_group(group, events, audit_files),
+        json_dumps_params=json_dumps_params,
+    )
+    response["Content-Disposition"] = f'attachment; filename="{group.slug}-agent-state.json"'
+    return response
 
 
 @login_required

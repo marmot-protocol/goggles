@@ -17,6 +17,13 @@
   <span class="crumb is-current" title="{{ group.group_ref }}">{{ group.group_ref|truncatechars:24 }}</span>
 {% endblock %}
 
+{% block topbar_tools %}
+  <a class="btn btn--secondary btn--sm" href="{% url 'group-agent-export' group.slug %}" title="Download agent-readable group state JSON">
+    <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>
+    Export JSON
+  </a>
+{% endblock %}
+
 {% block content %}
 <div class="tl-header">
   <div class="tl-header__top">

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from itertools import count
 
 from django.db.models import Count, Exists, Max, Min, OuterRef, Q
+from django.utils import timezone
 
 from .models import AuditEvent, AuditFile, AuditGroup
 
@@ -33,6 +34,61 @@ MESSAGE_EVENT_TYPES = {
     "message_state_changed",
     "rejection",
 }
+
+EPOCH_CHANGE_RESULT_KINDS = {"group_created", "group_evolution"}
+AGENT_EXPORT_SCHEMA_VERSION = "goggles-agent-group-state/v1"
+AGENT_EXPORT_NORMALIZED_FIELDS = (
+    "context_operation_id",
+    "human_action_action",
+    "human_action_origin",
+    "human_action_phase",
+    "human_action_fields",
+    "human_action_component_ids",
+    "human_action_target_count",
+    "human_action_message_ids",
+    "msg_id",
+    "outbound_msg_id",
+    "outbound_welcome_msg_ids",
+    "target_kind",
+    "relay_urls",
+    "accepted_relay_urls",
+    "failed_relays",
+    "required_acks",
+    "met_required_acks",
+    "epoch",
+    "source_epoch",
+    "from_epoch",
+    "to_epoch",
+    "pending_epoch",
+    "restored_epoch",
+    "current_tip_epoch",
+    "selected_fork_epoch",
+    "selected_tip_epoch",
+    "payload_len",
+    "payload_digest",
+    "candidate_digest",
+    "incumbent_digest",
+    "envelope_kind",
+    "outcome",
+    "outcome_kind",
+    "stale_reason",
+    "decision",
+    "reason",
+    "winner",
+    "new_state",
+    "pending_kind",
+    "intent_kind",
+    "result_kind",
+    "proposal_kind",
+    "snapshot_name",
+    "selected_branch_id",
+    "detail",
+    "fallback_snapshot_used",
+    "invalidated_msg_id",
+    "max_rewind_commits",
+    "candidate_count",
+    "eligible_count",
+)
 
 VIZ_PALETTE_SIZE = 8
 GROUP_REF_FULL_DISPLAY_MAX = 80
@@ -628,6 +684,97 @@ def timeline_payload_for_group(group, events, audit_files):
     }
 
 
+def agent_state_export_for_group(group, events, audit_files):
+    ordered = sorted_timeline_events(events)
+    timeline = timeline_payload_for_group(group, ordered, audit_files)
+    engine_ids = {engine["engine_id"] for engine in timeline["engines"]}
+    return {
+        "schema_version": AGENT_EXPORT_SCHEMA_VERSION,
+        "generated_at": timezone.now().isoformat(),
+        "sensitivity": {
+            "classification": "sensitive_forensic_export",
+            "contains": [
+                "engine_ids",
+                "account_refs",
+                "group_refs",
+                "message_ids",
+                "payload_digests",
+                "relay_urls",
+            ],
+            "omits": [
+                "raw_upload_bodies",
+                "bearer_tokens",
+                "source_ips",
+                "user_agents",
+            ],
+        },
+        "group": timeline["group"],
+        "summary": group_summary(group, audit_files, events=ordered),
+        "sources": [agent_source_row(audit_file, group) for audit_file in audit_files],
+        "timeline": timeline,
+        "actions": human_action_groups_for_group(ordered),
+        "messages": message_traces_from_events(ordered, engine_ids),
+        "events": [agent_event_row(event) for event in ordered],
+    }
+
+
+def agent_source_row(audit_file, group):
+    return {
+        "id": audit_file.id,
+        "source_name": audit_file.source_name or f"audit-file-{audit_file.id}",
+        "source_label": source_label_for_file(audit_file),
+        "source_account_label": audit_file.source_account_label,
+        "source_device_label": audit_file.source_device_label,
+        "source_platform": audit_file.source_platform,
+        "source_app_version": audit_file.source_app_version,
+        "validation_status": audit_file.validation_status,
+        "validation_error": audit_file.validation_error,
+        "total_line_count": audit_file.total_line_count,
+        "valid_event_count": audit_file.valid_event_count,
+        "invalid_event_count": audit_file.invalid_event_count,
+        "duplicate_event_count": audit_file.duplicate_event_count,
+        "group_event_count": sum(
+            1 for event in audit_file.events.all() if event.group_id == group.id
+        ),
+        "first_seq": audit_file.first_seq,
+        "last_seq": audit_file.last_seq,
+        "first_wall_time_ms": audit_file.first_wall_time_ms,
+        "last_wall_time_ms": audit_file.last_wall_time_ms,
+        "account_refs": audit_file.account_refs,
+        "engine_ids": audit_file.engine_ids,
+        "group_refs": audit_file.group_refs,
+        "schema_versions": audit_file.schema_versions,
+        "created_at": audit_file.created_at.isoformat(),
+    }
+
+
+def agent_event_row(event):
+    normalized = {}
+    for field in AGENT_EXPORT_NORMALIZED_FIELDS:
+        value = getattr(event, field)
+        if value in (None, "", [], {}):
+            continue
+        normalized[field] = value
+    return {
+        "id": event.id,
+        "source": {
+            "file_id": event.audit_file_id,
+            "line_number": event.line_number,
+            "line_hash": event.line_hash,
+        },
+        "schema_version": event.schema_version,
+        "seq": event.seq,
+        "wall_time_ms": event.wall_time_ms,
+        "account_ref": event.account_ref,
+        "engine_id": event.engine_id,
+        "group_ref": event.group_ref,
+        "event_type": event.event_type,
+        "context": event.raw_context or {},
+        "kind": event.raw_kind or {},
+        "normalized": normalized,
+    }
+
+
 def group_integrity_summary(group, events=None, traces=None):
     if events is None:
         events = list(valid_events_for_group(group))
@@ -729,6 +876,8 @@ def timeline_engines(events):
 
 def timeline_epochs(events, engine_idx, engine_count):
     confirmations = defaultdict(list)
+    direct_initiators = defaultdict(list)
+    message_epochs = defaultdict(set)
     forks = defaultdict(list)
     convergences = defaultdict(list)
     rollbacks = defaultdict(list)
@@ -738,7 +887,15 @@ def timeline_epochs(events, engine_idx, engine_count):
     roles = {}
 
     for event in events:
+        epoch = event_epoch(event)
+        if epoch is not None:
+            for msg_id in event_message_ids(event):
+                message_epochs[msg_id].add(epoch)
+
+    for event in events:
         engine = engine_idx.get(event.engine_id)
+        for epoch, initiator in epoch_initiators_for_event(event, engine, message_epochs):
+            direct_initiators[epoch].append(initiator)
         if event.event_type == "epoch_confirmed" and event.to_epoch is not None:
             confirmations[event.to_epoch].append(
                 {
@@ -746,6 +903,9 @@ def timeline_epochs(events, engine_idx, engine_count):
                     "t": event.wall_time_ms,
                     "from_epoch": event.from_epoch,
                     "pending_kind": event.pending_kind or "",
+                    "human_action": event.human_action_action or "",
+                    "human_action_origin": event.human_action_origin or "",
+                    "human_action_phase": event.human_action_phase or "",
                     "item_id": event.id,
                 }
             )
@@ -815,16 +975,23 @@ def timeline_epochs(events, engine_idx, engine_count):
                 message_counts[epoch] += 1
 
     epochs = []
-    for number in sorted(set(confirmations) | referenced):
+    for number in sorted(set(confirmations) | referenced | set(direct_initiators)):
         confs = sorted(
             confirmations.get(number, []),
             key=lambda conf: (conf["t"] is None, conf["t"] or 0, conf["item_id"]),
+        )
+        initiators = sorted(
+            dedupe_epoch_initiators(direct_initiators.get(number, [])),
+            key=lambda item: (item["t"] is None, item["t"] or 0, item["item_id"]),
         )
         seen_engines = set()
         for conf in confs:
             conf["repeat"] = conf["engine"] in seen_engines
             if conf["engine"] is not None:
                 seen_engines.add(conf["engine"])
+        initiator_engines = {
+            initiator["engine"] for initiator in initiators if initiator["engine"] is not None
+        }
         timed = [conf for conf in confs if conf["t"] is not None]
         first = timed[0] if timed else None
         for conf in confs:
@@ -847,8 +1014,12 @@ def timeline_epochs(events, engine_idx, engine_count):
                 "first_confirmed_ms": first["t"] if first else None,
                 "first_confirmed_engine": first["engine"] if first else None,
                 "commit_item_id": first["item_id"] if first else None,
+                "initiators": initiators,
+                "initiator_engines": sorted(initiator_engines),
                 "confirmations": confs,
-                "unconfirmed_engines": sorted(set(range(engine_count)) - seen_engines)
+                "unconfirmed_engines": sorted(
+                    set(range(engine_count)) - seen_engines - initiator_engines
+                )
                 if confs
                 else sorted(range(engine_count)),
                 "spread_ms": (timed[-1]["t"] - timed[0]["t"]) if len(timed) > 1 else None,
@@ -861,6 +1032,41 @@ def timeline_epochs(events, engine_idx, engine_count):
             }
         )
     return epochs, roles
+
+
+def epoch_initiators_for_event(event, engine, message_epochs):
+    if engine is None or event.human_action_origin != "local_user":
+        return []
+
+    initiator = {
+        "engine": engine,
+        "t": event.wall_time_ms,
+        "action": event.human_action_action or "",
+        "phase": event.human_action_phase or "",
+        "result_kind": event.result_kind or "",
+        "pending_kind": event.pending_kind or "",
+        "item_id": event.id,
+        "source": event.event_type,
+    }
+
+    if event.to_epoch is not None:
+        return [(event.to_epoch, initiator)]
+
+    if event.event_type == "send_outcome" and event.result_kind in EPOCH_CHANGE_RESULT_KINDS:
+        epochs = set()
+        for msg_id in event_message_ids(event):
+            epochs.update(message_epochs.get(msg_id, set()))
+        return [(epoch, initiator) for epoch in sorted(epochs)]
+
+    return []
+
+
+def dedupe_epoch_initiators(initiators):
+    by_key = {}
+    for item in initiators:
+        key = (item["engine"], item["item_id"], item["source"])
+        by_key.setdefault(key, item)
+    return list(by_key.values())
 
 
 def timeline_items(events, engine_idx, roles):

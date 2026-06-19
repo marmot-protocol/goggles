@@ -58,12 +58,25 @@ function confirmationList(payload, ep) {
         </div>`;
     })
     .join("");
-  const missing = ep.unconfirmed_engines.length
+  const missingEngines = ep.unconfirmed_engines || [];
+  const missing = missingEngines.length
     ? `<p class="rail-note rail-note--danger">${icon("alert", 12)} never confirmed by ${esc(
-        ep.unconfirmed_engines.map((idx) => engineName(payload, idx)).join(", ")
+        missingEngines.map((idx) => engineName(payload, idx)).join(", ")
       )}</p>`
     : "";
   return `<div class="rail-confirm-list">${rows}</div>${missing}`;
+}
+
+function initiatorSummary(payload, ep) {
+  const initiators = ep.initiators || [];
+  if (!initiators.length) return "";
+  const names = initiators
+    .map((initiator) =>
+      initiator.engine != null ? engineName(payload, initiator.engine) : "unknown engine"
+    )
+    .join(", ");
+  const action = initiators.find((initiator) => initiator.action)?.action || "";
+  return `${esc(names)}${action ? ` · ${esc(action)}` : ""}`;
 }
 
 function forkSection(payload, ep) {
@@ -117,6 +130,7 @@ export function renderRail(aside, payload, epochNumber) {
 
   const first = ep.confirmations.find((conf) => conf.t != null);
   const committer = first?.engine != null ? engineName(payload, first.engine) : null;
+  const initiator = initiatorSummary(payload, ep);
   const transition =
     first?.from_epoch != null ? `${first.from_epoch} → ${ep.epoch}` : `${ep.epoch}`;
   const confirmedCount = new Set(
@@ -127,6 +141,7 @@ export function renderRail(aside, payload, epochNumber) {
     row("Epoch", esc(ep.epoch)),
     row("Transition", esc(transition)),
     first?.pending_kind ? row("Pending kind", esc(first.pending_kind)) : "",
+    initiator ? row("Initiator", initiator, { mono: false }) : "",
     ep.first_confirmed_ms != null
       ? row("First confirmed", `${esc(dateOf(ep.first_confirmed_ms))} ${clockOf(ep.first_confirmed_ms)} UTC`)
       : row("First confirmed", "–"),

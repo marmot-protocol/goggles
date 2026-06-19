@@ -1814,6 +1814,113 @@ class TimelinePayloadTests(TestCase):
 
         self.assertEqual(payload["epochs"][0]["unconfirmed_engines"], [1])
 
+    def test_local_action_initiator_is_not_an_unconfirmed_engine(self):
+        system_action = {"action": "confirm_epoch", "origin": "system"}
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    kind={
+                        "type": "human_action",
+                        "action": "update_group_profile",
+                        "origin": "local_user",
+                        "phase": "succeeded",
+                        "from_epoch": 6,
+                        "to_epoch": 7,
+                    },
+                )
+            ),
+            source_account_label="Alice",
+        )
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=T0 + 100,
+                    human_action=system_action,
+                    kind={
+                        "type": "epoch_confirmed",
+                        "from_epoch": 6,
+                        "to_epoch": 7,
+                        "pending_kind": "group_evolution",
+                    },
+                )
+            ),
+            source_account_label="Bob",
+        )
+        ingest_body(jsonl(audit_event(0, engine_id=ENGINE_CAROL, wall_time_ms=T0 + 200)))
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        ep = payload_for(group)["epochs"][0]
+
+        self.assertEqual(ep["epoch"], 7)
+        self.assertEqual(ep["initiator_engines"], [0])
+        self.assertEqual(ep["initiators"][0]["action"], "update_group_profile")
+        self.assertEqual(ep["initiators"][0]["source"], "human_action")
+        self.assertEqual(ep["confirmations"][0]["engine"], 1)
+        self.assertEqual(ep["unconfirmed_engines"], [2])
+
+    def test_group_evolution_send_outcome_links_initiator_by_message_epoch(self):
+        system_action = {"action": "confirm_epoch", "origin": "system"}
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    kind={
+                        "type": "send_outcome",
+                        "intent_kind": "update_group_data",
+                        "result_kind": "group_evolution",
+                        "outbound_msg_id": MSG_ID,
+                    },
+                )
+            ),
+            source_account_label="Alice",
+        )
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=T0 + 50,
+                    human_action=system_action,
+                    kind={
+                        "type": "ingest_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome_kind": "processed",
+                        "epoch": 7,
+                    },
+                ),
+                audit_event(
+                    1,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=T0 + 100,
+                    human_action=system_action,
+                    kind={
+                        "type": "epoch_confirmed",
+                        "from_epoch": 6,
+                        "to_epoch": 7,
+                        "pending_kind": "group_evolution",
+                    },
+                ),
+            ),
+            source_account_label="Bob",
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        ep = payload_for(group)["epochs"][0]
+
+        self.assertEqual(ep["initiator_engines"], [0])
+        self.assertEqual(ep["initiators"][0]["source"], "send_outcome")
+        self.assertEqual(ep["initiators"][0]["result_kind"], "group_evolution")
+        self.assertEqual(ep["confirmations"][0]["engine"], 1)
+        self.assertEqual(ep["unconfirmed_engines"], [])
+
     def test_rollback_creates_stub_epoch_with_roles(self):
         ingest_body(
             jsonl(
@@ -2166,10 +2273,43 @@ class GroupDetailTimelineViewTests(TestCase):
         response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
 
         self.assertContains(response, 'id="timeline-data"')
+        self.assertContains(response, reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+        self.assertContains(response, "Export JSON")
         payload = response.context["timeline_payload"]
         self.assertEqual(payload["version"], 1)
         self.assertEqual(len(payload["engines"]), 1)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
+
+    def test_group_agent_export_requires_login(self):
+        ingest_body(representative_audit_log())
+
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+
+    def test_group_agent_export_returns_agent_readable_json(self):
+        ingest_body(representative_audit_log(), source_account_label="Alice")
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/json")
+        self.assertIn("attachment", response["Content-Disposition"])
+        self.assertIn(f"{GROUP_REF}-agent-state.json", response["Content-Disposition"])
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-agent-group-state/v1")
+        self.assertEqual(payload["group"]["slug"], GROUP_REF)
+        self.assertEqual(payload["summary"]["event_count"], 2)
+        self.assertEqual(payload["sources"][0]["source_account_label"], "Alice")
+        self.assertEqual(payload["timeline"]["version"], 1)
+        self.assertEqual(len(payload["events"]), 2)
+        self.assertEqual(payload["events"][0]["kind"]["type"], "ingest_entry")
+        self.assertIn("line_hash", payload["events"][0]["source"])
+        self.assertNotIn("raw_line", payload["events"][0])
+        self.assertIn("raw_upload_bodies", payload["sensitivity"]["omits"])
 
     def test_group_detail_fetches_events_with_bounded_queries(self):
         ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
