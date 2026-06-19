@@ -344,7 +344,12 @@ def human_action_groups_for_group(events):
         group["component_ids"] = sorted(
             set(group["component_ids"]) | set(event.human_action_component_ids or [])
         )
-        group["target_count"] = group["target_count"] or event.human_action_target_count
+        # Nullable integer: a real 0 must survive. ``X or Y`` would drop a
+        # genuine target_count of 0 (or overwrite it with a later positive
+        # value), so preserve the existing group value unless it is None.
+        group["target_count"] = first_present(
+            group["target_count"], event.human_action_target_count
+        )
         group["from_epoch"] = (
             group["from_epoch"] if group["from_epoch"] is not None else event.from_epoch
         )

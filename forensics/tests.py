@@ -1214,6 +1214,42 @@ class HumanActionGroupingTests(TestCase):
         self.assertEqual(action_groups[1]["last_wall_time_ms"], T0 + 1000)
         self.assertEqual(action_groups[1]["operation_id"], colliding_operation_id)
 
+    def test_shared_operation_target_count_zero_is_preserved(self):
+        # Regression for goggles#16: a real target_count of 0 must survive the
+        # grouping merge. The old ``group[...] or event...`` chain dropped a
+        # falsy-but-real 0 — either replacing it with a later None (rendered as
+        # the en dash) or overwriting it with a subsequent positive value.
+        shared = {"operation_id": "op-target-zero"}
+
+        def action(target_count):
+            ha = self._human_action(action="remove_member")
+            ha["target_count"] = target_count
+            return {**shared, "human_action": ha}
+
+        # First event carries a genuine target_count of 0; the second omits it
+        # (target_count=None) and a third carries a positive count. The merged
+        # group must keep the genuine 0 rather than letting None or 3 win.
+        ingest_body(
+            jsonl(
+                audit_event(0, wall_time_ms=T0, context=action(0)),
+                audit_event(1, wall_time_ms=T0 + 1000, context=action(None)),
+                audit_event(2, wall_time_ms=T0 + 2000, context=action(3)),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        events = list(valid_events_for_group(group))
+
+        # Sanity: the genuine 0 round-trips through ingest as a real 0, not None.
+        self.assertEqual(events[0].human_action_target_count, 0)
+        self.assertIsNone(events[1].human_action_target_count)
+
+        action_groups = human_action_groups_for_group(events)
+
+        # All three share one operation_id -> one merged group.
+        self.assertEqual(len(action_groups), 1)
+        # The genuine first-seen 0 is preserved, not dropped or overwritten.
+        self.assertEqual(action_groups[0]["target_count"], 0)
+
 
 class DashboardTests(TestCase):
     def test_upload_log_list_requires_login(self):
