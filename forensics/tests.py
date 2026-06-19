@@ -1893,6 +1893,49 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 12)
 
+    def test_group_detail_query_count_does_not_grow_with_file_count(self):
+        # Per-file group_event_count must come from the events prefetch, not a
+        # COUNT query per audit file (goggles#18). Prove it by showing the query
+        # count is identical whether the group has 2 files or 6: an N+1 would
+        # add one query per extra file.
+        engines = [
+            ENGINE_ALICE,
+            ENGINE_BOB,
+            ENGINE_CAROL,
+            "1111111111111111aaaaaaaaaaaaaaaa",
+            "2222222222222222bbbbbbbbbbbbbbbb",
+            "3333333333333333cccccccccccccccc",
+        ]
+        for engine_id in engines[:2]:
+            ingest_body(representative_audit_log(engine_id=engine_id))
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        with CaptureQueriesContext(connection) as few_ctx:
+            response_few = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+        self.assertEqual(response_few.status_code, 200)
+        self.assertEqual(AuditFile.objects.count(), 2)
+
+        for engine_id in engines[2:]:
+            ingest_body(representative_audit_log(engine_id=engine_id))
+        self.assertEqual(AuditFile.objects.count(), len(engines))
+
+        with CaptureQueriesContext(connection) as many_ctx:
+            response_many = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+        self.assertEqual(response_many.status_code, 200)
+
+        # Confirm the per-file count is actually rendered (the value the N+1
+        # was computing), so we are guarding a live code path.
+        for row in response_many.context["audit_files"]:
+            self.assertEqual(row["group_event_count"], 2)
+
+        self.assertEqual(
+            len(many_ctx.captured_queries),
+            len(few_ctx.captured_queries),
+            "group detail issues an extra query per audit file — the events "
+            "prefetch is being defeated (goggles#18 N+1 regression)",
+        )
+
 
 class ProfileTests(TestCase):
     OLD_PASSWORD = "correct horse battery staple"
