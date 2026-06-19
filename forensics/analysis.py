@@ -377,16 +377,14 @@ def event_row(event: AuditEvent):
         "human_action_fields": event.human_action_fields,
         "human_action_component_ids": event.human_action_component_ids,
         "human_action_target_count": event.human_action_target_count,
-        "msg_id": event.msg_id or event.outbound_msg_id or event.invalidated_msg_id,
+        "msg_id": primary_msg_id(event),
         "message_ids": event_message_ids(event),
         "epoch": event_epoch(event),
-        "digest": event.candidate_digest or event.payload_digest or event.incumbent_digest,
+        "digest": primary_digest(event),
         "target_kind": event.target_kind,
         "relay_summary": relay_summary(event),
-        "outcome": (
-            event.outcome or event.outcome_kind or event.decision or event.winner or event.new_state
-        ),
-        "reason": event.reason or event.stale_reason or event.detail or event.pending_kind,
+        "outcome": primary_outcome(event),
+        "reason": primary_reason(event),
         "summary": event_summary(event),
     }
 
@@ -454,6 +452,38 @@ def event_epoch(event: AuditEvent):
         or event.current_tip_epoch
         or event.selected_tip_epoch
     )
+
+
+def primary_msg_id(event: AuditEvent):
+    """First present message id for an event, used as its display/correlation key.
+
+    Falls back through both ``invalidated_msg_id`` (fork resolutions) and the
+    first ``human_action_message_ids`` entry (human actions). These two tail
+    sources are populated by mutually exclusive event types, so the combined
+    chain matches what ``event_row`` (invalidated) and ``timeline_items``
+    (human_action) each derived before they were unified.
+    """
+    return (
+        event.msg_id
+        or event.outbound_msg_id
+        or event.invalidated_msg_id
+        or (event.human_action_message_ids or [None])[0]
+    )
+
+
+def primary_digest(event: AuditEvent):
+    """First present digest for an event (candidate, then payload, then incumbent)."""
+    return event.candidate_digest or event.payload_digest or event.incumbent_digest
+
+
+def primary_outcome(event: AuditEvent):
+    """First present outcome-like field for an event."""
+    return event.outcome or event.outcome_kind or event.decision or event.winner or event.new_state
+
+
+def primary_reason(event: AuditEvent):
+    """First present reason-like field for an event."""
+    return event.reason or event.stale_reason or event.detail or event.pending_kind
 
 
 def event_message_ids(event: AuditEvent):
@@ -808,9 +838,7 @@ def timeline_items(events, engine_idx, roles):
             "tone": event_tone(event),
             "role": roles.get(event.id),
             "epoch": event_epoch(event),
-            "msg_id": event.msg_id
-            or event.outbound_msg_id
-            or (event.human_action_message_ids or [None])[0],
+            "msg_id": primary_msg_id(event),
             "message_ids": event_message_ids(event),
             "related_key": (
                 event.msg_id
@@ -833,15 +861,9 @@ def timeline_items(events, engine_idx, roles):
             "proposal_kind": event.proposal_kind,
             "snapshot_name": event.snapshot_name,
             "payload_len": event.payload_len,
-            "digest": (event.candidate_digest or event.payload_digest or event.incumbent_digest),
-            "outcome": (
-                event.outcome
-                or event.outcome_kind
-                or event.decision
-                or event.winner
-                or event.new_state
-            ),
-            "reason": event.reason or event.stale_reason or event.detail or event.pending_kind,
+            "digest": primary_digest(event),
+            "outcome": primary_outcome(event),
+            "reason": primary_reason(event),
             "summary": event_summary(event),
             "line": event.line_number,
             "file_id": event.audit_file_id,
