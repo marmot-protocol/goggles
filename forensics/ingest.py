@@ -17,6 +17,18 @@ from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 AUDIT_SCHEMA_VERSION = "marmot-forensics-audit/v1"
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
+# Upper bound for hex message identifiers (``msg_id``, ``outbound_msg_id``,
+# ``invalidated_msg_id``). ``AuditEvent.msg_id`` is an unbounded ``TextField``
+# carried by a single-column btree index (``Index(fields=["msg_id"])``); on
+# Postgres an index tuple larger than ~2704 bytes is rejected with a DataError
+# (``index row size N exceeds btree version 4 maximum 2704``) that is NOT an
+# IntegrityError, so it escapes the ``except IntegrityError`` handler in
+# ingest_audit_log_bytes() -- 500ing the upload and losing the raw evidence.
+# A legitimate Marmot message id is a 32-byte event id (64 hex chars); 512 is a
+# generous ceiling that still leaves the index tuple far inside the btree limit
+# and matches the bound already used for ``group_ref`` (#14 / #55).
+MSG_ID_MAX_LENGTH = 512
+
 # Upper bound for millisecond epoch timestamps (``wall_time_ms``). A value can
 # fit the ``bigint`` column (~9.2e18) and still be nonsense as a millis-since-
 # epoch instant. Downstream consumers materialize it: the server builds a
@@ -1025,6 +1037,18 @@ def copy_msg_field(
         return
     if not is_hex(value, even=True):
         errors.append(f"{field} must be even-length hex")
+        return
+    if len(value) > MSG_ID_MAX_LENGTH:
+        # Quarantine but do NOT store the oversized value. ``msg_id`` is carried
+        # by a single-column btree index; handing a multi-kilobyte value to
+        # bulk_create() overflows the Postgres btree tuple limit with a
+        # DataError that escapes ``except IntegrityError`` and 500s the upload,
+        # losing the raw evidence. Leaving ``normalized[field]`` unset keeps the
+        # model default ("") in the indexed column while the validation error
+        # and the verbatim raw line/event are still preserved as evidence --
+        # mirroring how the bounded ``group_ref`` path drops over-limit values
+        # (#14 / #55). Regression: marmot-protocol/goggles#56.
+        errors.append(f"{field} must be at most {MSG_ID_MAX_LENGTH} characters")
         return
     normalized[field] = value
 
