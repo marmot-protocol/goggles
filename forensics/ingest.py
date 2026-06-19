@@ -246,38 +246,42 @@ def save_invalid_upload(
     if existing is not None:
         return IngestionResult(audit_file=existing, created=False)
     fallback_group = group_for_slug(fallback_group_slug, fallback_group_name)
-    with transaction.atomic():
-        audit_file = AuditFile.objects.create(
-            upload_token=upload_token,
-            uploaded_by=uploaded_by,
-            source_name=source_name[:255],
-            source_account_label=source_account_label[:255],
-            source_device_label=source_device_label[:255],
-            source_platform=source_platform[:120],
-            source_app_version=source_app_version[:120],
-            content_type=content_type[:120],
-            file_sha256=file_sha256,
-            byte_size=len(dump_bytes),
-            raw_text=raw_text,
-            validation_status=AuditFile.STATUS_INVALID,
-            validation_error=error,
-            total_line_count=1,
-            invalid_event_count=1,
-            source_ip=source_ip,
-            user_agent=user_agent[:5000],
-        )
-        AuditEvent.objects.create(
-            group=fallback_group,
-            audit_file=audit_file,
-            line_number=1,
-            line_hash=hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest(),
-            raw_line=raw_text,
-            parse_status=AuditEvent.STATUS_INVALID,
-            validation_error=error,
-        )
-        if fallback_group is not None:
-            AuditGroup.objects.filter(id=fallback_group.id).update(updated_at=timezone.now())
-    return IngestionResult(audit_file=audit_file, created=True)
+    try:
+        with transaction.atomic():
+            audit_file = AuditFile.objects.create(
+                upload_token=upload_token,
+                uploaded_by=uploaded_by,
+                source_name=source_name[:255],
+                source_account_label=source_account_label[:255],
+                source_device_label=source_device_label[:255],
+                source_platform=source_platform[:120],
+                source_app_version=source_app_version[:120],
+                content_type=content_type[:120],
+                file_sha256=file_sha256,
+                byte_size=len(dump_bytes),
+                raw_text=raw_text,
+                validation_status=AuditFile.STATUS_INVALID,
+                validation_error=error,
+                total_line_count=1,
+                invalid_event_count=1,
+                source_ip=source_ip,
+                user_agent=user_agent[:5000],
+            )
+            AuditEvent.objects.create(
+                group=fallback_group,
+                audit_file=audit_file,
+                line_number=1,
+                line_hash=hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest(),
+                raw_line=raw_text,
+                parse_status=AuditEvent.STATUS_INVALID,
+                validation_error=error,
+            )
+            if fallback_group is not None:
+                AuditGroup.objects.filter(id=fallback_group.id).update(updated_at=timezone.now())
+            return IngestionResult(audit_file=audit_file, created=True)
+    except IntegrityError:
+        audit_file = AuditFile.objects.get(file_sha256=file_sha256)
+        return IngestionResult(audit_file=audit_file, created=False)
 
 
 def parse_jsonl(raw_text: str) -> list[ParsedLine]:
