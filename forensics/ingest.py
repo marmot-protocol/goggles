@@ -356,6 +356,18 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             "group_ref must be even-length hex and at most "
             f"{group_ref_max_length()} characters when present"
         )
+        # Drop the out-of-schema value from the stored column. ``group_ref`` is
+        # a TextField indexed by a composite btree (group_ref, wall_time_ms);
+        # storing an oversized value verbatim makes the INSERT fail on Postgres
+        # with a DataError (``index row size N exceeds btree version 4 maximum
+        # 2704``) that escapes the ``except IntegrityError`` handler and 500s
+        # the upload, losing the raw evidence. A valid group_ref is already
+        # bounded to group_ref_max_length() (well under the btree limit), so
+        # only invalid values can overflow the index -- and they are quarantine
+        # noise, not searchable refs. Clearing it mirrors how bounded fields
+        # (e.g. envelope_kind) drop over-limit values while keeping the
+        # validation error and the verbatim raw line/event as evidence.
+        normalized["group_ref"] = ""
 
     normalize_context(data.get("context"), normalized, errors)
 
