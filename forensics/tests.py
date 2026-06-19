@@ -1088,6 +1088,55 @@ class HumanActionGroupingTests(TestCase):
         self.assertEqual(action_groups[0]["first_wall_time_ms"], T0)
         self.assertEqual(action_groups[0]["last_wall_time_ms"], T0 + 1000)
 
+    def test_operationless_event_does_not_collide_with_event_prefixed_operation_id(self):
+        # Regression for the fallback-key collision: a real operation_id of the
+        # literal form "event:<pk>" must not merge with the synthetic key of an
+        # operation_id-less event whose DB pk happens to equal <pk>. The two
+        # actions are unrelated and must stay in separate groups.
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    context={"human_action": self._human_action()},
+                )
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        operationless = valid_events_for_group(group).get()
+        # Sanity: the first event carries no operation_id.
+        self.assertFalse(operationless.context_operation_id)
+
+        # Second event carries a real operation_id that collides with the old
+        # flat fallback key f"event:{pk}" of the first event.
+        colliding_operation_id = f"event:{operationless.pk}"
+        ingest_body(
+            jsonl(
+                audit_event(
+                    1,
+                    wall_time_ms=T0 + 1000,
+                    context={
+                        "operation_id": colliding_operation_id,
+                        "human_action": self._human_action(),
+                    },
+                )
+            )
+        )
+        events = list(valid_events_for_group(group))
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1].context_operation_id, colliding_operation_id)
+
+        action_groups = human_action_groups_for_group(events)
+
+        # Two distinct actions → two groups (the flat-string key produced 1).
+        self.assertEqual(len(action_groups), 2)
+        self.assertEqual(action_groups[0]["first_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["last_wall_time_ms"], T0)
+        self.assertEqual(action_groups[0]["operation_id"], "")
+        self.assertEqual(action_groups[1]["first_wall_time_ms"], T0 + 1000)
+        self.assertEqual(action_groups[1]["last_wall_time_ms"], T0 + 1000)
+        self.assertEqual(action_groups[1]["operation_id"], colliding_operation_id)
+
 
 class DashboardTests(TestCase):
     def test_upload_log_list_requires_login(self):
