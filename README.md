@@ -228,6 +228,8 @@ Invalid JSONL is saved as a quarantined upload and returns `400`.
 
 - Web UI access uses Django users; there is no public signup.
 - Uploads require bearer tokens generated with `create_upload_token`.
+- Upload tokens are reusable, long-lived credentials, not one-time codes; each
+  upload it authenticates only updates `last_used_at`.
 - Upload token secrets are shown once and stored only as keyed hashes.
 - Upload token hashes are keyed on `GOGGLES_TOKEN_HASH_KEY`, a dedicated
   secret that is **independent of `DJANGO_SECRET_KEY`**. Provision a stable
@@ -243,6 +245,9 @@ Invalid JSONL is saved as a quarantined upload and returns `400`.
   `GOGGLES_TOKEN_HASH_KEY` on an **existing** deployment, follow the migration
   runbook under "Production Deployment" above — setting a fresh key without it
   invalidates every previously issued token at once.
+- Bound a token's lifetime by passing `--expires-in-days N` to
+  `create_upload_token`; an expired token is rejected with 401. Tokens never
+  expire by default.
 - Rotate tokens by creating a new token, updating clients, then disabling the old token in Django admin or with:
 
 ```sh

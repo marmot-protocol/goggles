@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from django.db import connection
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 
 from config import settings as settings_module
 
@@ -1376,6 +1378,95 @@ class HumanActionGroupingTests(TestCase):
         self.assertEqual(len(action_groups), 1)
         # The genuine first-seen 0 is preserved, not dropped or overwritten.
         self.assertEqual(action_groups[0]["target_count"], 0)
+
+
+class UploadTokenLifecycleTests(TestCase):
+    """Lock in the documented upload-token lifecycle: reusable by default,
+    with an optional expiry. See AGENTS.md 'Upload token lifecycle' and
+    goggles#32 (docs-vs-behavior mismatch)."""
+
+    def _upload(self, raw_token):
+        return self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log(),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+    def test_token_is_reusable_across_multiple_uploads(self):
+        # The documented contract: a token authenticates every upload it is
+        # presented for. mark_used() records last_used_at but never revokes.
+        raw_token, token = UploadToken.issue("ios qa")
+
+        first = self._upload(raw_token)
+        self.assertEqual(first.status_code, 201)
+
+        second = self._upload(raw_token)
+        # Second upload of identical bytes is a dedupe (200), not a 401.
+        self.assertEqual(second.status_code, 200)
+
+        token.refresh_from_db()
+        self.assertTrue(token.is_active)
+        self.assertIsNotNone(token.last_used_at)
+
+    def test_token_with_future_expiry_authenticates(self):
+        raw_token, token = UploadToken.issue(
+            "ios qa", expires_at=timezone.now() + timedelta(days=1)
+        )
+        self.assertFalse(token.is_expired())
+
+        response = self._upload(raw_token)
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNotNone(UploadToken.authenticate(raw_token))
+
+    def test_expired_token_is_rejected_with_401(self):
+        raw_token, token = UploadToken.issue(
+            "stale device", expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        self.assertTrue(token.is_expired())
+        self.assertIsNone(UploadToken.authenticate(raw_token))
+
+        response = self._upload(raw_token)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(AuditFile.objects.count(), 0)
+
+    def test_token_expiring_between_uploads_stops_authenticating(self):
+        # Reusable until the expiry boundary, rejected once past it.
+        raw_token, token = UploadToken.issue(
+            "ios qa", expires_at=timezone.now() + timedelta(hours=1)
+        )
+        self.assertEqual(self._upload(raw_token).status_code, 201)
+
+        UploadToken.objects.filter(pk=token.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        self.assertEqual(self._upload(raw_token).status_code, 401)
+
+    def test_default_token_never_expires(self):
+        raw_token, token = UploadToken.issue("ios qa")
+        self.assertIsNone(token.expires_at)
+        self.assertFalse(token.is_expired())
+        self.assertIsNotNone(UploadToken.authenticate(raw_token))
+
+    def test_create_upload_token_command_sets_expiry(self):
+        out = StringIO()
+        before = timezone.now()
+        call_command("create_upload_token", "ios qa", "--expires-in-days", "7", stdout=out)
+        after = timezone.now()
+
+        token = UploadToken.objects.get(name="ios qa")
+        self.assertIsNotNone(token.expires_at)
+        self.assertGreaterEqual(token.expires_at, before + timedelta(days=7))
+        self.assertLessEqual(token.expires_at, after + timedelta(days=7))
+        self.assertIn("expires at", out.getvalue())
+
+    def test_create_upload_token_command_defaults_to_no_expiry(self):
+        out = StringIO()
+        call_command("create_upload_token", "ios qa", stdout=out)
+
+        token = UploadToken.objects.get(name="ios qa")
+        self.assertIsNone(token.expires_at)
+        self.assertIn("does not expire", out.getvalue())
 
 
 class DashboardTests(TestCase):

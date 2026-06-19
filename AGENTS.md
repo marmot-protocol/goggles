@@ -14,9 +14,25 @@ payload digests, IPs, and user agents as sensitive data.
 - Install dependencies with `uv sync`.
 - Use `just dev` for the seeded local app at `127.0.0.1:8000`.
 - Use `just reset-db` to recreate the durable local SQLite database.
-- Use `just token "name"` to create a one-time upload bearer token.
+- Use `just token "name"` to create a reusable upload bearer token. Add
+  `--expires-in-days N` to set an optional expiry; pass `--expires-in-days` to
+  `manage.py create_upload_token` directly when invoking the command outside
+  `just`.
 - Use `just check` for the quick local verification suite.
 - Use `just ci` before publishing when you need parity with GitHub Actions.
+
+## Upload token lifecycle
+
+Upload bearer tokens are long-lived, reusable credentials, not one-time codes:
+
+- A token authenticates every upload it is presented for; `mark_used()` records
+  `last_used_at` but does not revoke the token.
+- A token stays valid until it is deactivated (`is_active = False`, via the
+  admin) or until its optional `expires_at` is reached.
+- `expires_at` is null by default (no expiry). Set it at creation with
+  `--expires-in-days` or edit it in the admin to bound a token's lifetime.
+- Treat a leaked token as a standing credential: deactivate or delete it in the
+  admin to revoke access immediately.
 
 ## Guardrails
 

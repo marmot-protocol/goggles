@@ -59,9 +59,10 @@ dev: migrate
     @echo 'Seeded login: admin / pass123'
     DATABASE_URL='{{database_url}}' {{python}} manage.py runserver 127.0.0.1:{{port}}
 
-# Create an upload bearer token in the durable local development database.
-token name="local test client": migrate
-    DATABASE_URL='{{database_url}}' {{python}} manage.py create_upload_token "{{name}}"
+# Create a reusable upload bearer token in the durable local development
+# database. Pass extra flags through, e.g. `just token "ios qa" --expires-in-days 30`.
+token name="local test client" *args: migrate
+    DATABASE_URL='{{database_url}}' {{python}} manage.py create_upload_token "{{name}}" {{args}}
 
 # Open a Django shell against the durable local development database.
 shell: migrate

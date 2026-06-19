@@ -22,7 +22,14 @@ class AuditGroupAdmin(admin.ModelAdmin):
 
 @admin.register(UploadToken)
 class UploadTokenAdmin(admin.ModelAdmin):
-    list_display = ("name", "token_prefix", "is_active", "created_at", "last_used_at")
+    list_display = (
+        "name",
+        "token_prefix",
+        "is_active",
+        "created_at",
+        "expires_at",
+        "last_used_at",
+    )
     list_filter = ("is_active",)
     search_fields = ("name", "token_prefix")
     readonly_fields = ("token_prefix", "token_hash", "created_at", "last_used_at")
