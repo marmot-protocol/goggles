@@ -2285,6 +2285,22 @@ class GroupListAnnotationTests(TestCase):
         response = self.client.get(reverse("group-list"))
         self.assertEqual(response.status_code, 200)
 
+    def test_group_list_view_counts_multi_group_upload_once_in_header(self):
+        ingest_body(
+            jsonl(
+                audit_event(0, group_ref=GROUP_REF, wall_time_ms=T0),
+                audit_event(1, group_ref=OTHER_GROUP_REF, wall_time_ms=T0 + 100),
+            )
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["total_logs"], 1)
+        self.assertContains(response, "2 groups · 1 log · chain-of-custody intact")
+
     def test_group_list_view_query_count_is_bounded(self):
         self.seed_fork_group()
         self.seed_clean_group()
