@@ -26,7 +26,11 @@ from .analysis import (
     timeline_payload_for_group,
     valid_events_for_group,
 )
-from .ingest import group_ref_max_length, ingest_audit_log_bytes
+from .ingest import (
+    MSG_ID_MAX_LENGTH,
+    group_ref_max_length,
+    ingest_audit_log_bytes,
+)
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
@@ -672,6 +676,68 @@ class AuditLogIngestionTests(TestCase):
         # ...but the verbatim line is preserved as evidence.
         self.assertEqual(event.raw_line, body.rstrip("\n"))
         self.assertEqual(event.raw_event["group_ref"], oversized_group_ref)
+
+    def test_overlong_msg_id_is_quarantined_not_500(self):
+        # msg_id is an unbounded TextField carried by a single-column btree
+        # index (Index(fields=["msg_id"])). copy_msg_field() previously only
+        # checked that the value was even-length hex, so an otherwise-valid
+        # event with a multi-kilobyte hex msg_id passed normalization and was
+        # handed verbatim to bulk_create(). On Postgres an index tuple larger
+        # than ~2704 bytes is rejected with a DataError ("index row size N
+        # exceeds btree version 4 maximum 2704"), which is NOT an IntegrityError
+        # and so escapes the ``except IntegrityError`` handler in
+        # ingest_audit_log_bytes() -- 500ing the upload and losing the raw
+        # evidence. The oversized value must be dropped from the stored indexed
+        # column while the verbatim raw line/event are preserved. Regression for
+        # marmot-protocol/goggles#56.
+        #
+        # NOTE: the value must be INCOMPRESSIBLE. Postgres applies the 2704-byte
+        # btree limit to the (TOAST-compressed) index tuple, so a repetitive
+        # string like "ab" * 3000 compresses well under the limit and does NOT
+        # reproduce the crash. A string of distinct hex chunks does not compress
+        # and overflows the index exactly as the production payload does.
+        raw_token, _token = UploadToken.issue("ios test client")
+        oversized_msg_id = "".join(
+            hashlib.md5(str(i).encode()).hexdigest() for i in range(200)
+        )  # 200 * 32 = 6400 incompressible, even-length hex chars
+        self.assertGreater(len(oversized_msg_id), MSG_ID_MAX_LENGTH)
+        body = jsonl(
+            audit_event(
+                0,
+                kind={
+                    "type": "ingest_entry",
+                    "msg_id": oversized_msg_id,
+                    "envelope_kind": "group_message",
+                    "payload_len": 512,
+                    "payload_digest": DIGEST_A,
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("msg_id", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        # Raw upload text is preserved intact, not lost to a 500/rollback.
+        self.assertEqual(audit_file.raw_text, body)
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIn("msg_id", event.validation_error)
+        # The oversized value is dropped from the stored (indexed) column...
+        self.assertEqual(event.msg_id, "")
+        # ...but the verbatim line/event are preserved as evidence.
+        self.assertEqual(event.raw_line, body.rstrip("\n"))
+        self.assertEqual(event.raw_event["kind"]["msg_id"], oversized_msg_id)
 
     def test_json_booleans_are_rejected_for_integer_fields(self):
         raw_token, _token = UploadToken.issue("ios test client")
