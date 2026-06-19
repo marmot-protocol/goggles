@@ -1650,6 +1650,42 @@ class TimelinePayloadTests(TestCase):
 
         self.assertEqual(ep["message_event_count"], 1)
 
+    def test_epoch_zero_message_event_buckets_under_epoch_zero(self):
+        # Regression for goggles#16: a real epoch of 0 (MLS genesis epoch) must
+        # be treated as present. The old `X or Y` chain in event_epoch() dropped
+        # the falsy 0, so the message event was lost from message_event_count and
+        # the timeline item's epoch came out as None.
+        ingest_body(
+            jsonl(
+                # Confirms epoch 0, creating the epoch-0 bucket.
+                epoch_confirmed(0, ENGINE_ALICE, 0, 0, T0),
+                # Message event whose only epoch field is the genuine 0.
+                audit_event(
+                    1,
+                    kind={
+                        "type": "ingest_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome_kind": "processed",
+                        "epoch": 0,
+                    },
+                    wall_time_ms=T0 + 10,
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        payload = payload_for(group)
+        ep = payload["epochs"][0]
+
+        # Bucket is epoch 0 and the epoch-0 message event is counted there.
+        self.assertEqual(ep["epoch"], 0)
+        self.assertEqual(ep["message_event_count"], 1)
+
+        # The timeline item for the epoch-0 event renders epoch 0, not None.
+        outcome_items = [item for item in payload["items"] if item["type"] == "ingest_outcome"]
+        self.assertEqual(len(outcome_items), 1)
+        self.assertEqual(outcome_items[0]["epoch"], 0)
+
     def test_null_wall_time_event_excluded_with_count(self):
         ingest_body(jsonl(audit_event(0, wall_time_ms=T0)))
         group = AuditGroup.objects.get(slug=GROUP_REF)
