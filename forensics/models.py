@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from datetime import datetime
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -33,6 +34,11 @@ class UploadToken(models.Model):
     token_hash = models.CharField(max_length=128)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Optional expiry. Null means the token never expires.",
+    )
     last_used_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -43,7 +49,7 @@ class UploadToken(models.Model):
         return f"{self.name} ({self.token_prefix}, {state})"
 
     @classmethod
-    def issue(cls, name: str) -> tuple[str, UploadToken]:
+    def issue(cls, name: str, expires_at: datetime | None = None) -> tuple[str, UploadToken]:
         prefix = secrets.token_hex(4)
         secret = secrets.token_urlsafe(32)
         raw_token = f"{cls.TOKEN_PREFIX}_{prefix}_{secret}"
@@ -51,6 +57,7 @@ class UploadToken(models.Model):
             name=name,
             token_prefix=prefix,
             token_hash=cls.hash_secret(secret),
+            expires_at=expires_at,
         )
         return raw_token, token
 
@@ -63,6 +70,11 @@ class UploadToken(models.Model):
         # hashes for deployments that have not provisioned a dedicated key.
         key = settings.GOGGLES_TOKEN_HASH_KEY.encode("utf-8")
         return hmac.new(key, secret.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def is_expired(self, *, at: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        return (at or timezone.now()) >= self.expires_at
 
     @classmethod
     def authenticate(cls, raw_token: str | None) -> UploadToken | None:
@@ -77,6 +89,8 @@ class UploadToken(models.Model):
         except cls.DoesNotExist:
             return None
         if not hmac.compare_digest(token.token_hash, cls.hash_secret(secret)):
+            return None
+        if token.is_expired():
             return None
         return token
 
