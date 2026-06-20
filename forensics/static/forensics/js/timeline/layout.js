@@ -73,11 +73,27 @@ export const short = (hex, n = 8) => (hex ? String(hex).slice(0, n) : "");
 
 // ---- per-item presentation decisions ----
 
+const PEELER_WARNING_OUTCOMES = ["decrypt_failed", "stale_epoch"];
+const DEFERRED_MESSAGE_STATES = ["peel_deferred"];
+const FAILED_MESSAGE_STATES = ["failed", "epoch_invalidated"];
+
 const failedish = (item) =>
   item.type === "rejection" ||
-  (item.type === "peeler_outcome" && item.outcome !== "success") ||
+  (item.type === "peeler_outcome" &&
+    item.outcome !== "success" &&
+    !PEELER_WARNING_OUTCOMES.includes(item.outcome)) ||
   (item.type === "message_state_changed" &&
-    ["failed", "epoch_invalidated", "peel_deferred"].includes(item.outcome));
+    FAILED_MESSAGE_STATES.includes(item.outcome));
+
+const warningish = (item) =>
+  item.type === "peeler_retry_burst" ||
+  (item.type === "peeler_outcome" && PEELER_WARNING_OUTCOMES.includes(item.outcome)) ||
+  (item.type === "message_state_changed" && DEFERRED_MESSAGE_STATES.includes(item.outcome));
+
+const alertTone = (item, fallback) =>
+  failedish(item) ? "error" : warningish(item) ? "warning" : fallback;
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
 function detailLine(item) {
   switch (item.type) {
@@ -91,6 +107,8 @@ function detailLine(item) {
       return `${item.outcome || "?"}${item.epoch != null ? ` · epoch ${item.epoch}` : ""}`;
     case "peeler_outcome":
       return `peeler · ${item.outcome || "?"}${item.reason ? ` · ${item.reason}` : ""}`;
+    case "peeler_retry_burst":
+      return `peeler retry/defer · ${plural(item.message_count || 0, "message")} · ${plural(item.event_count || 0, "event")}`;
     case "message_state_changed":
       return `→ ${item.outcome || "?"}${item.reason ? ` · ${item.reason}` : ""}`;
     case "rejection":
@@ -188,6 +206,20 @@ export function computeLayout(payload) {
       case "snapshot_created":
         col.push({ kind: "snapshot", t: item.t, h: 22, item, id: item.id });
         break;
+      case "peeler_retry_burst":
+        col.push({
+          kind: "card",
+          t: item.t,
+          item,
+          tone: "warning",
+          lines: [
+            detailLine(item),
+            item.outcome_summary ? `outcomes · ${item.outcome_summary}` : "",
+            item.reason ? `reasons · ${item.reason}` : "",
+          ].filter(Boolean),
+          id: item.id,
+        });
+        break;
       case "ingest_entry": {
         const card = {
           kind: "card",
@@ -208,16 +240,18 @@ export function computeLayout(payload) {
         const open = item.msg_id ? openCards[item.engine].get(item.msg_id) : null;
         const line = detailLine(item);
         const errorish = failedish(item);
+        const warnish = warningish(item);
         if (open) {
           open.lines.push(line);
           if (errorish) open.tone = "error";
+          else if (warnish && open.tone !== "error") open.tone = "warning";
           break;
         }
         col.push({
           kind: "card",
           t: item.t,
           item,
-          tone: errorish ? "error" : item.type === "peeler_outcome" ? "receive" : item.tone,
+          tone: alertTone(item, item.type === "peeler_outcome" ? "receive" : item.tone),
           lines: [line],
           id: item.id,
         });

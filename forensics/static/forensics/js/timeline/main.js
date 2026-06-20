@@ -19,16 +19,39 @@ if (mount && rail && data) {
     const layout = computeLayout(payload);
     render(mount, layout, payload);
 
-    let selected = defaultEpoch(payload);
+    let selected = { type: "epoch", epoch: defaultEpoch(payload) };
     updateSelection(mount, selected);
     renderRail(rail, payload, selected);
 
-    mount.addEventListener("click", (e) => {
-      const node = e.target.closest("[data-epoch]");
-      if (!node || !mount.contains(node)) return;
-      selected = Number(node.dataset.epoch);
+    const selectFromNode = (target) => {
+      const itemNode = target.closest("[data-item-id]");
+      if (itemNode && mount.contains(itemNode)) {
+        selected = {
+          type: "item",
+          itemId: itemNode.dataset.itemId,
+          epoch: itemNode.dataset.epoch ? Number(itemNode.dataset.epoch) : null,
+        };
+        updateSelection(mount, selected);
+        renderRail(rail, payload, selected);
+        return true;
+      }
+
+      const epochNode = target.closest("[data-epoch]");
+      if (!epochNode || !mount.contains(epochNode)) return false;
+      selected = { type: "epoch", epoch: Number(epochNode.dataset.epoch) };
       updateSelection(mount, selected);
       renderRail(rail, payload, selected);
+      return true;
+    };
+
+    mount.addEventListener("click", (e) => {
+      selectFromNode(e.target);
+    });
+
+    mount.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      if (!selectFromNode(e.target)) return;
+      e.preventDefault();
     });
 
     // Related-event highlight: hovering anything that carries a msg/digest

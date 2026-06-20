@@ -79,6 +79,7 @@
 .legend-swatch--joined { background: var(--accent-soft); border: 1.5px solid var(--accent); }
 .legend-swatch--applied { background: var(--surface-card); border: 1.5px dashed var(--border-default); }
 .legend-swatch--rollback { background: var(--danger-soft); border: 1.5px solid var(--danger); }
+.legend-swatch--warning { background: var(--warning-soft); border: 1.5px solid var(--warning); }
 .legend-swatch--connector {
   width: 18px;
   height: 0;
@@ -427,6 +428,19 @@
   text-overflow: ellipsis;
 }
 
+.tl-pill[data-item-id],
+.tl-prop[data-item-id],
+.tl-card[data-item-id] {
+  cursor: pointer;
+}
+
+.tl-pill[data-item-id]:focus-visible,
+.tl-prop[data-item-id]:focus-visible,
+.tl-card[data-item-id]:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
 /* ---- Message cards ---- */
 .tl-card {
   position: absolute;
@@ -449,6 +463,10 @@
 .tl-card--send { border-left-color: var(--info); }
 .tl-card--receive { border-left-color: var(--viz-8); }
 .tl-card--fork { border-left-color: var(--warning); }
+.tl-card--warning {
+  border-left-color: var(--warning);
+  background: var(--warning-soft);
+}
 .tl-card--error {
   border-left-color: var(--danger);
   background: var(--danger-soft);
@@ -475,6 +493,7 @@
 }
 
 .tl-card--error .tl-card__msg { color: var(--danger-fg); }
+.tl-card--warning .tl-card__msg { color: var(--warning-fg); }
 
 .tl-card__line {
   font: var(--type-body-sm);
@@ -486,10 +505,15 @@
 }
 
 .tl-card--error .tl-card__line { color: var(--danger-fg); }
+.tl-card--warning .tl-card__line { color: var(--warning-fg); }
 
 /* Related-event highlight (shared msg/digest across columns) */
 [data-related].is-related {
   box-shadow: 0 0 0 2px var(--accent-ring), var(--shadow-sm);
+}
+
+[data-item-id].is-selected {
+  box-shadow: 0 0 0 2px var(--border-focus), var(--shadow-sm);
 }
 
 .tl-excluded-note {
@@ -546,6 +570,28 @@
 .rail-row__value.is-mono { font: var(--type-data); font-size: var(--text-xs); }
 
 .rail-section .eyebrow { margin-bottom: 6px; }
+
+.rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rail-list.is-mono {
+  font: var(--type-data);
+  font-size: var(--text-xs);
+}
+
+.rail-list span,
+.rail-inline-id {
+  overflow-wrap: anywhere;
+}
+
+.rail-inline-id {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-faint);
+}
 
 .rail-confirm-list {
   display: flex;

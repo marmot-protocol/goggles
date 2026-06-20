@@ -18,7 +18,10 @@ FORK_EVENT_TYPES = (
 
 PEELER_EVENT_TYPES = ("peeler_outcome", "rejection", "message_state_changed")
 
-FAILED_MESSAGE_STATES = {"failed", "epoch_invalidated", "peel_deferred"}
+FAILED_MESSAGE_STATES = {"failed", "epoch_invalidated"}
+DEFERRED_MESSAGE_STATES = {"peel_deferred"}
+ATTENTION_MESSAGE_STATES = FAILED_MESSAGE_STATES | DEFERRED_MESSAGE_STATES
+PEELER_WARNING_OUTCOMES = {"decrypt_failed", "stale_epoch"}
 
 # Event kinds that represent message traffic rather than group-state machinery.
 MESSAGE_EVENT_TYPES = {
@@ -352,7 +355,8 @@ def peeler_and_rejection_events(group, events=None):
         elif event.event_type == "rejection":
             rows.append(event_row(event))
         elif (
-            event.event_type == "message_state_changed" and event.new_state in FAILED_MESSAGE_STATES
+            event.event_type == "message_state_changed"
+            and event.new_state in ATTENTION_MESSAGE_STATES
         ):
             rows.append(event_row(event))
     return rows
@@ -518,10 +522,18 @@ def event_tone(event: AuditEvent) -> str:
     tone = "send" if event.event_type.startswith("send_") else "receive"
     if event.event_type in {"fork_resolution", "convergence_decision"}:
         tone = "fork"
-    if event.event_type in {"peeler_outcome", "rejection"}:
+    if event.event_type == "peeler_outcome":
+        if event.outcome in PEELER_WARNING_OUTCOMES:
+            return "warning"
+        if event.outcome and event.outcome != "success":
+            return "error"
+    if event.event_type == "rejection":
         tone = "error"
-    if event.event_type == "message_state_changed" and event.new_state in FAILED_MESSAGE_STATES:
-        tone = "error"
+    if event.event_type == "message_state_changed":
+        if event.new_state in FAILED_MESSAGE_STATES:
+            tone = "error"
+        elif event.new_state in DEFERRED_MESSAGE_STATES:
+            tone = "warning"
     return tone
 
 
@@ -1074,6 +1086,7 @@ def timeline_items(events, engine_idx, roles):
     items = []
     excluded_ids = []
     by_reason = {"no_wall_time": 0, "no_engine": 0}
+    peeler_bursts = defaultdict(list)
     for event in events:
         engine = engine_idx.get(event.engine_id)
         if event.wall_time_ms is None:
@@ -1084,51 +1097,149 @@ def timeline_items(events, engine_idx, roles):
             by_reason["no_engine"] += 1
             excluded_ids.append(event.id)
             continue
-        item = {
-            "id": event.id,
-            "engine": engine,
-            "t": event.wall_time_ms,
-            "seq": event.seq,
-            "type": event.event_type,
-            "tone": event_tone(event),
-            "role": roles.get(event.id),
-            "epoch": event_epoch(event),
-            "msg_id": primary_msg_id(event),
-            "message_ids": event_message_ids(event),
-            "related_key": (
-                event.msg_id
-                or event.outbound_msg_id
-                or (event.human_action_message_ids or [None])[0]
-                or event.candidate_digest
-                or event.payload_digest
-            ),
-            "operation_id": event.context_operation_id,
-            "human_action": event.human_action_action,
-            "human_action_label": action_label(event.human_action_action),
-            "human_action_origin": event.human_action_origin,
-            "human_action_phase": event.human_action_phase,
-            "human_action_fields": event.human_action_fields,
-            "target_kind": event.target_kind,
-            "relay_summary": relay_summary(event),
-            "envelope_kind": event.envelope_kind,
-            "intent_kind": event.intent_kind,
-            "result_kind": event.result_kind,
-            "proposal_kind": event.proposal_kind,
-            "snapshot_name": event.snapshot_name,
-            "payload_len": event.payload_len,
-            "digest": primary_digest(event),
-            "outcome": primary_outcome(event),
-            "reason": primary_reason(event),
-            "summary": event_summary(event),
-            "line": event.line_number,
-            "file_id": event.audit_file_id,
-        }
-        items.append(
-            {key: value for key, value in item.items() if value is not None and value != ""}
-        )
+        if is_timeline_peeler_retry_event(event):
+            peeler_bursts[(engine, event.wall_time_ms // 1000)].append(event)
+            continue
+        items.append(timeline_item_for_event(event, engine, roles))
+    for (engine, _second), burst_events in peeler_bursts.items():
+        if len(burst_events) == 1:
+            event = burst_events[0]
+            items.append(timeline_item_for_event(event, engine_idx[event.engine_id], roles))
+        else:
+            items.append(timeline_peeler_retry_burst_item(burst_events, engine))
+    items.sort(key=timeline_item_sort_key)
     excluded = {
         "count": len(excluded_ids),
         "by_reason": by_reason,
         "event_ids": excluded_ids,
     }
     return items, excluded
+
+
+def timeline_item_for_event(event, engine, roles):
+    item = {
+        "id": event.id,
+        "engine": engine,
+        "t": event.wall_time_ms,
+        "seq": event.seq,
+        "type": event.event_type,
+        "tone": event_tone(event),
+        "role": roles.get(event.id),
+        "epoch": event_epoch(event),
+        "msg_id": primary_msg_id(event),
+        "message_ids": event_message_ids(event),
+        "related_key": (
+            event.msg_id
+            or event.outbound_msg_id
+            or (event.human_action_message_ids or [None])[0]
+            or event.candidate_digest
+            or event.payload_digest
+        ),
+        "operation_id": event.context_operation_id,
+        "human_action": event.human_action_action,
+        "human_action_label": action_label(event.human_action_action),
+        "human_action_origin": event.human_action_origin,
+        "human_action_phase": event.human_action_phase,
+        "human_action_fields": event.human_action_fields,
+        "target_kind": event.target_kind,
+        "relay_summary": relay_summary(event),
+        "envelope_kind": event.envelope_kind,
+        "intent_kind": event.intent_kind,
+        "result_kind": event.result_kind,
+        "proposal_kind": event.proposal_kind,
+        "snapshot_name": event.snapshot_name,
+        "payload_len": event.payload_len,
+        "digest": primary_digest(event),
+        "outcome": primary_outcome(event),
+        "reason": primary_reason(event),
+        "summary": event_summary(event),
+        "line": event.line_number,
+        "file_id": event.audit_file_id,
+    }
+    return compact_item(item)
+
+
+def is_timeline_peeler_retry_event(event: AuditEvent) -> bool:
+    return (event.event_type == "peeler_outcome" and event.outcome in PEELER_WARNING_OUTCOMES) or (
+        event.event_type == "message_state_changed" and event.new_state in DEFERRED_MESSAGE_STATES
+    )
+
+
+def timeline_peeler_retry_burst_item(events, engine):
+    ordered = sorted(
+        events,
+        key=lambda event: (
+            event.wall_time_ms or 0,
+            event.line_number,
+            event.id,
+        ),
+    )
+    first = ordered[0]
+    message_ids = unique_in_order(
+        msg_id for event in ordered for msg_id in event_message_ids(event)
+    )
+    outcomes = [primary_outcome(event) for event in ordered if primary_outcome(event)]
+    reasons = [primary_reason(event) for event in ordered if primary_reason(event)]
+    message_count = len(message_ids)
+    event_count = len(ordered)
+    message_word = "" if message_count == 1 else "s"
+    event_word = "" if event_count == 1 else "s"
+    item = {
+        "id": min(event.id for event in ordered),
+        "engine": engine,
+        "t": first.wall_time_ms,
+        "seq": first.seq,
+        "type": "peeler_retry_burst",
+        "tone": "warning",
+        "msg_id": message_ids[0] if message_count == 1 else "",
+        "message_ids": message_ids,
+        "message_count": message_count,
+        "event_count": event_count,
+        "source_event_ids": [event.id for event in ordered],
+        "outcome": "deferred",
+        "outcome_summary": summarize_counts(outcomes),
+        "reason": summarize_counts(reasons),
+        "summary": (
+            f"peeler retry/defer burst · {message_count} message{message_word} · "
+            f"{event_count} event{event_word}"
+        ),
+        "line": min(event.line_number for event in ordered),
+        "file_id": first.audit_file_id,
+    }
+    if message_count == 1:
+        item["related_key"] = message_ids[0]
+    return compact_item(item)
+
+
+def unique_in_order(values):
+    seen = set()
+    result = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def summarize_counts(values, limit: int = 3) -> str:
+    counts = Counter(value for value in values if value)
+    parts = [
+        f"{value} x{count}" if count > 1 else value for value, count in counts.most_common(limit)
+    ]
+    extra = len(counts) - limit
+    if extra > 0:
+        parts.append(f"+{extra} more")
+    return ", ".join(parts)
+
+
+def compact_item(item):
+    return {key: value for key, value in item.items() if value is not None and value != ""}
+
+
+def timeline_item_sort_key(item):
+    return (
+        item["t"],
+        item.get("line", 0),
+        item["id"],
+    )

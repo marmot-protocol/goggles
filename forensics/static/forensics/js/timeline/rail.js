@@ -24,6 +24,34 @@ const engineAvatar = (payload, idx) => {
   return `<span class="avatar avatar--26" style="--avatar-color: var(--viz-${engine.color_index})">${esc(engine.initials)}</span>`;
 };
 
+const labelize = (value) =>
+  String(value || "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
+const dash = (value) => (value == null || value === "" ? "–" : esc(value));
+
+const compactList = (values, { mono = true } = {}) => {
+  const items = (values || []).filter((value) => value != null && value !== "");
+  if (!items.length) return "–";
+  return `<span class="rail-list${mono ? " is-mono" : ""}">${items
+    .map((value) => `<span>${esc(value)}</span>`)
+    .join("")}</span>`;
+};
+
+const itemBadge = (item) => {
+  if (item.tone === "error") {
+    return `<span class="badge badge--danger"><span class="badge__dot"></span>${esc(item.outcome || "error")}</span>`;
+  }
+  if (item.tone === "warning" || item.tone === "fork") {
+    return `<span class="badge badge--warning"><span class="badge__dot"></span>${esc(item.outcome || item.tone)}</span>`;
+  }
+  if (item.tone === "send") {
+    return `<span class="badge badge--info"><span class="badge__dot"></span>send</span>`;
+  }
+  return `<span class="badge"><span class="badge__dot"></span>${esc(item.tone || "event")}</span>`;
+};
+
 function statusBadge(ep) {
   if (ep.fork_status === "resolved") {
     return `<span class="badge badge--danger"><span class="badge__dot"></span>fork resolved</span>`;
@@ -117,7 +145,104 @@ function forkSection(payload, ep) {
   return parts.join("");
 }
 
-export function renderRail(aside, payload, epochNumber) {
+function renderEventRail(aside, payload, itemId) {
+  const item = payload.items.find((entry) => String(entry.id) === String(itemId));
+  if (!item) {
+    aside.innerHTML = `
+      <div class="rail-head">
+        <span class="eyebrow">Event detail</span>
+      </div>
+      <p class="rail-note">The selected timeline item is no longer present in the current payload.</p>`;
+    return;
+  }
+
+  const engine = payload.engines[item.engine];
+  const title =
+    item.human_action_label ||
+    item.summary ||
+    item.snapshot_name ||
+    labelize(item.type || "event");
+  const engineValue = engine
+    ? `${esc(engineName(payload, item.engine))}<span class="rail-inline-id is-mono">${esc(engine.engine_id)}</span>`
+    : "–";
+  const sourceValue = [
+    item.file_id != null ? `file ${item.file_id}` : "",
+    item.line != null ? `line ${item.line}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const basics = [
+    row("Type", dash(item.type), { mono: false }),
+    row("Time", `${esc(dateOf(item.t))} ${clockOf(item.t)} UTC`),
+    row("Wall ms", dash(item.t)),
+    row("Engine", engineValue, { mono: false }),
+    item.seq != null ? row("Seq", dash(item.seq)) : "",
+    sourceValue ? row("Source", esc(sourceValue), { mono: false }) : "",
+    item.epoch != null ? row("Epoch", `E${esc(item.epoch)}`) : "",
+  ].join("");
+
+  const messageRows = [
+    item.msg_id ? row("Message", esc(item.msg_id)) : "",
+    item.message_ids?.length ? row("Messages", compactList(item.message_ids)) : "",
+    item.digest ? row("Digest", esc(item.digest)) : "",
+    item.related_key ? row("Related key", esc(item.related_key)) : "",
+  ].join("");
+
+  const outcomeRows = [
+    item.summary ? row("Summary", esc(item.summary), { mono: false }) : "",
+    item.outcome ? row("Outcome", esc(item.outcome), { mono: false }) : "",
+    item.outcome_summary ? row("Outcomes", esc(item.outcome_summary), { mono: false }) : "",
+    item.reason ? row("Reason", esc(item.reason), { mono: false }) : "",
+    item.relay_summary ? row("Relay", esc(item.relay_summary), { mono: false }) : "",
+  ].join("");
+
+  const actionRows = [
+    item.operation_id ? row("Operation", esc(item.operation_id)) : "",
+    item.human_action ? row("Action", esc(item.human_action), { mono: false }) : "",
+    item.human_action_origin ? row("Origin", esc(item.human_action_origin), { mono: false }) : "",
+    item.human_action_phase ? row("Phase", esc(item.human_action_phase), { mono: false }) : "",
+    item.human_action_fields?.length
+      ? row("Fields", compactList(item.human_action_fields, { mono: false }), { mono: false })
+      : "",
+    item.intent_kind ? row("Intent", esc(item.intent_kind), { mono: false }) : "",
+    item.result_kind ? row("Result", esc(item.result_kind), { mono: false }) : "",
+    item.proposal_kind ? row("Proposal", esc(item.proposal_kind), { mono: false }) : "",
+    item.target_kind ? row("Target", esc(item.target_kind), { mono: false }) : "",
+  ].join("");
+
+  const burstRows = [
+    item.message_count != null ? row("Message count", esc(item.message_count)) : "",
+    item.event_count != null ? row("Event count", esc(item.event_count)) : "",
+    item.source_event_ids?.length ? row("Source events", compactList(item.source_event_ids)) : "",
+  ].join("");
+
+  aside.innerHTML = `
+    <div class="rail-head">
+      <div class="rail-head__row">
+        <span class="eyebrow">Event detail · from timeline</span>
+        ${itemBadge(item)}
+      </div>
+      <h2>${esc(title)}</h2>
+    </div>
+
+    <div class="card card--flat rail-card">${basics}</div>
+    ${messageRows ? `<div class="rail-section"><div class="eyebrow">Message identity</div><div class="card card--flat rail-card">${messageRows}</div></div>` : ""}
+    ${outcomeRows ? `<div class="rail-section"><div class="eyebrow">Outcome</div><div class="card card--flat rail-card">${outcomeRows}</div></div>` : ""}
+    ${actionRows ? `<div class="rail-section"><div class="eyebrow">Action context</div><div class="card card--flat rail-card">${actionRows}</div></div>` : ""}
+    ${burstRows ? `<div class="rail-section"><div class="eyebrow">Compacted evidence</div><div class="card card--flat rail-card">${burstRows}</div></div>` : ""}
+
+    <p class="rail-basis">${icon("clock", 11)} per-device wall-clock event detail</p>`;
+}
+
+export function renderRail(aside, payload, selection) {
+  if (selection && typeof selection === "object" && selection.type === "item") {
+    renderEventRail(aside, payload, selection.itemId);
+    return;
+  }
+
+  const epochNumber =
+    selection && typeof selection === "object" ? selection.epoch : selection;
   const ep = payload.epochs.find((entry) => entry.epoch === epochNumber);
   if (!ep) {
     aside.innerHTML = `

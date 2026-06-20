@@ -7,7 +7,7 @@
 {% block main_class %}app-main{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="{% static 'forensics/timeline.css' %}?v=20260610">
+<link rel="stylesheet" href="{% static 'forensics/timeline.css' %}?v=20260620">
 {% endblock %}
 
 {% block breadcrumb %}
@@ -59,6 +59,7 @@
     <span class="legend-key"><span class="legend-swatch legend-swatch--joined"></span>first seen / joined</span>
     <span class="legend-key"><span class="legend-swatch legend-swatch--applied"></span>applied commit</span>
     <span class="legend-key"><span class="legend-swatch legend-swatch--rollback"></span>rollback</span>
+    <span class="legend-key"><span class="legend-swatch legend-swatch--warning"></span>peeler retry/defer</span>
     <span class="legend-key"><span class="legend-swatch legend-swatch--connector"></span>commit → joiner welcome</span>
     <span class="legend-note"><svg class="icon" width="12" height="12" aria-hidden="true"><use href="#i-clock"/></svg> vertical axis = wall-clock · idle gaps compressed</span>
   </div>

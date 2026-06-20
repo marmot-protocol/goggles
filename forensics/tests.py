@@ -2389,6 +2389,88 @@ class TimelinePayloadTests(TestCase):
         self.assertEqual(item["related_key"], MSG_ID)
         self.assertEqual(item["digest"], DIGEST_A)
 
+    def test_peeler_retry_bursts_are_compacted_for_timeline(self):
+        terminal_msg_id = "55" * 32
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    kind={
+                        "type": "peeler_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome": "decrypt_failed",
+                        "fallback_snapshot_used": False,
+                        "detail": "no_matching_epoch",
+                    },
+                    wall_time_ms=T0 + 100,
+                ),
+                audit_event(
+                    1,
+                    kind={
+                        "type": "message_state_changed",
+                        "msg_id": MSG_ID,
+                        "new_state": "peel_deferred",
+                        "reason": "persist",
+                    },
+                    wall_time_ms=T0 + 200,
+                ),
+                audit_event(
+                    2,
+                    kind={
+                        "type": "peeler_outcome",
+                        "msg_id": OTHER_MSG_ID,
+                        "outcome": "decrypt_failed",
+                        "fallback_snapshot_used": False,
+                        "detail": "no_matching_epoch",
+                    },
+                    wall_time_ms=T0 + 500,
+                ),
+                audit_event(
+                    3,
+                    kind={
+                        "type": "message_state_changed",
+                        "msg_id": OTHER_MSG_ID,
+                        "new_state": "peel_deferred",
+                        "reason": "peel_failed",
+                    },
+                    wall_time_ms=T0 + 700,
+                ),
+                audit_event(
+                    4,
+                    kind={
+                        "type": "message_state_changed",
+                        "msg_id": terminal_msg_id,
+                        "new_state": "failed",
+                        "reason": "terminal",
+                    },
+                    wall_time_ms=T0 + 800,
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        items = payload_for(group)["items"]
+        bursts = [item for item in items if item["type"] == "peeler_retry_burst"]
+        failed_items = [
+            item
+            for item in items
+            if item["type"] == "message_state_changed" and item["msg_id"] == terminal_msg_id
+        ]
+
+        self.assertEqual(len(bursts), 1)
+        burst = bursts[0]
+        self.assertEqual(burst["tone"], "warning")
+        self.assertNotIn("msg_id", burst)
+        self.assertEqual(burst["message_ids"], [MSG_ID, OTHER_MSG_ID])
+        self.assertEqual(burst["message_count"], 2)
+        self.assertEqual(burst["event_count"], 4)
+        self.assertEqual(burst["outcome"], "deferred")
+        self.assertIn("decrypt_failed x2", burst["outcome_summary"])
+        self.assertIn("peel_deferred x2", burst["outcome_summary"])
+        self.assertIn("persist", burst["reason"])
+        self.assertIn("peel_failed", burst["reason"])
+        self.assertEqual(failed_items[0]["tone"], "error")
+
 
 class GroupListAnnotationTests(TestCase):
     def seed_fork_group(self):

@@ -88,7 +88,15 @@ function svgOverlay(layout) {
 const TONE_BADGE = {
   error: (visual) =>
     `<span class="badge badge--danger"><span class="badge__dot"></span>${esc(visual.item.outcome || "failed")}</span>`,
+  warning: (visual) =>
+    `<span class="badge badge--warning"><span class="badge__dot"></span>${esc(visual.item.outcome || "attention")}</span>`,
   fork: () => `<span class="badge badge--warning">fork</span>`,
+};
+
+const itemAttrs = (item, { interactive = true } = {}) => {
+  if (!item?.id) return "";
+  const base = `data-item-id="${esc(item.id)}" aria-pressed="false"`;
+  return interactive ? `${base} role="button" tabindex="0"` : base;
 };
 
 function cardEl(visual, x) {
@@ -101,7 +109,7 @@ function cardEl(visual, x) {
     .join("");
   const related = item.related_key ? ` data-related="${esc(item.related_key)}"` : "";
   return `
-    <div class="tl-card tl-card--${visual.tone}"${related} title="${esc(title)} · seq ${esc(item.seq)}${ref ? ` · ${esc(ref)}` : ""}"
+    <div class="tl-card tl-card--${visual.tone}" ${itemAttrs(item)}${related} title="${esc(title)} · seq ${esc(item.seq)}${ref ? ` · ${esc(ref)}` : ""}"
       style="left:${x}px; top:${visual._y}px; width:${colInnerW}px; min-height:${visual.h - 6}px">
       <div class="tl-card__head"><span class="tl-card__clock">${clockOf(visual.t)}</span>${badge}</div>
       ${ref ? `<div class="tl-card__msg">${esc(short(ref, 12))}</div>` : ""}
@@ -135,7 +143,7 @@ export function render(mount, layout, payload) {
       if (visual.kind === "commit") {
         const create = firstEpoch && visual.epoch === firstEpoch.epoch;
         els.push(`
-          <button type="button" class="tl-commit${visual.fork ? " tl-commit--fork" : ""}" data-epoch="${esc(visual.epoch)}" aria-pressed="false"
+          <button type="button" class="tl-commit${visual.fork ? " tl-commit--fork" : ""}" data-epoch="${esc(visual.epoch)}" ${itemAttrs({ id: visual.id }, { interactive: false })}
             style="left:${x}px; top:${visual._y}px; width:${colInnerW}px">
             ${icon(create ? "home" : "branch", 13)}
             <span>E${esc(visual.epoch)}</span>
@@ -145,7 +153,7 @@ export function render(mount, layout, payload) {
       }
       if (visual.kind === "applied") {
         els.push(`
-          <div class="tl-pill tl-pill--applied" style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="epoch ${esc(visual.epoch)} confirmed${visual.repeat ? " (repeat)" : ""}">
+          <div class="tl-pill tl-pill--applied" ${itemAttrs({ id: visual.id })} style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="epoch ${esc(visual.epoch)} confirmed${visual.repeat ? " (repeat)" : ""}">
             ${icon("corner-down", 12)}<span>${visual.repeat ? "re-applied" : "applied"} E${esc(visual.epoch)}</span>
             <span class="tl-pill__clock">${clockOf(visual.t)}</span>
           </div>`);
@@ -162,7 +170,7 @@ export function render(mount, layout, payload) {
       if (visual.kind === "rollback") {
         const item = visual.item;
         els.push(`
-          <button type="button" class="tl-pill tl-pill--rollback" data-epoch="${esc(item.epoch)}" aria-pressed="false"
+          <button type="button" class="tl-pill tl-pill--rollback" data-epoch="${esc(item.epoch)}" ${itemAttrs(item, { interactive: false })}
             style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="${esc(item.summary)}">
             ${icon("alert", 12)}<span>${esc(item.summary || "rollback")}</span>
             <span class="tl-pill__clock">${clockOf(visual.t)}</span>
@@ -172,7 +180,7 @@ export function render(mount, layout, payload) {
       if (visual.kind === "snapshot") {
         const item = visual.item;
         els.push(`
-          <div class="tl-pill tl-pill--snapshot" style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="${esc(item.snapshot_name || "snapshot")}${item.reason ? ` · ${esc(item.reason)}` : ""}">
+          <div class="tl-pill tl-pill--snapshot" ${itemAttrs(item)} style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="${esc(item.snapshot_name || "snapshot")}${item.reason ? ` · ${esc(item.reason)}` : ""}">
             ${icon("camera", 12)}<span>${esc(item.snapshot_name || "snapshot")}</span>
             <span class="tl-pill__clock">${clockOf(visual.t)}</span>
           </div>`);
@@ -180,7 +188,7 @@ export function render(mount, layout, payload) {
       }
       if (visual.kind === "prop") {
         els.push(`
-          <div class="tl-prop" style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="${esc(visual.text)}">
+          <div class="tl-prop" ${itemAttrs(visual.item)} style="left:${x}px; top:${visual._y}px; width:${colInnerW}px" title="${esc(visual.text)}">
             <span class="tl-prop__tag">prop</span>
             <span class="tl-prop__text">${esc(visual.text)}</span>
           </div>`);
@@ -198,9 +206,17 @@ export function render(mount, layout, payload) {
     </div>`;
 }
 
-export function updateSelection(mount, epoch) {
+export function updateSelection(mount, selection) {
+  const epoch = typeof selection === "object" ? selection.epoch : selection;
+  const itemId = typeof selection === "object" ? selection.itemId : null;
   for (const node of mount.querySelectorAll("[data-epoch]")) {
-    const on = node.dataset.epoch === String(epoch);
+    const on = itemId == null && node.dataset.epoch === String(epoch);
+    node.classList.toggle("is-selected", on);
+    node.setAttribute("aria-pressed", String(on));
+  }
+  for (const node of mount.querySelectorAll("[data-item-id]")) {
+    if (itemId == null && node.dataset.epoch != null) continue;
+    const on = itemId != null && node.dataset.itemId === String(itemId);
     node.classList.toggle("is-selected", on);
     node.setAttribute("aria-pressed", String(on));
   }
