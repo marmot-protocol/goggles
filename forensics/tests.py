@@ -14,7 +14,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -41,6 +41,7 @@ from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
+    client_ip,
 )
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
@@ -3305,3 +3306,52 @@ class DebugFailClosedSettingsTests(SimpleTestCase):
         with self._clean_env(DJANGO_DEBUG="0", **self._PROD_ENV):
             ns = self._load_settings()
         self.assertIs(ns["DEBUG"], False)
+
+
+class ClientIpTests(SimpleTestCase):
+    """Regression tests for goggles#15.
+
+    ``source_ip`` must come from the trusted rightmost ``X-Forwarded-For`` hop
+    appended by our reverse proxy, never from the spoofable leftmost client
+    value, and a non-IP must degrade to ``None`` rather than 500 the upload.
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_uses_rightmost_trusted_proxy_value_not_spoofed_leftmost(self):
+        request = self.factory.post(
+            "/",
+            HTTP_X_FORWARDED_FOR="1.2.3.4, 203.0.113.10",
+            REMOTE_ADDR="127.0.0.1",
+        )
+
+        self.assertEqual(client_ip(request), "203.0.113.10")
+
+    def test_invalid_forwarded_for_value_returns_none(self):
+        request = self.factory.post(
+            "/",
+            HTTP_X_FORWARDED_FOR="not-an-ip",
+            REMOTE_ADDR="127.0.0.1",
+        )
+
+        self.assertIsNone(client_ip(request))
+
+    def test_absent_forwarded_for_falls_back_to_remote_addr(self):
+        request = self.factory.post("/", REMOTE_ADDR="198.51.100.22")
+
+        self.assertEqual(client_ip(request), "198.51.100.22")
+
+    def test_ipv6_forwarded_for_value_is_preserved(self):
+        request = self.factory.post(
+            "/",
+            HTTP_X_FORWARDED_FOR="1.2.3.4, 2001:db8::1",
+            REMOTE_ADDR="127.0.0.1",
+        )
+
+        self.assertEqual(client_ip(request), "2001:db8::1")
+
+    def test_invalid_remote_addr_returns_none(self):
+        request = self.factory.post("/", REMOTE_ADDR="garbage")
+
+        self.assertIsNone(client_ip(request))
