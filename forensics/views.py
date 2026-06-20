@@ -6,6 +6,7 @@ from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig
+from django.core.files.uploadhandler import FileUploadHandler
 from django.db.models import Count, Q
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -30,6 +31,8 @@ from .analysis import (
 )
 from .ingest import ingest_audit_log_bytes
 from .models import AuditFile, AuditGroup, UploadToken
+
+UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
 
 
 def healthz(_request: HttpRequest):
@@ -151,6 +154,27 @@ def profile(request: HttpRequest):
     return render(request, "forensics/profile.html", {"form": form})
 
 
+class MaxDumpSizeUploadHandler(FileUploadHandler):
+    """Abort multipart file parsing once a single uploaded file exceeds the app limit."""
+
+    def __init__(self, request: HttpRequest | None = None):
+        super().__init__(request)
+        self.bytes_received = 0
+
+    def new_file(self, *args, **kwargs):
+        super().new_file(*args, **kwargs)
+        self.bytes_received = 0
+
+    def receive_data_chunk(self, raw_data: bytes, start: int) -> bytes:
+        self.bytes_received += len(raw_data)
+        if self.bytes_received > settings.GOGGLES_MAX_DUMP_BYTES:
+            raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
+        return raw_data
+
+    def file_complete(self, file_size: int):
+        return None
+
+
 @csrf_exempt
 @require_POST
 def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
@@ -158,12 +182,14 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
     if token is None:
         return JsonResponse({"error": "missing or invalid bearer token"}, status=401)
 
+    install_max_dump_size_upload_handler(request)
+
     try:
         audit_bytes, source_name, content_type = audit_bytes_from_request(request)
     except RequestDataTooBig:
-        return JsonResponse({"error": "audit log exceeds maximum upload size"}, status=413)
+        return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
     if len(audit_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
-        return JsonResponse({"error": "audit log exceeds maximum upload size"}, status=413)
+        return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
 
     fallback_slug, fallback_name = fallback_group_from_request(request, group_slug)
     source_metadata = source_metadata_from_request(request)
@@ -216,6 +242,11 @@ def authenticate_request(request: HttpRequest) -> UploadToken | None:
     return UploadToken.authenticate(value.strip())
 
 
+def install_max_dump_size_upload_handler(request: HttpRequest) -> None:
+    if (request.content_type or "").startswith("multipart/"):
+        request.upload_handlers.insert(0, MaxDumpSizeUploadHandler(request))
+
+
 def audit_bytes_from_request(request: HttpRequest) -> tuple[bytes, str, str]:
     if request.FILES:
         upload = (
@@ -223,10 +254,26 @@ def audit_bytes_from_request(request: HttpRequest) -> tuple[bytes, str, str]:
             or request.FILES.get("dump")
             or next(iter(request.FILES.values()))
         )
-        return upload.read(), upload.name, getattr(upload, "content_type", "")
+        return read_upload_bytes(upload), upload.name, getattr(upload, "content_type", "")
     if request.body:
         return request.body, "", request.content_type or ""
     return b"", "", ""
+
+
+def read_upload_bytes(upload) -> bytes:
+    max_dump_bytes = settings.GOGGLES_MAX_DUMP_BYTES
+    upload_size = getattr(upload, "size", None)
+    if upload_size is not None and upload_size > max_dump_bytes:
+        raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
+
+    chunks = []
+    total_bytes = 0
+    for chunk in upload.chunks():
+        total_bytes += len(chunk)
+        if total_bytes > max_dump_bytes:
+            raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def source_metadata_from_request(request: HttpRequest) -> dict[str, str]:
