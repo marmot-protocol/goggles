@@ -12,6 +12,7 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import connection
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
@@ -1945,6 +1946,7 @@ class HealthCheckTests(TestCase):
         self.assertEqual(response.json(), {"status": "ok"})
 
 
+@override_settings(DEBUG=True)
 class SeedDevCommandTests(TestCase):
     def test_seed_dev_creates_admin_user_and_sample_audit_log_idempotently(self):
         output = StringIO()
@@ -1964,7 +1966,65 @@ class SeedDevCommandTests(TestCase):
             2,
         )
         self.assertEqual(AuditEvent.objects.filter(group=group).count(), 6)
-        self.assertIn("admin / pass123", output.getvalue())
+        self.assertIn("Dev user ready: admin", output.getvalue())
+        self.assertNotIn("pass123", output.getvalue())
+
+    @override_settings(DEBUG=False)
+    def test_seed_dev_refuses_when_debug_false_without_explicit_allow(self):
+        with mock.patch.dict(os.environ, {"GOGGLES_ALLOW_SEED": ""}):
+            with self.assertRaisesMessage(
+                CommandError,
+                "Refusing to run seed_dev when DEBUG=False",
+            ):
+                call_command("seed_dev", stdout=StringIO())
+
+        self.assertFalse(User.objects.filter(username="admin").exists())
+        self.assertEqual(AuditFile.objects.count(), 0)
+
+    def test_seed_dev_refuses_to_promote_existing_user_without_force(self):
+        existing = User.objects.create_user(username="admin", password="original")
+
+        with self.assertRaisesMessage(CommandError, "already exists"):
+            call_command("seed_dev", stdout=StringIO())
+
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password("original"))
+        self.assertFalse(existing.is_staff)
+        self.assertFalse(existing.is_superuser)
+        self.assertTrue(existing.is_active)
+        self.assertEqual(AuditFile.objects.count(), 0)
+
+    def test_seed_dev_force_promotes_existing_user_explicitly(self):
+        existing = User.objects.create_user(username="admin", password="original")
+
+        call_command("seed_dev", "--force", stdout=StringIO())
+
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password("pass123"))
+        self.assertTrue(existing.is_staff)
+        self.assertTrue(existing.is_superuser)
+
+    @override_settings(DEBUG=False)
+    def test_seed_dev_allows_explicit_env_override_when_debug_false(self):
+        with mock.patch.dict(os.environ, {"GOGGLES_ALLOW_SEED": "1"}):
+            call_command("seed_dev", stdout=StringIO())
+
+        admin = User.objects.get(username="admin")
+        self.assertTrue(admin.is_staff)
+        self.assertTrue(admin.is_superuser)
+
+    @override_settings(DEBUG=False)
+    def test_seed_dev_env_override_does_not_promote_existing_user_without_force(self):
+        existing = User.objects.create_user(username="admin", password="original")
+
+        with mock.patch.dict(os.environ, {"GOGGLES_ALLOW_SEED": "1"}):
+            with self.assertRaisesMessage(CommandError, "already exists"):
+                call_command("seed_dev", stdout=StringIO())
+
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password("original"))
+        self.assertFalse(existing.is_staff)
+        self.assertFalse(existing.is_superuser)
 
     def test_seed_dev_seeds_new_format_action_logs(self):
         call_command("seed_dev", stdout=StringIO())
