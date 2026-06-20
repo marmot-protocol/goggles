@@ -14,6 +14,11 @@ urlpatterns = [
     ),
     path("groups/<slug:slug>/", views.group_detail, name="group-detail"),
     path("audit-files/<int:pk>/", views.audit_file_detail, name="audit-file-detail"),
+    path(
+        "audit-files/<int:pk>/raw/",
+        views.audit_file_raw_text,
+        name="audit-file-raw-text",
+    ),
     path("api/v1/audit-logs/", views.api_audit_log_upload, name="api-audit-log-upload"),
     path(
         "api/v1/groups/<slug:group_slug>/audit-logs/",

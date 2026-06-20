@@ -7,8 +7,10 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig
 from django.core.files.uploadhandler import FileUploadHandler
+from django.core.paginator import Paginator
 from django.db.models import Count, Q
-from django.http import HttpRequest, JsonResponse
+from django.db.models.functions import Length, Substr
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.views.decorators.csrf import csrf_exempt
@@ -33,6 +35,8 @@ from .ingest import ingest_audit_log_bytes
 from .models import AuditFile, AuditGroup, UploadToken
 
 UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
+AUDIT_FILE_EVENT_PAGE_SIZE = 100
+RAW_TEXT_PREVIEW_CHARS = 32 * 1024
 
 
 def healthz(_request: HttpRequest):
@@ -121,18 +125,52 @@ def group_agent_export(request: HttpRequest, slug: str):
 @login_required
 def audit_file_detail(request: HttpRequest, pk: int):
     audit_file = get_object_or_404(
-        AuditFile.objects.prefetch_related("events__group"),
+        AuditFile.objects.defer("raw_text").annotate(
+            raw_text_preview=Substr("raw_text", 1, RAW_TEXT_PREVIEW_CHARS),
+            raw_text_length=Length("raw_text"),
+        ),
         pk=pk,
+    )
+    event_queryset = audit_file.events.order_by("line_number", "id")
+    event_page = Paginator(event_queryset, AUDIT_FILE_EVENT_PAGE_SIZE).get_page(
+        request.GET.get("page")
     )
     return render(
         request,
         "forensics/audit_file_detail.html",
         {
             "audit_file": audit_file,
-            "event_rows": [event_row(event) for event in audit_file.events.all()],
+            "event_page": event_page,
+            "event_rows": [event_row(event) for event in event_page],
             "groups": groups_for_audit_file(audit_file),
+            "raw_text_preview": audit_file.raw_text_preview or "",
+            "raw_text_preview_chars": RAW_TEXT_PREVIEW_CHARS,
+            "raw_text_is_truncated": (audit_file.raw_text_length or 0) > RAW_TEXT_PREVIEW_CHARS,
+            "raw_text_char_count": audit_file.raw_text_length or 0,
         },
     )
+
+
+@login_required
+def audit_file_raw_text(request: HttpRequest, pk: int):
+    audit_file = get_object_or_404(
+        AuditFile.objects.only("id", "source_name", "raw_text"),
+        pk=pk,
+    )
+    filename = raw_text_download_filename(audit_file)
+    response = HttpResponse(
+        audit_file.raw_text,
+        content_type="application/x-ndjson; charset=utf-8",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+def raw_text_download_filename(audit_file: AuditFile) -> str:
+    source_name = (audit_file.source_name or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
+    stem = slugify(source_stem or f"audit-file-{audit_file.pk}")
+    return f"{stem or f'audit-file-{audit_file.pk}'}.jsonl"
 
 
 @login_required

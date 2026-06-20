@@ -37,7 +37,11 @@ from .ingest import (
     ingest_audit_log_bytes,
 )
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
-from .views import audit_bytes_from_request
+from .views import (
+    AUDIT_FILE_EVENT_PAGE_SIZE,
+    RAW_TEXT_PREVIEW_CHARS,
+    audit_bytes_from_request,
+)
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
 ENGINE_ALICE = "0123456789abcdef0123456789abcdef"
@@ -1935,6 +1939,126 @@ class DashboardTests(TestCase):
             sorted(payload),
             ["engines", "epochs", "excluded", "group", "integrity", "items", "time", "version"],
         )
+
+
+class AuditFileDetailViewTests(TestCase):
+    def setUp(self):
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+    @staticmethod
+    def make_audit_file(event_count=0, raw_text="line zero\n", **kwargs):
+        digest = hashlib.sha256(f"{event_count}:{raw_text}".encode()).hexdigest()
+        audit_file = AuditFile.objects.create(
+            file_sha256=digest,
+            byte_size=len(raw_text.encode("utf-8")),
+            raw_text=raw_text,
+            total_line_count=event_count,
+            valid_event_count=event_count,
+            **kwargs,
+        )
+        AuditEvent.objects.bulk_create(
+            AuditEvent(
+                audit_file=audit_file,
+                line_number=i + 1,
+                line_hash=f"{i:064x}",
+                raw_line=f"line {i}",
+                parse_status=AuditEvent.STATUS_VALID,
+                event_type=f"detail_type_{i:03d}",
+                engine_id=ENGINE_ALICE,
+                account_ref=ACCOUNT_ALICE,
+                group_ref=GROUP_REF,
+                seq=i,
+            )
+            for i in range(event_count)
+        )
+        return audit_file
+
+    def detail_url(self, audit_file):
+        return reverse("audit-file-detail", args=[audit_file.pk])
+
+    def test_detail_requires_login(self):
+        self.client.logout()
+        audit_file = self.make_audit_file()
+
+        response = self.client.get(self.detail_url(audit_file))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+
+    def test_detail_paginates_event_rows(self):
+        total_events = AUDIT_FILE_EVENT_PAGE_SIZE + 5
+        audit_file = self.make_audit_file(total_events)
+
+        first_page = self.client.get(self.detail_url(audit_file))
+
+        self.assertEqual(first_page.status_code, 200)
+        self.assertEqual(len(first_page.context["event_rows"]), AUDIT_FILE_EVENT_PAGE_SIZE)
+        self.assertEqual(first_page.context["event_page"].paginator.count, total_events)
+        content = first_page.content.decode()
+        self.assertIn("detail_type_000", content)
+        self.assertNotIn("detail_type_104", content)
+        self.assertContains(first_page, f"Showing 1–{AUDIT_FILE_EVENT_PAGE_SIZE} of {total_events}")
+
+        second_page = self.client.get(self.detail_url(audit_file), {"page": 2})
+
+        self.assertEqual(second_page.status_code, 200)
+        self.assertEqual(len(second_page.context["event_rows"]), 5)
+        self.assertContains(second_page, "detail_type_104")
+        self.assertNotContains(second_page, "detail_type_000")
+
+    def test_detail_truncates_raw_text_preview_and_links_download(self):
+        tail_marker = "TAIL-RAW-TEXT-SHOULD-NOT-BE-IN-PREVIEW"
+        raw_text = "x" * (RAW_TEXT_PREVIEW_CHARS + 100) + tail_marker
+        audit_file = self.make_audit_file(1, raw_text=raw_text, source_name="big-upload.jsonl")
+
+        response = self.client.get(self.detail_url(audit_file))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["raw_text_preview"]), RAW_TEXT_PREVIEW_CHARS)
+        self.assertTrue(response.context["raw_text_is_truncated"])
+        content = response.content.decode()
+        self.assertIn("Raw JSONL preview", content)
+        self.assertIn("Download full JSONL", content)
+        self.assertIn(reverse("audit-file-raw-text", args=[audit_file.pk]), content)
+        self.assertNotIn(tail_marker, content)
+        self.assertContains(
+            response,
+            f"Showing first {RAW_TEXT_PREVIEW_CHARS} of {len(raw_text)} characters",
+        )
+
+    def test_detail_html_size_is_bounded_by_preview_and_page_size(self):
+        small = self.make_audit_file(2, raw_text="small\n")
+        huge = self.make_audit_file(
+            AUDIT_FILE_EVENT_PAGE_SIZE + 150,
+            raw_text="x" * 5_000_000,
+            source_name="huge",
+        )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small_response = self.client.get(self.detail_url(small))
+        with CaptureQueriesContext(connection) as huge_queries:
+            huge_response = self.client.get(self.detail_url(huge))
+
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(huge_response.status_code, 200)
+        self.assertEqual(len(huge_response.context["event_rows"]), AUDIT_FILE_EVENT_PAGE_SIZE)
+        self.assertEqual(len(small_queries), len(huge_queries))
+        self.assertLess(len(huge_response.content) - len(small_response.content), 150_000)
+        self.assertLess(len(huge_response.content), 250_000)
+
+    def test_raw_text_download_returns_full_content(self):
+        tail_marker = "TAIL-RAW-TEXT-DOWNLOAD"
+        raw_text = "x" * (RAW_TEXT_PREVIEW_CHARS + 100) + tail_marker
+        audit_file = self.make_audit_file(raw_text=raw_text, source_name="device export.jsonl")
+
+        response = self.client.get(reverse("audit-file-raw-text", args=[audit_file.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/x-ndjson; charset=utf-8")
+        self.assertIn("attachment", response["Content-Disposition"])
+        self.assertIn("device-export.jsonl", response["Content-Disposition"])
+        self.assertEqual(response.content.decode(), raw_text)
 
 
 class HealthCheckTests(TestCase):

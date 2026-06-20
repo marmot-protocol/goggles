@@ -459,6 +459,53 @@ a.btn:hover { text-decoration: none; }
 .data-table tbody tr[data-href] { cursor: pointer; }
 .data-table tbody tr[data-href]:hover td { background: var(--surface-hover); }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-4);
+  padding: 10px 16px;
+  border-top: var(--border-hairline) solid var(--border-subtle);
+  background: var(--surface-card);
+}
+
+.pagination--top {
+  border-top: 0;
+  border-bottom: var(--border-hairline) solid var(--border-subtle);
+}
+
+.pagination__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border: var(--border-hairline) solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-app);
+  font: var(--type-body-sm);
+}
+
+.pagination__link.is-disabled {
+  color: var(--text-faint);
+  background: var(--surface-sunken);
+}
+
+.pagination__status {
+  color: var(--text-muted);
+  font: var(--type-data-sm);
+}
+
+.raw-preview-note {
+  margin: 0 0 var(--space-5);
+  color: var(--text-muted);
+  font: var(--type-body-sm);
+}
+
+.raw-text-preview {
+  max-height: 30rem;
+  white-space: pre-wrap;
+}
+
 .cell-stack { display: inline-flex; align-items: center; gap: 10px; }
 .cell-stack > .icon { color: var(--text-faint); }
 .cell-lines { display: flex; flex-direction: column; }
