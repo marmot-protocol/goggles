@@ -661,12 +661,13 @@ def message_ids_from_events(events):
 # assume cross-engine monotonicity. Epoch numbers are real and may be sparse.
 
 
-def timeline_payload_for_group(group, events, audit_files):
+def timeline_payload_for_group(group, events, audit_files, traces=None):
     ordered = sorted_timeline_events(events)
     engines, engine_idx = timeline_engines(ordered)
     epochs, roles = timeline_epochs(ordered, engine_idx, len(engines))
     items, excluded = timeline_items(ordered, engine_idx, roles)
-    traces = message_traces_from_events(ordered, {engine["engine_id"] for engine in engines})
+    if traces is None:
+        traces = message_traces_from_events(ordered, {engine["engine_id"] for engine in engines})
     placed = [item["t"] for item in items]
     return {
         "version": 1,
