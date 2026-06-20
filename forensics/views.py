@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
@@ -367,5 +369,15 @@ def groups_for_audit_file(audit_file: AuditFile):
 def client_ip(request: HttpRequest) -> str | None:
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return request.META.get("REMOTE_ADDR")
+        # Trust only the rightmost hop, appended by our reverse proxy. The
+        # leftmost entries are client-controlled and trivially spoofable.
+        candidate = forwarded_for.rsplit(",", 1)[-1].strip()
+    else:
+        candidate = (request.META.get("REMOTE_ADDR") or "").strip()
+    if not candidate:
+        return None
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
