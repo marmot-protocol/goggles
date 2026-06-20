@@ -92,7 +92,9 @@ def group_detail(request: HttpRequest, slug: str):
             "missing_observations": missing_observations_for_group(group, traces=traces),
             "fork_events": fork_and_convergence_events(group, events=events),
             "peeler_events": peeler_and_rejection_events(group, events=events),
-            "timeline_payload": timeline_payload_for_group(group, events, audit_files),
+            "timeline_payload": timeline_payload_for_group(
+                group, events, audit_files, traces=traces
+            ),
         },
     )
 

@@ -20,6 +20,7 @@ from django.utils import timezone
 
 from config import settings as settings_module
 
+from . import analysis as analysis_module
 from . import ingest as ingest_module
 from .analysis import (
     audit_files_for_group,
@@ -2611,6 +2612,22 @@ class GroupDetailTimelineViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 12)
+
+    def test_group_detail_reuses_message_traces_for_timeline_integrity(self):
+        ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
+        ingest_body(representative_audit_log(engine_id=ENGINE_BOB))
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        with mock.patch.object(
+            analysis_module,
+            "message_traces_from_events",
+            wraps=analysis_module.message_traces_from_events,
+        ) as trace_builder:
+            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(trace_builder.call_count, 1)
 
     def test_group_detail_query_count_does_not_grow_with_file_count(self):
         # Per-file group_event_count must come from the events prefetch, not a
