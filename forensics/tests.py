@@ -1916,12 +1916,17 @@ class SeedDevCommandTests(TestCase):
             2,
         )
         self.assertEqual(AuditEvent.objects.filter(group=group).count(), 6)
-        self.assertIn("admin / pass123", output.getvalue())
+        self.assertIn("Dev user ready: admin", output.getvalue())
+        self.assertNotIn("pass123", output.getvalue())
 
     @override_settings(DEBUG=False)
     def test_seed_dev_refuses_when_debug_false_without_explicit_allow(self):
-        with self.assertRaisesMessage(CommandError, "Refusing to run seed_dev when DEBUG=False"):
-            call_command("seed_dev", stdout=StringIO())
+        with mock.patch.dict(os.environ, {"GOGGLES_ALLOW_SEED": ""}):
+            with self.assertRaisesMessage(
+                CommandError,
+                "Refusing to run seed_dev when DEBUG=False",
+            ):
+                call_command("seed_dev", stdout=StringIO())
 
         self.assertFalse(User.objects.filter(username="admin").exists())
         self.assertEqual(AuditFile.objects.count(), 0)

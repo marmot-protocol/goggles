@@ -57,7 +57,7 @@ class Command(BaseCommand):
         seeded_files = [self.seed_audit_log(fixture_path) for fixture_path in fixture_paths]
 
         if credentials_set:
-            self.stdout.write(self.style.SUCCESS(f"Dev user ready: {user.username} / {password}"))
+            self.stdout.write(self.style.SUCCESS(f"Dev user ready: {user.username}"))
         else:
             self.stdout.write(
                 self.style.WARNING(
@@ -88,8 +88,9 @@ class Command(BaseCommand):
             return
         raise CommandError(
             "Refusing to run seed_dev when DEBUG=False; this command creates a development "
-            f"superuser. Set {ALLOW_SEED_ENV}=1 or pass --force only for controlled "
-            "non-production seeding."
+            f"superuser. Set {ALLOW_SEED_ENV}=1 only for controlled non-production "
+            "seeding. Pass --force only when you also intend to reset or promote an "
+            "existing user."
         )
 
     def seed_user(self, username: str, password: str, *, force: bool):
