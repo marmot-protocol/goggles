@@ -253,6 +253,24 @@ def divergent_counts_for_groups(groups):
     return divergent_counts_for_group_ids([group.pk for group in groups if group.pk])
 
 
+def is_divergent_message(engines, all_engines):
+    """A message is divergent when at least one engine observed it AND at
+    least one other engine in the group did not.
+
+    Single source of truth for the divergence definition shared by the
+    lightweight persisted aggregation (divergent_counts_for_group_ids,
+    landing-page hot path) and the trace-based detail computation
+    (missing_observations_for_group / group_integrity_summary). Keep these
+    callers structurally linked so the landing-page count and the detail-page
+    count cannot silently drift. The standalone copy in migration 0006 is
+    intentionally self-contained (migrations must not import app code) and is
+    guarded by the parity regression test instead.
+    """
+    engines = set(engines)
+    all_engines = set(all_engines)
+    return bool(engines) and bool(all_engines - engines)
+
+
 def divergent_counts_for_group_ids(group_ids):
     """Return ``{group_id: divergent_message_count}`` for persisted updates."""
     group_ids = list(dict.fromkeys(group_id for group_id in group_ids if group_id))
@@ -299,7 +317,7 @@ def divergent_counts_for_group_ids(group_ids):
     for group_id, message_engines in message_engines_by_group.items():
         all_engines = engines_by_group[group_id]
         counts[group_id] = sum(
-            1 for engines in message_engines.values() if engines and all_engines.difference(engines)
+            1 for engines in message_engines.values() if is_divergent_message(engines, all_engines)
         )
     return counts
 
@@ -383,7 +401,19 @@ def source_label_for_file(audit_file: AuditFile) -> str:
 def missing_observations_for_group(group, traces=None):
     if traces is None:
         traces = message_traces_for_group(group)
-    return [trace for trace in traces if trace["missing_engines"] and trace["engines"]]
+    return [trace for trace in traces if trace_is_divergent(trace)]
+
+
+def trace_is_divergent(trace):
+    """Apply the shared divergence predicate to a message trace.
+
+    ``missing_engines == sorted(all_engines - engines)`` per
+    ``message_traces_from_events``, so reconstructing the group's full engine
+    set as ``engines | missing_engines`` makes this predicate call identical to
+    the persisted aggregation path (``divergent_counts_for_group_ids``).
+    """
+    all_engines_for_trace = set(trace["engines"]) | set(trace["missing_engines"])
+    return is_divergent_message(trace["engines"], all_engines_for_trace)
 
 
 def fork_and_convergence_events(group, events=None):
@@ -843,7 +873,7 @@ def group_integrity_summary(group, events=None, traces=None):
         events = list(valid_events_for_group(group))
     if traces is None:
         traces = message_traces_for_group(group, events=events)
-    missing = [trace for trace in traces if trace["missing_engines"] and trace["engines"]]
+    missing = missing_observations_for_group(group, traces=traces)
     fork_count = sum(1 for event in events if event.event_type == "fork_resolution")
     rollback_count = sum(1 for event in events if event.event_type == "epoch_rolled_back")
     return {
