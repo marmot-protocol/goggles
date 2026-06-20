@@ -69,7 +69,27 @@
 {% endif %}
 
 <section class="card card--flush">
-  <header class="card__header"><span class="card__title">Events</span></header>
+  <header class="card__header">
+    <span class="card__title">Events</span>
+    <span class="card__subtitle">
+      Showing {{ event_page.start_index }}–{{ event_page.end_index }} of {{ event_page.paginator.count }}
+    </span>
+  </header>
+  {% if event_page.paginator.num_pages > 1 %}
+    <nav class="pagination pagination--top" aria-label="Audit event pages">
+      {% if event_page.has_previous %}
+        <a class="pagination__link" href="?page={{ event_page.previous_page_number }}">Previous</a>
+      {% else %}
+        <span class="pagination__link is-disabled">Previous</span>
+      {% endif %}
+      <span class="pagination__status">Page {{ event_page.number }} of {{ event_page.paginator.num_pages }}</span>
+      {% if event_page.has_next %}
+        <a class="pagination__link" href="?page={{ event_page.next_page_number }}">Next</a>
+      {% else %}
+        <span class="pagination__link is-disabled">Next</span>
+      {% endif %}
+    </nav>
+  {% endif %}
   <div class="card__body table-scroll">
     <table class="data-table">
       <thead>
@@ -132,12 +152,38 @@
       </tbody>
     </table>
   </div>
+  {% if event_page.paginator.num_pages > 1 %}
+    <nav class="pagination" aria-label="Audit event pages">
+      {% if event_page.has_previous %}
+        <a class="pagination__link" href="?page={{ event_page.previous_page_number }}">Previous</a>
+      {% else %}
+        <span class="pagination__link is-disabled">Previous</span>
+      {% endif %}
+      <span class="pagination__status">Page {{ event_page.number }} of {{ event_page.paginator.num_pages }}</span>
+      {% if event_page.has_next %}
+        <a class="pagination__link" href="?page={{ event_page.next_page_number }}">Next</a>
+      {% else %}
+        <span class="pagination__link is-disabled">Next</span>
+      {% endif %}
+    </nav>
+  {% endif %}
 </section>
 
 <section class="card card--flat">
-  <header class="card__header"><span class="card__title">Raw JSONL</span></header>
+  <header class="card__header">
+    <span class="card__title">Raw JSONL preview</span>
+    <a href="{% url 'audit-file-raw-text' audit_file.id %}">Download full JSONL</a>
+  </header>
   <div class="card__body">
-    <pre class="well">{{ audit_file.raw_text }}</pre>
+    {% if raw_text_is_truncated %}
+      <p class="raw-preview-note">
+        Showing first {{ raw_text_preview_chars }} of {{ raw_text_char_count }} characters
+        ({{ audit_file.byte_size }} bytes total). Full content is preserved for download.
+      </p>
+    {% else %}
+      <p class="raw-preview-note">{{ raw_text_char_count }} characters.</p>
+    {% endif %}
+    <pre class="well raw-text-preview">{{ raw_text_preview }}</pre>
   </div>
 </section>
 {% endblock %}
