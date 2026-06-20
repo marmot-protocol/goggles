@@ -15,6 +15,7 @@ class AuditGroup(models.Model):
     name = models.CharField(max_length=200)
     slug = models.SlugField(max_length=160, unique=True)
     group_ref = models.CharField(max_length=512, blank=True, db_index=True)
+    divergent_message_count = models.PositiveIntegerField(default=0)
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
