@@ -7,6 +7,7 @@ from itertools import count
 from django.db.models import Count, Exists, Max, Min, OuterRef, Q
 from django.utils import timezone
 
+from . import normalized_fields as normalized_field_config
 from .models import AuditEvent, AuditFile, AuditGroup
 
 FORK_EVENT_TYPES = (
@@ -40,58 +41,11 @@ MESSAGE_EVENT_TYPES = {
 
 EPOCH_CHANGE_RESULT_KINDS = {"group_created", "group_evolution"}
 AGENT_EXPORT_SCHEMA_VERSION = "goggles-agent-group-state/v1"
-AGENT_EXPORT_NORMALIZED_FIELDS = (
-    "context_operation_id",
-    "human_action_action",
-    "human_action_origin",
-    "human_action_phase",
-    "human_action_fields",
-    "human_action_component_ids",
-    "human_action_target_count",
-    "human_action_message_ids",
-    "msg_id",
-    "outbound_msg_id",
-    "outbound_welcome_msg_ids",
-    "target_kind",
-    "relay_urls",
-    "accepted_relay_urls",
-    "failed_relays",
-    "required_acks",
-    "met_required_acks",
-    "epoch",
-    "source_epoch",
-    "from_epoch",
-    "to_epoch",
-    "pending_epoch",
-    "restored_epoch",
-    "current_tip_epoch",
-    "selected_fork_epoch",
-    "selected_tip_epoch",
-    "payload_len",
-    "payload_digest",
-    "candidate_digest",
-    "incumbent_digest",
-    "envelope_kind",
-    "outcome",
-    "outcome_kind",
-    "stale_reason",
-    "decision",
-    "reason",
-    "winner",
-    "new_state",
-    "pending_kind",
-    "intent_kind",
-    "result_kind",
-    "proposal_kind",
-    "snapshot_name",
-    "selected_branch_id",
-    "detail",
-    "fallback_snapshot_used",
-    "invalidated_msg_id",
-    "max_rewind_commits",
-    "candidate_count",
-    "eligible_count",
+AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE = (
+    normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE
 )
+AGENT_EXPORT_NORMALIZED_FIELD_EXTRA = normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXTRA
+AGENT_EXPORT_NORMALIZED_FIELDS = normalized_field_config.agent_export_normalized_fields()
 
 VIZ_PALETTE_SIZE = 8
 GROUP_REF_FULL_DISPLAY_MAX = 80
