@@ -217,33 +217,71 @@ class UploadTokenHashKeyTests(TestCase):
             self.assertIsNotNone(authenticated)
             self.assertEqual(authenticated.pk, token.pk)
 
-    def test_legacy_token_survives_pinning_hash_key_to_secret_key(self):
-        # Documented zero-downtime migration: a token issued under the
-        # SECRET_KEY fallback keeps working when an operator pins
-        # GOGGLES_TOKEN_HASH_KEY to the current SECRET_KEY value before
-        # decoupling. A jump straight to a *fresh* key, by contrast, breaks it.
+    def test_legacy_token_survives_direct_fresh_hash_key_cutover(self):
+        # A token issued under the SECRET_KEY fallback keeps working when an
+        # operator sets a fresh GOGGLES_TOKEN_HASH_KEY while the old SECRET_KEY
+        # is still configured; authenticate() rekeys the row on first use.
         with override_settings(
             SECRET_KEY="current-signing-key",
             GOGGLES_TOKEN_HASH_KEY="current-signing-key",  # fallback state
         ):
             raw_token, token = UploadToken.issue("legacy device")
 
-        # Operator pins the dedicated key to the current SECRET_KEY: safe.
-        with override_settings(
-            SECRET_KEY="current-signing-key",
-            GOGGLES_TOKEN_HASH_KEY="current-signing-key",
-        ):
-            authenticated = UploadToken.authenticate(raw_token)
-        self.assertIsNotNone(authenticated)
-        self.assertEqual(authenticated.pk, token.pk)
-
-        # Jumping straight to a fresh dedicated key invalidates the legacy
-        # token (the all-token outage the migration runbook warns about).
         with override_settings(
             SECRET_KEY="current-signing-key",
             GOGGLES_TOKEN_HASH_KEY="brand-new-dedicated-key",
         ):
-            self.assertIsNone(UploadToken.authenticate(raw_token))
+            authenticated = UploadToken.authenticate(raw_token)
+
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(authenticated.pk, token.pk)
+
+    def test_legacy_secret_key_token_hash_is_rekeyed_on_successful_authentication(self):
+        # A token issued before GOGGLES_TOKEN_HASH_KEY existed is stored under
+        # the SECRET_KEY fallback. Once a dedicated key is configured, the next
+        # successful authentication should migrate that row to the dedicated key
+        # so clients do not need a forced raw-token rotation.
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="current-signing-key",
+        ):
+            raw_token, token = UploadToken.issue("legacy device")
+            legacy_hash = token.token_hash
+
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="fresh-dedicated-token-key",
+        ):
+            authenticated = UploadToken.authenticate(raw_token)
+            token.refresh_from_db()
+            migrated_hash = UploadToken.hash_secret(raw_token.split("_", 2)[2])
+
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(authenticated.pk, token.pk)
+        self.assertNotEqual(token.token_hash, legacy_hash)
+        self.assertEqual(token.token_hash, migrated_hash)
+
+    def test_rekeyed_legacy_token_survives_later_secret_key_rotation(self):
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="current-signing-key",
+        ):
+            raw_token, token = UploadToken.issue("legacy device")
+
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="fresh-dedicated-token-key",
+        ):
+            self.assertIsNotNone(UploadToken.authenticate(raw_token))
+
+        with override_settings(
+            SECRET_KEY="rotated-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="fresh-dedicated-token-key",
+        ):
+            authenticated = UploadToken.authenticate(raw_token)
+
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(authenticated.pk, token.pk)
 
 
 class AuditLogIngestionTests(TestCase):
