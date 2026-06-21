@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from django.utils import timezone
 
 from .analysis import divergent_counts_for_group_ids
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
+
+logger = logging.getLogger(__name__)
 
 AUDIT_SCHEMA_VERSION = "marmot-forensics-audit/v1"
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -233,6 +236,39 @@ def ingest_audit_log_bytes(
     except IntegrityError:
         audit_file = AuditFile.objects.get(file_sha256=file_sha256)
         return IngestionResult(audit_file=audit_file, created=False)
+    except Exception as exc:
+        # Defense-in-depth: any *other* failure while creating events (e.g. a
+        # psycopg ``DataError`` from a per-statement bind-parameter or btree
+        # index-tuple overflow) is NOT an ``IntegrityError``, so it would
+        # otherwise escape this handler, roll back the ``transaction.atomic()``
+        # block above, and 500 the upload with no ``AuditFile`` persisted --
+        # losing the raw evidence (the failure class of #7 / #14 / #24 / #36 /
+        # #51). The atomic block has already rolled back by the time we get
+        # here, so the partial write is gone; re-save the upload as a single
+        # quarantined ``AuditFile`` that preserves ``raw_text`` verbatim instead
+        # of dropping it on the floor. Log only the fact + exception type (never
+        # the raw upload body or any sensitive field).
+        logger.warning(
+            "audit log ingest failed; quarantining upload to preserve evidence",
+            extra={"error_type": type(exc).__name__},
+        )
+        return save_invalid_upload(
+            fallback_group_slug=fallback_group_slug,
+            fallback_group_name=fallback_group_name,
+            upload_token=upload_token,
+            uploaded_by=uploaded_by,
+            source_ip=source_ip,
+            user_agent=user_agent,
+            source_name=source_name,
+            source_account_label=source_account_label,
+            source_device_label=source_device_label,
+            source_platform=source_platform,
+            source_app_version=source_app_version,
+            content_type=content_type,
+            dump_bytes=dump_bytes,
+            raw_text=raw_text,
+            error="audit log ingest failed; upload quarantined to preserve raw evidence",
+        )
 
 
 def save_invalid_upload(
@@ -594,8 +630,40 @@ def create_events(
         values = event_values(audit_file, parsed, group)
         events.append(AuditEvent(**values))
         remember_duplicate_event(parsed, existing_duplicates)
-    AuditEvent.objects.bulk_create(events)
+    AuditEvent.objects.bulk_create(events, batch_size=audit_event_batch_size())
     return duplicate_count, group_ids
+
+
+# Postgres encodes the parameter count of a Bind message as an int16, so a
+# single ``INSERT ... VALUES (...),(...),...`` statement may carry at most 65535
+# bind parameters. Without an explicit ``batch_size`` Django sizes each INSERT
+# via ``connection.ops.bulk_batch_size(fields, objs)``; the Postgres backend
+# does not override the base implementation, which returns ``len(objs)`` -- so
+# every event lands in one statement. ``AuditEvent`` has ~71 concrete columns
+# per unsaved row, so any valid upload over ~900 lines (the common case: real
+# Marmot audit logs are append-only JSONL and the upload ceiling is 50 MiB)
+# overflows the 65535 cap. psycopg raises a non-``IntegrityError`` that escapes
+# the ``except IntegrityError`` handler in ``ingest_audit_log_bytes()`` and 500s
+# the upload, losing the raw evidence. Cap the batch from the live field count
+# so the bound stays correct if columns are added or removed.
+# Regression: marmot-protocol/goggles#51.
+POSTGRES_MAX_BIND_PARAMS = 65535
+
+
+def audit_event_batch_size() -> int:
+    """Largest ``bulk_create`` batch that stays under Postgres' bind cap.
+
+    Derived from the number of columns Django binds per unsaved ``AuditEvent``
+    (the local concrete fields, minus the auto ``id`` which is unset on insert),
+    so the ceiling tracks the model rather than a hand-tuned magic number.
+    """
+    fields_per_row = len(
+        [field for field in AuditEvent._meta.local_concrete_fields if not field.auto_created]
+    )
+    fields_per_row = max(fields_per_row, 1)
+    # Leave generous headroom below the hard 65535 cap so the per-statement
+    # parameter count is comfortably inside the limit.
+    return max(POSTGRES_MAX_BIND_PARAMS // (fields_per_row * 2), 1)
 
 
 def groups_for_parsed_lines(
