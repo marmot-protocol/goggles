@@ -7,7 +7,7 @@ from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
-from django.core.exceptions import RequestDataTooBig
+from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
 from django.db.models import Count, Q
@@ -197,14 +197,18 @@ def profile(request: HttpRequest):
 
 
 class MaxDumpSizeUploadHandler(FileUploadHandler):
-    """Abort multipart file parsing once a single uploaded file exceeds the app limit."""
+    """Abort multipart file parsing once the uploaded bytes exceed the app limit.
+
+    The byte counter is *cumulative* across every file part in the request and
+    is intentionally not reset in ``new_file``. A single multipart request can
+    contain many parts, each individually under ``GOGGLES_MAX_DUMP_BYTES``; a
+    per-file cap would let their sum buffer in memory and exhaust the worker.
+    Capping the aggregate bounds total resident upload memory at roughly one
+    ``GOGGLES_MAX_DUMP_BYTES``, matching the documented single-file ceiling.
+    """
 
     def __init__(self, request: HttpRequest | None = None):
         super().__init__(request)
-        self.bytes_received = 0
-
-    def new_file(self, *args, **kwargs):
-        super().new_file(*args, **kwargs)
         self.bytes_received = 0
 
     def receive_data_chunk(self, raw_data: bytes, start: int) -> bytes:
@@ -228,7 +232,11 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
 
     try:
         audit_bytes, source_name, content_type = audit_bytes_from_request(request)
-    except RequestDataTooBig:
+    except (RequestDataTooBig, TooManyFilesSent):
+        # RequestDataTooBig: a part (or the cumulative upload) exceeded the size
+        # cap. TooManyFilesSent: the request carried more parts than
+        # DATA_UPLOAD_MAX_NUMBER_FILES. Both are rejected with the same 413 so a
+        # multi-part memory-exhaustion attempt cannot bypass the ceiling.
         return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
     if len(audit_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
         return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
