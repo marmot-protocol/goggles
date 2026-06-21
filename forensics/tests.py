@@ -283,6 +283,50 @@ class UploadTokenHashKeyTests(TestCase):
         self.assertIsNotNone(authenticated)
         self.assertEqual(authenticated.pk, token.pk)
 
+    def test_expired_legacy_token_is_rejected_without_rekeying(self):
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="current-signing-key",
+        ):
+            raw_token, token = UploadToken.issue(
+                "expired legacy device",
+                expires_at=timezone.now() - timedelta(minutes=1),
+            )
+            legacy_hash = token.token_hash
+
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="fresh-dedicated-token-key",
+        ):
+            authenticated = UploadToken.authenticate(raw_token)
+            token.refresh_from_db()
+            dedicated_hash = UploadToken.hash_secret(raw_token.split("_", 2)[2])
+
+        self.assertIsNone(authenticated)
+        self.assertEqual(token.token_hash, legacy_hash)
+        self.assertNotEqual(token.token_hash, dedicated_hash)
+
+    def test_foreign_key_token_hash_is_rejected_without_rekeying(self):
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="current-signing-key",
+        ):
+            raw_token, token = UploadToken.issue("foreign-key legacy device")
+            secret = raw_token.split("_", 2)[2]
+            foreign_key_hash = UploadToken.hash_secret(secret, key="neither-current-nor-legacy")
+            token.token_hash = foreign_key_hash
+            token.save(update_fields=["token_hash"])
+
+        with override_settings(
+            SECRET_KEY="current-signing-key",
+            GOGGLES_TOKEN_HASH_KEY="fresh-dedicated-token-key",
+        ):
+            authenticated = UploadToken.authenticate(raw_token)
+            token.refresh_from_db()
+
+        self.assertIsNone(authenticated)
+        self.assertEqual(token.token_hash, foreign_key_hash)
+
 
 class AuditLogIngestionTests(TestCase):
     def test_bearer_token_post_stores_valid_jsonl_and_normalizes_events(self):
