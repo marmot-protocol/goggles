@@ -645,6 +645,13 @@ def create_events(
         events.append(AuditEvent(**values))
         remember_duplicate_event(parsed, existing_duplicates)
     AuditEvent.objects.bulk_create(events, batch_size=audit_event_batch_size())
+    # Persist the file -> group membership explicitly. ``group_ids`` is the
+    # authoritative full set resolved from EVERY parsed line (duplicates added
+    # their group above, before the ``continue``), so the link survives even
+    # when all of a group's events in this file were deduplicated away and no
+    # AuditEvent row was stored for it (marmot-protocol/goggles#37).
+    if group_ids:
+        audit_file.groups.add(*group_ids)
     return duplicate_count, group_ids
 
 

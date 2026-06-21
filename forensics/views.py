@@ -85,7 +85,12 @@ def upload_log_list(request: HttpRequest):
             "upload_token__name",
             "upload_token__token_prefix",
         )
-        .annotate(group_count=Count("events__group", distinct=True))
+        # Count the explicit AuditFile.groups M2M (#37) rather than inferring
+        # links from stored AuditEvent rows (events__group), so duplicate-heavy
+        # uploads whose group events were all deduplicated away still report
+        # their linked-group count correctly. The annotation does not need a
+        # matching .only() entry — it is computed, not a deferred column.
+        .annotate(group_count=Count("groups", distinct=True))
         .order_by("-created_at", "-id")[:100]
     )
     stats = AuditFile.objects.aggregate(
@@ -397,9 +402,11 @@ def group_name(candidate: str) -> str:
 
 
 def groups_for_audit_file(audit_file: AuditFile):
-    return list(
-        AuditGroup.objects.filter(audit_events__audit_file=audit_file).distinct().order_by("slug")
-    )
+    # Use the explicit file -> group membership rather than inferring links from
+    # stored AuditEvent rows: a duplicate-heavy upload may store zero events for
+    # a group whose membership is still recorded on the file
+    # (marmot-protocol/goggles#37).
+    return list(audit_file.groups.distinct().order_by("slug"))
 
 
 def client_ip(request: HttpRequest) -> str | None:

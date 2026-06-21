@@ -43,6 +43,7 @@ from .views import (
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    groups_for_audit_file,
 )
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
@@ -1316,6 +1317,92 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(AuditFile.objects.count(), 2)
         self.assertEqual(AuditEvent.objects.filter(group__slug=GROUP_REF).count(), 3)
         self.assertEqual(AuditFile.objects.order_by("created_at").last().duplicate_event_count, 2)
+
+    def test_duplicate_heavy_reupload_keeps_group_link_with_zero_stored_events(self):
+        # A second upload whose events for one group are ALL duplicates of an
+        # earlier file stores zero AuditEvent rows for that group, yet the
+        # file -> group link must survive: it is recorded on the explicit
+        # AuditFile.groups membership, not inferred from stored events
+        # (marmot-protocol/goggles#37).
+        raw_token, _token = UploadToken.issue("ios test client")
+        first_body = jsonl(
+            audit_event(0, group_ref=GROUP_REF),
+            audit_event(1, group_ref=OTHER_GROUP_REF),
+        )
+        # The re-upload repeats GROUP_REF's line verbatim (a duplicate that is
+        # deduplicated away) while adding a fresh OTHER_GROUP_REF line.
+        second_body = jsonl(
+            audit_event(0, group_ref=GROUP_REF),
+            audit_event(
+                2,
+                group_ref=OTHER_GROUP_REF,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": OTHER_MSG_ID,
+                    "new_state": "processed",
+                    "reason": "state_update",
+                },
+            ),
+        )
+
+        first_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=first_body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        second_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=second_body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(first_response.status_code, 201)
+        self.assertEqual(second_response.status_code, 201)
+        second_file = AuditFile.objects.order_by("created_at").last()
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        other_group = AuditGroup.objects.get(slug=OTHER_GROUP_REF)
+
+        # GROUP_REF's single line was deduplicated away: zero stored events for
+        # it in the second file, so the OLD stored-event-derived link is gone.
+        self.assertEqual(
+            second_file.events.filter(group__slug=GROUP_REF).count(),
+            0,
+        )
+
+        # The explicit relation keeps BOTH groups linked to the second file.
+        linked_groups = groups_for_audit_file(second_file)
+        self.assertIn(group, linked_groups)
+        self.assertIn(other_group, linked_groups)
+
+        # The upload API response surfaces both groups for the duplicate-heavy
+        # upload (group is None when more than one group is linked).
+        body = second_response.json()
+        self.assertCountEqual(body["groups"], [GROUP_REF, OTHER_GROUP_REF])
+        self.assertIsNone(body["group"])
+
+        # The upload_log_list "N linked" badge counts both groups, not just the
+        # one with a stored event in the second file.
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        list_response = self.client.get(reverse("upload-log-list"))
+        listed = {row.id: row for row in list_response.context["audit_files"]}
+        self.assertEqual(listed[second_file.id].group_count, 2)
+
+        # Group detail (audit_files_for_group) lists the duplicate-only file for
+        # GROUP_REF even though it stored zero events for that group. Before the
+        # explicit-M2M fix, filtering on events__group dropped it entirely.
+        # Its per-file group_event_count is correctly 0 (no stored events).
+        detail_files = {f.id: f for f in audit_files_for_group(group)}
+        self.assertIn(second_file.id, detail_files)
+        self.assertEqual(detail_files[second_file.id].group_event_count, 0)
+
+        # Group-list audit_file_count (annotated_group_list) counts the
+        # duplicate-only file toward GROUP_REF's linked-file total. Both the
+        # first and second files are linked to GROUP_REF.
+        rows = {row.slug: row for row in group_list_rows()}
+        self.assertEqual(rows[GROUP_REF].audit_file_count, 2)
 
     def test_corrected_valid_upload_keeps_lines_seen_in_quarantined_upload(self):
         raw_token, _token = UploadToken.issue("ios test client")

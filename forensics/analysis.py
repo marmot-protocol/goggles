@@ -99,17 +99,22 @@ GROUP_REF_EDGE_DISPLAY_CHARS = 32
 
 
 def audit_files_for_group(group):
-    # Annotate the per-file group-event count in SQL instead of prefetching
-    # every event of every related file. `prefetch_related("events__group")`
-    # used to materialize all AuditEvents of all these files (including
-    # invalid/other-group rows) just to count, in Python, the ones matching
-    # this group (goggles#65); the COUNT(... filter) below computes the same
-    # number in the database while still issuing a bounded number of queries
-    # (no N+1, goggles#18).
+    # File membership comes from the explicit AuditFile.groups M2M (goggles#37),
+    # NOT from stored AuditEvent rows. A duplicate-heavy upload whose group
+    # events were all deduplicated away has zero stored events for the group but
+    # is still genuinely linked to it; filtering on `events__group` (the old
+    # behavior) dropped such files from group detail entirely.
+    #
+    # The per-file group-event count is still annotated in SQL from the stored
+    # events (a duplicate-only file correctly shows group_event_count=0). This
+    # avoids prefetching every event of every related file just to count them in
+    # Python (goggles#65) while staying bounded — no COUNT-per-file N+1
+    # (goggles#18). distinct=True guards against row multiplication from joining
+    # both the groups (M2M) and events relations.
     return (
-        AuditFile.objects.filter(events__group=group)
+        AuditFile.objects.filter(groups=group)
         .annotate(
-            group_event_count=Count("events", filter=Q(events__group=group)),
+            group_event_count=Count("events", filter=Q(events__group=group), distinct=True),
         )
         .distinct()
         .order_by("-created_at", "-id")
@@ -200,7 +205,12 @@ def annotated_group_list():
         event_type__in=["fork_resolution", "epoch_rolled_back"],
     )
     return AuditGroup.objects.annotate(
-        audit_file_count=Count("audit_events__audit_file", distinct=True),
+        # File count comes from the explicit AuditFile.groups M2M (goggles#37,
+        # reverse accessor `audit_files_linked`) rather than inferring links from
+        # stored AuditEvent rows (`audit_events__audit_file`). Duplicate-heavy
+        # uploads whose group events were all deduplicated away still count
+        # toward the group's linked-file total.
+        audit_file_count=Count("audit_files_linked", distinct=True),
         event_count=Count("audit_events", filter=valid, distinct=True),
         engine_count=Count(
             "audit_events__engine_id",
