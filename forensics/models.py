@@ -277,6 +277,7 @@ class AuditEvent(models.Model):
             )
         ]
         indexes = [
+            models.Index(fields=["line_hash", "engine_id"], name="forensics_a_line_hash_eng_idx"),
             models.Index(fields=["account_ref", "engine_id"]),
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["group_ref", "wall_time_ms"]),

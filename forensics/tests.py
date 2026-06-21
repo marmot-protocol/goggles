@@ -436,6 +436,13 @@ class NormalizedFieldConfigurationTests(SimpleTestCase):
         self.assertEqual(sorted(produced_fields - persisted_fields), [])
 
 
+class AuditEventIndexTests(SimpleTestCase):
+    def test_duplicate_ingest_lookup_has_leading_line_hash_index(self):
+        index_fields = [tuple(index.fields) for index in AuditEvent._meta.indexes]
+
+        self.assertIn(("line_hash", "engine_id"), index_fields)
+
+
 class UploadTokenHashKeyTests(TestCase):
     """Token hashing is keyed on GOGGLES_TOKEN_HASH_KEY, not SECRET_KEY.
 
