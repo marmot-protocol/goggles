@@ -299,17 +299,91 @@ def representative_audit_log(engine_id=ENGINE_ALICE):
 
 
 class NormalizedFieldConfigurationTests(SimpleTestCase):
-    def test_persisted_normalized_fields_are_derived_from_audit_event_model(self):
+    def test_persisted_normalized_fields_match_pinned_snapshot(self):
+        """Pin the persisted normalized-field set in both directions.
+
+        persisted_normalized_fields() derives its set from the AuditEvent model
+        (concrete columns minus NON_NORMALIZED_AUDIT_EVENT_FIELDS). That derivation
+        only guards the silent-drop direction. Pinning the result against an
+        explicit snapshot also guards the reverse, more dangerous direction for a
+        forensic tool: a new bookkeeping column added to AuditEvent but omitted
+        from NON_NORMALIZED_AUDIT_EVENT_FIELDS would be auto-included in the
+        persisted set, silently copied from parsed.normalized, and surfaced in the
+        agent-state export -- with no other test failing. The snapshot forces any
+        such column add/remove to come with a conscious edit and reviewer
+        attention on whether the column is normalized or bookkeeping (goggles#85).
+        """
         from . import normalized_fields as normalized_field_config
 
         persisted = normalized_field_config.persisted_normalized_fields()
-        concrete_field_names = {field.name for field in AuditEvent._meta.local_concrete_fields}
 
-        self.assertEqual(len(persisted), len(set(persisted)))
         self.assertEqual(
-            set(persisted),
-            concrete_field_names - normalized_field_config.NON_NORMALIZED_AUDIT_EVENT_FIELDS,
+            persisted,
+            normalized_field_config.EXPECTED_PERSISTED_NORMALIZED_FIELDS,
+            "persisted_normalized_fields() drifted from its pinned snapshot. An "
+            "AuditEvent column was added or removed: if it is a normalized value, "
+            "update EXPECTED_PERSISTED_NORMALIZED_FIELDS; if it is ingestion "
+            "bookkeeping, add it to NON_NORMALIZED_AUDIT_EVENT_FIELDS so it does "
+            "not leak into the agent-state export (goggles#85).",
         )
+
+    def test_non_normalized_exclusion_set_actually_excludes_bookkeeping_columns(self):
+        """Assert the exclusion set's *contents*, not the impl formula.
+
+        The previous test re-derived the implementation formula (concrete columns
+        minus the exclusion set) and asserted it equals the implementation, which
+        is tautological and gives false confidence about what the exclusion set
+        contains. Anchor the actual bookkeeping columns instead so dropping one
+        from NON_NORMALIZED_AUDIT_EVENT_FIELDS (which would leak it into the
+        export) fails here.
+        """
+        from . import normalized_fields as normalized_field_config
+
+        concrete_field_names = {field.name for field in AuditEvent._meta.local_concrete_fields}
+        non_normalized = normalized_field_config.NON_NORMALIZED_AUDIT_EVENT_FIELDS
+
+        # Every declared bookkeeping field must be a real AuditEvent column (so a
+        # renamed/removed column can't leave a stale exclusion that masks a leak).
+        self.assertLessEqual(non_normalized, concrete_field_names)
+
+        # Columns that carry raw evidence, identity, ingest provenance, or
+        # ORM/bookkeeping state must never be treated as persisted normalized
+        # values -- they must not surface under event["normalized"].
+        required_bookkeeping = {
+            "id",
+            "group",
+            "audit_file",
+            "raw_line",
+            "raw_event",
+            "raw_kind",
+            "raw_context",
+            "parse_status",
+            "validation_error",
+            "account_ref",
+            "engine_id",
+            "group_ref",
+            "event_type",
+            "created_at",
+        }
+        self.assertEqual(
+            required_bookkeeping - non_normalized,
+            set(),
+            "A bookkeeping/identity/raw-evidence column is missing from "
+            "NON_NORMALIZED_AUDIT_EVENT_FIELDS and would leak into the "
+            "agent-state export (goggles#85).",
+        )
+
+        # None of the pinned normalized fields may also be marked bookkeeping.
+        self.assertEqual(
+            set(normalized_field_config.EXPECTED_PERSISTED_NORMALIZED_FIELDS) & non_normalized,
+            set(),
+        )
+
+    def test_persisted_field_set_is_ingest_normalized_fields(self):
+        from . import normalized_fields as normalized_field_config
+
+        persisted = normalized_field_config.persisted_normalized_fields()
+        self.assertEqual(len(persisted), len(set(persisted)))
         self.assertEqual(ingest_module.normalized_fields(), persisted)
 
     def test_agent_export_fields_are_persisted_fields_minus_documented_exclusions(self):

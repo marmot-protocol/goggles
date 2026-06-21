@@ -41,10 +41,6 @@ MESSAGE_EVENT_TYPES = {
 
 EPOCH_CHANGE_RESULT_KINDS = {"group_created", "group_evolution"}
 AGENT_EXPORT_SCHEMA_VERSION = "goggles-agent-group-state/v1"
-AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE = (
-    normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE
-)
-AGENT_EXPORT_NORMALIZED_FIELD_EXTRA = normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXTRA
 AGENT_EXPORT_NORMALIZED_FIELDS = normalized_field_config.agent_export_normalized_fields()
 
 VIZ_PALETTE_SIZE = 8
