@@ -3031,10 +3031,11 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(trace_builder.call_count, 1)
 
     def test_group_detail_query_count_does_not_grow_with_file_count(self):
-        # Per-file group_event_count must come from the events prefetch, not a
-        # COUNT query per audit file (goggles#18). Prove it by showing the query
-        # count is identical whether the group has 2 files or 6: an N+1 would
-        # add one query per extra file.
+        # Per-file group_event_count is annotated in SQL by
+        # audit_files_for_group (goggles#65), not computed per file. Prove it by
+        # showing the query count is identical whether the group has 2 files or
+        # 6: a COUNT-per-file N+1 (goggles#18) would add one query per extra
+        # file.
         engines = [
             ENGINE_ALICE,
             ENGINE_BOB,
@@ -3071,6 +3072,64 @@ class GroupDetailTimelineViewTests(TestCase):
             len(few_ctx.captured_queries),
             "group detail issues an extra query per audit file — the events "
             "prefetch is being defeated (goggles#18 N+1 regression)",
+        )
+
+    def test_group_detail_does_not_load_events_of_marginally_overlapping_files(self):
+        # goggles#65: audit_files_for_group annotates the per-file group-event
+        # count in SQL. It must NOT prefetch every AuditEvent of every related
+        # file just to count, in Python, the matching subset. Prove it with a
+        # file whose events span two groups: rendering group_detail for one
+        # group must report a count of only that group's events for the file
+        # AND must never SELECT the file's events (incl. the other group's)
+        # into the worker.
+        body = jsonl(
+            audit_event(0, group_ref=GROUP_REF),
+            audit_event(
+                1,
+                group_ref=OTHER_GROUP_REF,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": OTHER_MSG_ID,
+                    "new_state": "processed",
+                    "reason": "state_update",
+                },
+            ),
+        )
+        ingest_body(body)
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.events.count(), 2)  # one per group
+
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 200)
+
+        # Only this group's single event is counted, not all 2 events on the file.
+        rows = response.context["audit_files"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], audit_file.id)
+        self.assertEqual(rows[0]["group_event_count"], 1)
+
+        # The dropped prefetch (`prefetch_related("events__group")`) issued a
+        # standalone `SELECT <event columns> FROM "forensics_auditevent" WHERE
+        # ..."audit_file_id" IN (...)` that pulled every event of every related
+        # file into the worker. With the SQL annotation the per-file count is a
+        # `COUNT(...) FILTER` over a JOIN on the AuditFile query, so no query
+        # loads events keyed by `audit_file_id IN`. The legitimate event loads
+        # this request performs (valid_events_for_group, the invalid-count) are
+        # all scoped to `group_id`, never `audit_file_id IN`, so this marker is
+        # unique to the prefetch.
+        prefetch_shaped = [
+            q["sql"] for q in ctx.captured_queries if '"audit_file_id" IN' in q["sql"]
+        ]
+        self.assertEqual(
+            prefetch_shaped,
+            [],
+            "group detail prefetched the events of every related file just to "
+            "count per-file group membership (goggles#65 over-fetch regression)",
         )
 
 
