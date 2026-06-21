@@ -156,6 +156,12 @@ class AuditFile(models.Model):
     user_agent = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    groups = models.ManyToManyField(
+        AuditGroup,
+        related_name="audit_files_linked",
+        blank=True,
+    )
+
     class Meta:
         ordering = ["-created_at"]
         constraints = [
