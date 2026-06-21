@@ -99,9 +99,18 @@ GROUP_REF_EDGE_DISPLAY_CHARS = 32
 
 
 def audit_files_for_group(group):
+    # Annotate the per-file group-event count in SQL instead of prefetching
+    # every event of every related file. `prefetch_related("events__group")`
+    # used to materialize all AuditEvents of all these files (including
+    # invalid/other-group rows) just to count, in Python, the ones matching
+    # this group (goggles#65); the COUNT(... filter) below computes the same
+    # number in the database while still issuing a bounded number of queries
+    # (no N+1, goggles#18).
     return (
         AuditFile.objects.filter(events__group=group)
-        .prefetch_related("events__group")
+        .annotate(
+            group_event_count=Count("events", filter=Q(events__group=group)),
+        )
         .distinct()
         .order_by("-created_at", "-id")
     )
@@ -158,14 +167,12 @@ def file_rows_for_group(audit_files, group):
             "valid_event_count": audit_file.valid_event_count,
             "invalid_event_count": audit_file.invalid_event_count,
             "duplicate_event_count": audit_file.duplicate_event_count,
-            # Count in memory over the events prefetched by
-            # audit_files_for_group (`prefetch_related("events__group")`).
-            # `events.filter(group=group)` would bypass that prefetch cache and
-            # issue a fresh COUNT query per file (an N+1; goggles#18), so count
-            # from the already-loaded rows by comparing group_id directly.
-            "group_event_count": sum(
-                1 for event in audit_file.events.all() if event.group_id == group.id
-            ),
+            # Per-file group-event count, annotated in SQL by
+            # audit_files_for_group (`Count("events", filter=Q(events__group))`).
+            # Counting in the database avoids loading every event of every
+            # related file into memory (goggles#65) while staying bounded — no
+            # COUNT-per-file N+1 (goggles#18).
+            "group_event_count": audit_file.group_event_count,
             "account_refs": audit_file.account_refs,
             "engine_ids": audit_file.engine_ids,
             "group_refs": audit_file.group_refs,
@@ -803,7 +810,7 @@ def agent_state_export_for_group(group, events, audit_files):
         },
         "group": timeline["group"],
         "summary": group_summary(group, audit_files, events=ordered),
-        "sources": [agent_source_row(audit_file, group) for audit_file in audit_files],
+        "sources": [agent_source_row(audit_file) for audit_file in audit_files],
         "timeline": timeline,
         "actions": human_action_groups_for_group(ordered),
         "messages": message_traces_from_events(ordered, engine_ids),
@@ -811,7 +818,7 @@ def agent_state_export_for_group(group, events, audit_files):
     }
 
 
-def agent_source_row(audit_file, group):
+def agent_source_row(audit_file):
     return {
         "id": audit_file.id,
         "source_name": audit_file.source_name or f"audit-file-{audit_file.id}",
@@ -826,9 +833,9 @@ def agent_source_row(audit_file, group):
         "valid_event_count": audit_file.valid_event_count,
         "invalid_event_count": audit_file.invalid_event_count,
         "duplicate_event_count": audit_file.duplicate_event_count,
-        "group_event_count": sum(
-            1 for event in audit_file.events.all() if event.group_id == group.id
-        ),
+        # Annotated in SQL by audit_files_for_group (goggles#65); see
+        # file_rows_for_group for the rationale.
+        "group_event_count": audit_file.group_event_count,
         "first_seq": audit_file.first_seq,
         "last_seq": audit_file.last_seq,
         "first_wall_time_ms": audit_file.first_wall_time_ms,
