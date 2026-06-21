@@ -48,16 +48,8 @@ class AuditFileAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("validation_status",)
-    search_fields = (
-        "source_name",
-        "source_account_label",
-        "source_device_label",
-        "source_platform",
-        "file_sha256",
-        "account_refs",
-        "engine_ids",
-        "group_refs",
-    )
+    search_fields = ("file_sha256__exact",)
+    show_full_result_count = False
     # ``raw_text`` is excluded from the change form: it holds the entire
     # uploaded JSONL (potentially tens of MB), and Django's default model form
     # would render it into one editable textarea, making the page unbounded by
@@ -131,24 +123,22 @@ class AuditEventAdmin(admin.ModelAdmin):
         "msg_id",
         "wall_time_ms",
     )
-    list_filter = (
-        "parse_status",
-        "event_type",
-        "outcome",
-        "outcome_kind",
-        "new_state",
-        "audit_file",
-    )
+    list_filter = ("parse_status",)
     search_fields = (
-        "account_ref",
-        "engine_id",
-        "group_ref",
-        "msg_id",
-        "payload_digest",
-        "candidate_digest",
-        "incumbent_digest",
-        "raw_line",
+        "account_ref__exact",
+        "engine_id__exact",
+        "group_ref__exact",
+        "msg_id__exact",
+        "payload_digest__exact",
+        "candidate_digest__exact",
     )
+    autocomplete_fields = ("audit_file", "group")
+    show_full_result_count = False
+
+    def lookup_allowed(self, lookup, value, request):
+        if lookup == "audit_file__id__exact":
+            return True
+        return super().lookup_allowed(lookup, value, request)
 
 
 @admin.register(AnalysisRun)
