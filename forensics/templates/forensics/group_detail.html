@@ -35,6 +35,9 @@
           {% for engine in timeline_summary.engines %}
             <span class="avatar avatar--26" style="--avatar-color: var(--viz-{{ engine.color_index }})" title="{{ engine.label|default:engine.short }}">{{ engine.initials }}</span>
           {% endfor %}
+          {% if timeline_summary.engine_overflow_count %}
+            <span class="avatar avatar--26 avatar--more" title="{{ timeline_summary.engine_overflow_count }} more engines">+{{ timeline_summary.engine_overflow_count }}</span>
+          {% endif %}
         </span>
         <span class="tl-participants">{{ summary.engine_count }} engine{{ summary.engine_count|pluralize }}</span>
       </div>

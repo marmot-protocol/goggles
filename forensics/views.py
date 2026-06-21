@@ -158,24 +158,22 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
         event_type__in=FORK_EVENT_TYPES + PEELER_EVENT_TYPES
     ).count()
     epoch_count = group_epoch_count(valid_events)
+    engine_preview = group_engine_preview(valid_events)
+    engine_count = event_stats["engine_count"] or 0
     return {
         "summary": {
             "file_count": file_count,
             "event_count": event_stats["event_count"],
             "invalid_event_count": invalid_event_count,
-            "engine_count": event_stats["engine_count"],
+            "engine_count": engine_count,
             "group_count": event_stats["group_count"],
             "message_count": event_stats["message_count"],
         },
         "timeline_summary": {
-            "engines": group_engine_preview(valid_events),
+            "engines": engine_preview,
+            "engine_overflow_count": max(engine_count - len(engine_preview), 0),
             "epoch_count": epoch_count,
-            "integrity": {
-                "divergent_message_count": group.divergent_message_count,
-                "has_fork_activity": valid_events.filter(
-                    event_type__in=("fork_resolution", "epoch_rolled_back")
-                ).exists(),
-            },
+            "integrity": group_global_integrity_summary(group, valid_events),
         },
         "tab_counts": {
             "timeline": epoch_count,
@@ -233,6 +231,28 @@ def group_engine_preview(valid_events) -> list[dict]:
     return engines
 
 
+def group_global_integrity_summary(group: AuditGroup, valid_events=None) -> dict:
+    if valid_events is None:
+        valid_events = valid_group_event_queryset(group)
+    counts = valid_events.aggregate(
+        fork_resolution_count=Count("id", filter=Q(event_type="fork_resolution")),
+        rollback_count=Count("id", filter=Q(event_type="epoch_rolled_back")),
+    )
+    fork_count = counts["fork_resolution_count"] or 0
+    rollback_count = counts["rollback_count"] or 0
+    return {
+        "divergent_message_count": group.divergent_message_count,
+        # The timeline endpoint is windowed; listing every divergent msg_id would
+        # require rebuilding all message traces and reintroduce the unbounded
+        # payload path. Keep the cheap whole-group count global and leave the
+        # full IDs to the messages tab / export paths.
+        "divergent_msg_ids": [],
+        "fork_resolution_count": fork_count,
+        "rollback_count": rollback_count,
+        "has_fork_activity": bool(fork_count or rollback_count),
+    }
+
+
 @login_required
 def group_timeline(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
@@ -244,6 +264,7 @@ def group_timeline(request: HttpRequest, slug: str):
     page = Paginator(valid_events_for_group(group), page_size).get_page(request.GET.get("page"))
     events = list(page.object_list)
     payload = timeline_payload_for_group(group, events, [])
+    payload["integrity"] = group_global_integrity_summary(group)
     payload["pagination"] = {
         "page": page.number,
         "page_size": page_size,

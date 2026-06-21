@@ -3673,6 +3673,115 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(payload["pagination"]["event_count"], 2)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
+    def test_group_timeline_integrity_uses_whole_group_summary_when_paged(self):
+        group = AuditGroup.objects.create(
+            name="Paged integrity group",
+            slug="paged-integrity-group",
+            group_ref=GROUP_REF,
+            divergent_message_count=4,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=100,
+            raw_text="{}\n{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="paged.jsonl",
+            total_line_count=2,
+            valid_event_count=2,
+        )
+        AuditEvent.objects.bulk_create(
+            [
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=1,
+                    line_hash="1" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="ingest_entry",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=1,
+                    wall_time_ms=1_700_000_000_001,
+                    msg_id=MSG_ID,
+                ),
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=2,
+                    line_hash="2" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="fork_resolution",
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    group_ref=GROUP_REF,
+                    seq=2,
+                    wall_time_ms=1_700_000_000_002,
+                    source_epoch=6,
+                    candidate_digest=DIGEST_A,
+                    incumbent_digest=DIGEST_B,
+                    winner="candidate",
+                    invalidated_msg_id=OTHER_MSG_ID,
+                ),
+            ]
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("group-timeline", kwargs={"slug": group.slug}), {"page_size": 1}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["pagination"]["event_count"], 2)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["integrity"]["divergent_message_count"], 4)
+        self.assertEqual(payload["integrity"]["fork_resolution_count"], 1)
+        self.assertTrue(payload["integrity"]["has_fork_activity"])
+
+    def test_group_detail_shows_engine_preview_overflow_count(self):
+        group = AuditGroup.objects.create(
+            name="Crowded group",
+            slug="crowded-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="b" * 64,
+            byte_size=1_000,
+            raw_text="\n".join("{}" for _ in range(14)),
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="crowded.jsonl",
+            total_line_count=14,
+            valid_event_count=14,
+        )
+        AuditEvent.objects.bulk_create(
+            AuditEvent(
+                audit_file=audit_file,
+                group=group,
+                line_number=i + 1,
+                line_hash=f"{i:064x}",
+                raw_line="{}",
+                parse_status=AuditEvent.STATUS_VALID,
+                event_type="ingest_entry",
+                engine_id=f"{i:032x}",
+                account_ref=ACCOUNT_ALICE,
+                group_ref=GROUP_REF,
+                seq=i,
+                wall_time_ms=1_700_000_000_000 + i,
+            )
+            for i in range(14)
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
+
+        self.assertContains(response, "+2")
+        self.assertContains(response, "2 more engines")
+
     def test_group_agent_export_requires_login(self):
         ingest_body(representative_audit_log())
 
