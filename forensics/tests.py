@@ -33,6 +33,7 @@ from .analysis import (
 )
 from .ingest import (
     MSG_ID_MAX_LENGTH,
+    audit_event_batch_size,
     group_ref_max_length,
     ingest_audit_log_bytes,
 )
@@ -1392,6 +1393,96 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertLessEqual(len(queries), 35)
         self.assertEqual(AuditEvent.objects.count(), 20)
+
+    def test_audit_event_batch_size_stays_under_postgres_bind_limit(self):
+        # AuditEvent.objects.bulk_create() must pass an explicit batch_size so a
+        # single INSERT never exceeds Postgres' 65535 bind-parameter cap (the
+        # parameter count is encoded as an int16 on the wire). With ~71 columns
+        # per unsaved row the cap is ~922 events per statement; assert the
+        # derived batch size keeps the per-statement parameter count comfortably
+        # below the hard limit. Regression for marmot-protocol/goggles#51.
+        fields_per_row = len(
+            [field for field in AuditEvent._meta.local_concrete_fields if not field.auto_created]
+        )
+        batch_size = audit_event_batch_size()
+        self.assertGreaterEqual(batch_size, 1)
+        self.assertLess(batch_size * fields_per_row, 65535)
+
+    def test_upload_well_over_postgres_bind_limit_ingests_not_500(self):
+        # A valid JSONL upload whose line count far exceeds the ~922-event
+        # single-statement ceiling must still ingest with a 201, not 500. Without
+        # an explicit batch_size, Django's Postgres backend issues one
+        # INSERT ... VALUES (...),(...),... carrying len(objs) * ~71 bind
+        # parameters; past ~922 events that exceeds the 65535 int16 cap and
+        # psycopg raises a non-IntegrityError that escapes the
+        # ``except IntegrityError`` handler, rolling back the upload and 500ing
+        # with no AuditFile persisted -- losing the raw evidence. SQLite (the dev
+        # DB) overrides bulk_batch_size and auto-batches, so this only ever 500s
+        # on Postgres in CI; the explicit batch_size makes it correct on both.
+        # Regression for marmot-protocol/goggles#51.
+        event_count = 1500
+        body = jsonl(
+            *[
+                audit_event(
+                    seq,
+                    kind={
+                        "type": "ingest_entry",
+                        "msg_id": f"{seq:064x}",
+                        "envelope_kind": "group_message",
+                        "payload_len": 512,
+                        "payload_digest": DIGEST_A,
+                    },
+                )
+                for seq in range(event_count)
+            ]
+        )
+        raw_token, _token = UploadToken.issue("ios test client")
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["validation_status"], "valid")
+        self.assertEqual(response.json()["event_count"], event_count)
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_VALID)
+        self.assertEqual(audit_file.events.count(), event_count)
+        self.assertEqual(audit_file.raw_text, body)
+
+    def test_unexpected_ingest_error_quarantines_upload_not_500(self):
+        # Defense-in-depth: if event creation raises something OTHER than an
+        # IntegrityError (e.g. a psycopg DataError from a bind-parameter or
+        # btree-index overflow), the upload must still be saved as a quarantined
+        # AuditFile that preserves the raw text, not lost to a 500. Simulate the
+        # uncaught-error path by making create_events() raise a non-IntegrityError
+        # and assert the raw evidence survives. Regression for
+        # marmot-protocol/goggles#51.
+        from django.db import DataError
+
+        raw_token, _token = UploadToken.issue("ios test client")
+        body = representative_audit_log()
+
+        with mock.patch.object(
+            ingest_module, "create_events", side_effect=DataError("simulated bind overflow")
+        ):
+            response = self.client.post(
+                reverse("api-audit-log-upload"),
+                data=body,
+                content_type="application/x-ndjson",
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            )
+
+        # Quarantined (invalid) rather than a 500 with no record.
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        # The raw upload text is preserved intact as evidence, not dropped.
+        self.assertEqual(audit_file.raw_text, body)
 
     def test_all_supported_audit_kind_variants_are_normalized(self):
         raw_token, _token = UploadToken.issue("ios test client")
