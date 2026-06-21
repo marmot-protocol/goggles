@@ -437,6 +437,30 @@ class NormalizedFieldConfigurationTests(SimpleTestCase):
         self.assertEqual(sorted(produced_fields - persisted_fields), [])
 
 
+class AuditEventIndexTests(TestCase):
+    def test_line_hash_engine_id_index_exists_in_database(self):
+        index_name = "forensics_a_line_hash_eng_idx"
+        declared_index = next(
+            (index for index in AuditEvent._meta.indexes if index.name == index_name), None
+        )
+
+        if declared_index is None:
+            self.fail(f"{index_name} missing from AuditEvent.Meta.indexes")
+        else:
+            self.assertEqual(tuple(declared_index.fields), ("line_hash", "engine_id"))
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(
+                cursor, AuditEvent._meta.db_table
+            )
+        database_index = constraints.get(index_name)
+
+        if database_index is None:
+            self.fail(f"{index_name} missing from database constraints")
+        else:
+            self.assertTrue(database_index["index"])
+            self.assertEqual(tuple(database_index["columns"]), ("line_hash", "engine_id"))
+
+
 class UploadTokenHashKeyTests(TestCase):
     """Token hashing is keyed on GOGGLES_TOKEN_HASH_KEY, not SECRET_KEY.
 
