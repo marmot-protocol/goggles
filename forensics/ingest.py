@@ -12,6 +12,7 @@ from django.db.backends.base.operations import BaseDatabaseOperations
 from django.template.defaultfilters import slugify
 from django.utils import timezone
 
+from .analysis import divergent_counts_for_group_ids
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 
 AUDIT_SCHEMA_VERSION = "marmot-forensics-audit/v1"
@@ -215,8 +216,19 @@ def ingest_audit_log_bytes(
             if duplicate_count:
                 audit_file.duplicate_event_count = duplicate_count
                 audit_file.save(update_fields=["duplicate_event_count"])
-            for group_id in group_ids:
-                AuditGroup.objects.filter(id=group_id).update(updated_at=timezone.now())
+            locked_group_ids = list(
+                AuditGroup.objects.select_for_update()
+                .filter(id__in=group_ids)
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+            divergent_counts = divergent_counts_for_group_ids(locked_group_ids)
+            updated_at = timezone.now()
+            for group_id in locked_group_ids:
+                AuditGroup.objects.filter(id=group_id).update(
+                    divergent_message_count=divergent_counts.get(group_id, 0),
+                    updated_at=updated_at,
+                )
             return IngestionResult(audit_file=audit_file, created=True)
     except IntegrityError:
         audit_file = AuditFile.objects.get(file_sha256=file_sha256)

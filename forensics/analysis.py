@@ -209,12 +209,11 @@ def annotated_group_list():
 
 def group_list_rows():
     groups = list(annotated_group_list())
-    divergent = divergent_counts_for_groups(groups)
     for group in groups:
         search_ref = group.group_ref or group.slug
         group.search_ref = search_ref
         group.display_ref = display_group_ref(search_ref)
-        group.divergent_count = divergent.get(group.pk, 0)
+        group.divergent_count = group.divergent_message_count
         group.last_activity = _last_activity_datetime(group.last_activity_ms)
     return groups
 
@@ -244,30 +243,81 @@ def display_group_ref(value: str) -> str:
 
 
 def divergent_counts_for_groups(groups):
-    """Per-group count of messages not observed by every engine.
+    """Compute persisted divergent-message counts for the given groups.
 
-    Missing-observation logic spans three id columns plus a JSON list and a
-    set difference per group, so it stays in Python: one batched query, then
-    message_traces_from_events per group bucket. Fine while groups are few and
-    events per group are bounded; persist the count (AnalysisRun or a column)
-    if that stops being true.
+    This is intentionally kept out of the groups landing page hot path. Ingest
+    calls it only for groups touched by a new upload, then stores the result on
+    ``AuditGroup.divergent_message_count`` so ``/`` can render without loading
+    every valid ``AuditEvent`` into Python.
     """
-    events = AuditEvent.objects.filter(
-        group__in=[group.pk for group in groups],
+    return divergent_counts_for_group_ids([group.pk for group in groups if group.pk])
+
+
+def divergent_counts_for_group_ids(group_ids):
+    """Return ``{group_id: divergent_message_count}`` for persisted updates."""
+    group_ids = list(dict.fromkeys(group_id for group_id in group_ids if group_id))
+    counts = dict.fromkeys(group_ids, 0)
+    if not group_ids:
+        return counts
+
+    engines_by_group = defaultdict(set)
+    message_engines_by_group = defaultdict(lambda: defaultdict(set))
+    rows = AuditEvent.objects.filter(
+        group_id__in=group_ids,
         parse_status=AuditEvent.STATUS_VALID,
         audit_file__validation_status=AuditFile.STATUS_VALID,
+    ).values_list(
+        "group_id",
+        "engine_id",
+        "msg_id",
+        "outbound_msg_id",
+        "invalidated_msg_id",
+        "outbound_welcome_msg_ids",
+        "human_action_message_ids",
     )
-    by_group = defaultdict(list)
-    for event in events:
-        by_group[event.group_id].append(event)
-    counts = {}
-    for group_id, group_events in by_group.items():
-        engines = {event.engine_id for event in group_events if event.engine_id}
-        traces = message_traces_from_events(group_events, engines)
+
+    for (
+        group_id,
+        engine_id,
+        msg_id,
+        outbound_msg_id,
+        invalidated_msg_id,
+        outbound_welcome_msg_ids,
+        human_action_message_ids,
+    ) in rows.iterator(chunk_size=2_000):
+        if engine_id:
+            engines_by_group[group_id].add(engine_id)
+            for message_id in event_message_id_values(
+                msg_id,
+                outbound_msg_id,
+                invalidated_msg_id,
+                outbound_welcome_msg_ids,
+                human_action_message_ids,
+            ):
+                message_engines_by_group[group_id][message_id].add(engine_id)
+
+    for group_id, message_engines in message_engines_by_group.items():
+        all_engines = engines_by_group[group_id]
         counts[group_id] = sum(
-            1 for trace in traces if trace["missing_engines"] and trace["engines"]
+            1 for engines in message_engines.values() if engines and all_engines.difference(engines)
         )
     return counts
+
+
+def event_message_id_values(
+    msg_id,
+    outbound_msg_id,
+    invalidated_msg_id,
+    outbound_welcome_msg_ids,
+    human_action_message_ids,
+):
+    ids = []
+    for value in (msg_id, outbound_msg_id, invalidated_msg_id):
+        if value:
+            ids.append(value)
+    ids.extend(outbound_welcome_msg_ids or [])
+    ids.extend(human_action_message_ids or [])
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -603,13 +653,13 @@ def primary_reason(event: AuditEvent):
 
 
 def event_message_ids(event: AuditEvent):
-    ids = []
-    for value in (event.msg_id, event.outbound_msg_id, event.invalidated_msg_id):
-        if value:
-            ids.append(value)
-    ids.extend(event.outbound_welcome_msg_ids or [])
-    ids.extend(event.human_action_message_ids or [])
-    return ids
+    return event_message_id_values(
+        event.msg_id,
+        event.outbound_msg_id,
+        event.invalidated_msg_id,
+        event.outbound_welcome_msg_ids,
+        event.human_action_message_ids,
+    )
 
 
 def action_label(value: str) -> str:

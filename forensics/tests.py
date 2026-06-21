@@ -2804,6 +2804,18 @@ class GroupListAnnotationTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 8)
 
+    def test_group_list_rows_do_not_rebuild_message_traces(self):
+        self.seed_fork_group()
+
+        with mock.patch.object(
+            analysis_module,
+            "message_traces_from_events",
+            side_effect=AssertionError("group list must use persisted divergence counts"),
+        ):
+            rows = {group.slug: group for group in group_list_rows()}
+
+        self.assertEqual(rows[GROUP_REF].divergent_count, 1)
+
     def test_group_list_view_renders_search_and_group_ref_without_generated_label(self):
         self.seed_clean_group()
         User.objects.create_user(username="analyst", password="correct horse battery staple")
