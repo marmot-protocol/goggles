@@ -1715,28 +1715,52 @@ class AuditLogIngestionTests(TestCase):
             )
             for index, group_ref in enumerate(group_refs, start=1)
         ]
-        body = jsonl(
-            *[
-                audit_event(
-                    seq,
-                    group_ref=group_ref,
-                    kind={
-                        "type": "ingest_entry",
-                        "msg_id": f"{seq:064x}",
-                        "envelope_kind": "group_message",
-                        "payload_len": 512,
-                        "payload_digest": DIGEST_A,
-                    },
-                )
-                for seq, group_ref in enumerate(group_refs, start=1)
-            ]
+
+        def message_event(seq, group_ref, engine_id, account_ref, msg_id):
+            return audit_event(
+                seq,
+                engine_id=engine_id,
+                account_ref=account_ref,
+                group_ref=group_ref,
+                kind={
+                    "type": "ingest_entry",
+                    "msg_id": msg_id,
+                    "envelope_kind": "group_message",
+                    "payload_len": 512,
+                    "payload_digest": DIGEST_A,
+                },
+            )
+
+        # Seed each group with Alice seeing one message. The captured Bob upload
+        # touches all three groups in one ingest and should refresh their
+        # persisted rollups in one batched UPDATE with per-group divergent counts
+        # of 0, 1, and 2 respectively.
+        alice_body = jsonl(
+            message_event(1, group_refs[0], ENGINE_ALICE, ACCOUNT_ALICE, "10" * 32),
+            message_event(2, group_refs[1], ENGINE_ALICE, ACCOUNT_ALICE, "20" * 32),
+            message_event(3, group_refs[2], ENGINE_ALICE, ACCOUNT_ALICE, "30" * 32),
         )
+        bob_body = jsonl(
+            message_event(4, group_refs[0], ENGINE_BOB, ACCOUNT_BOB, "10" * 32),
+            message_event(5, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "20" * 32),
+            message_event(6, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "21" * 32),
+            message_event(7, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "30" * 32),
+            message_event(8, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "31" * 32),
+            message_event(9, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "32" * 32),
+        )
+        expected_divergent_counts = {
+            groups[0].id: 0,
+            groups[1].id: 1,
+            groups[2].id: 2,
+        }
+        seed_result = ingest_audit_log_bytes(dump_bytes=alice_body.encode("utf-8"))
         bumped_at = timezone.now()
 
         with mock.patch.object(ingest_module.timezone, "now", return_value=bumped_at):
             with CaptureQueriesContext(connection) as queries:
-                result = ingest_audit_log_bytes(dump_bytes=body.encode("utf-8"))
+                result = ingest_audit_log_bytes(dump_bytes=bob_body.encode("utf-8"))
 
+        self.assertTrue(seed_result.created)
         self.assertTrue(result.created)
         group_update_queries = [
             query["sql"]
@@ -1748,6 +1772,11 @@ class AuditLogIngestionTests(TestCase):
         for group in groups:
             group.refresh_from_db()
             self.assertEqual(group.updated_at, bumped_at)
+            self.assertEqual(
+                group.divergent_message_count,
+                expected_divergent_counts[group.id],
+                group.group_ref,
+            )
 
     def test_audit_event_batch_size_stays_under_postgres_bind_limit(self):
         # AuditEvent.objects.bulk_create() must pass an explicit batch_size so a
