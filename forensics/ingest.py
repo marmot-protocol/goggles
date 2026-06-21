@@ -10,6 +10,7 @@ from typing import Any
 
 from django.db import IntegrityError, transaction
 from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.models import Case, IntegerField, Value, When
 from django.template.defaultfilters import slugify
 from django.utils import timezone
 
@@ -225,13 +226,7 @@ def ingest_audit_log_bytes(
                 .order_by("id")
                 .values_list("id", flat=True)
             )
-            divergent_counts = divergent_counts_for_group_ids(locked_group_ids)
-            updated_at = timezone.now()
-            for group_id in locked_group_ids:
-                AuditGroup.objects.filter(id=group_id).update(
-                    divergent_message_count=divergent_counts.get(group_id, 0),
-                    updated_at=updated_at,
-                )
+            refresh_group_rollups(locked_group_ids)
             return IngestionResult(audit_file=audit_file, created=True)
     except IntegrityError:
         audit_file = AuditFile.objects.get(file_sha256=file_sha256)
@@ -646,6 +641,26 @@ def create_events(
         remember_duplicate_event(parsed, existing_duplicates)
     AuditEvent.objects.bulk_create(events, batch_size=audit_event_batch_size())
     return duplicate_count, group_ids
+
+
+def refresh_group_rollups(group_ids: list[int]) -> None:
+    """Refresh persisted per-group rollups touched by one ingest in one UPDATE."""
+    group_ids = list(dict.fromkeys(group_id for group_id in group_ids if group_id))
+    if not group_ids:
+        return
+
+    divergent_counts = divergent_counts_for_group_ids(group_ids)
+    divergent_count_case = Case(
+        *[
+            When(id=group_id, then=Value(divergent_counts.get(group_id, 0)))
+            for group_id in group_ids
+        ],
+        output_field=IntegerField(),
+    )
+    AuditGroup.objects.filter(id__in=group_ids).update(
+        divergent_message_count=divergent_count_case,
+        updated_at=timezone.now(),
+    )
 
 
 # Postgres encodes the parameter count of a Bind message as an int16, so a
