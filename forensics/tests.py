@@ -3714,10 +3714,49 @@ class AuditFileAdminTests(TestCase):
         self.assertNotIn("schema_versions", AuditFileAdmin.list_filter)
         self.assertIn("validation_status", AuditFileAdmin.list_filter)
 
-    def test_audit_event_admin_filterable_by_audit_file(self):
+    def test_audit_file_admin_search_avoids_json_field_scans(self):
+        from .admin import AuditFileAdmin
+
+        self.assertEqual(AuditFileAdmin.search_fields, ("file_sha256__exact",))
+        self.assertNotIn("account_refs", AuditFileAdmin.search_fields)
+        self.assertNotIn("engine_ids", AuditFileAdmin.search_fields)
+        self.assertNotIn("group_refs", AuditFileAdmin.search_fields)
+        self.assertFalse(AuditFileAdmin.show_full_result_count)
+
+    def test_audit_event_admin_filters_avoid_distinct_and_fk_dropdown_scans(self):
         from .admin import AuditEventAdmin
 
-        self.assertIn("audit_file", AuditEventAdmin.list_filter)
+        self.assertEqual(AuditEventAdmin.list_filter, ("parse_status",))
+        self.assertNotIn("event_type", AuditEventAdmin.list_filter)
+        self.assertNotIn("outcome", AuditEventAdmin.list_filter)
+        self.assertNotIn("outcome_kind", AuditEventAdmin.list_filter)
+        self.assertNotIn("new_state", AuditEventAdmin.list_filter)
+        self.assertNotIn("audit_file", AuditEventAdmin.list_filter)
+        self.assertFalse(AuditEventAdmin.show_full_result_count)
+
+    def test_audit_event_admin_search_avoids_raw_line_scans(self):
+        from .admin import AuditEventAdmin
+
+        self.assertEqual(
+            AuditEventAdmin.search_fields,
+            (
+                "account_ref__exact",
+                "engine_id__exact",
+                "group_ref__exact",
+                "msg_id__exact",
+                "payload_digest__exact",
+                "candidate_digest__exact",
+            ),
+        )
+        self.assertNotIn("raw_line", AuditEventAdmin.search_fields)
+        self.assertNotIn("incumbent_digest", AuditEventAdmin.search_fields)
+
+    def test_audit_event_admin_keeps_audit_file_deep_link_without_sidebar_filter(self):
+        from .admin import AuditEventAdmin
+
+        self.assertNotIn("audit_file", AuditEventAdmin.list_filter)
+        self.assertIn("audit_file", AuditEventAdmin.autocomplete_fields)
+        self.assertIn("group", AuditEventAdmin.autocomplete_fields)
 
     # --- raw_text bounding (goggles#34, adversarial review follow-up) -------
     #
