@@ -375,11 +375,25 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             f"wall_time_ms must be a non-negative integer within range (at most {MAX_WALL_TIME_MS})"
         )
         normalized["wall_time_ms"] = None
-    if normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
+    # ``account_ref`` / ``group_ref`` are coerced to "" above via
+    # ``value_if_str()`` for any non-string. A present-but-non-string value
+    # (number, list, object, bool) must be treated as a schema violation -- like
+    # ``engine_id``, which is validated unconditionally below -- and not silently
+    # dropped to "" (which would skip the truthiness-gated checks, mark the event
+    # valid, lose attribution, and silently re-bucket the event under the
+    # fallback group). Distinguish "absent" (None) from "present but wrong type".
+    if present_but_not_str(data, "account_ref"):
+        errors.append("account_ref must be 32 hex characters when present")
+    elif normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
         errors.append("account_ref must be 32 hex characters when present")
     if not is_hex(normalized["engine_id"], exact_len=32):
         errors.append("engine_id must be 32 hex characters")
-    if normalized["group_ref"] and not valid_group_ref(normalized["group_ref"]):
+    if present_but_not_str(data, "group_ref"):
+        errors.append(
+            "group_ref must be even-length hex and at most "
+            f"{group_ref_max_length()} characters when present"
+        )
+    elif normalized["group_ref"] and not valid_group_ref(normalized["group_ref"]):
         errors.append(
             "group_ref must be even-length hex and at most "
             f"{group_ref_max_length()} characters when present"
@@ -1165,6 +1179,18 @@ def copy_optional_int(
 
 def value_if_str(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+def present_but_not_str(data: dict[str, Any], key: str) -> bool:
+    """True when ``key`` is present in ``data`` but its value is not a string.
+
+    Used to distinguish "absent" (``None`` / missing) from "present but wrong
+    type" for ``account_ref`` / ``group_ref``, so a non-string value is flagged
+    as a schema violation instead of being silently coerced to ``""`` by
+    ``value_if_str()`` and skipping the truthiness-gated validation.
+    """
+    value = data.get(key)
+    return value is not None and not isinstance(value, str)
 
 
 def bounded_str_or_empty(value: Any, field: str, errors: list[str]) -> str:

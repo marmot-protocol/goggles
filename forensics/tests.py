@@ -787,6 +787,105 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(event.raw_line, body.rstrip("\n"))
         self.assertEqual(event.raw_event["group_ref"], oversized_group_ref)
 
+    def test_non_string_account_ref_returns_400_and_is_quarantined(self):
+        # A present-but-non-string account_ref (here a JSON number) must be
+        # treated as a schema violation -- like engine_id -- not silently coerced
+        # to "" (which would drop attribution and mark the event valid). The file
+        # is quarantined and the raw evidence (original numeric value) preserved.
+        # Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        bad_event = audit_event(0)
+        bad_event["account_ref"] = 123456
+        body = jsonl(bad_event)
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("account_ref", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        # Raw upload text is preserved intact for forensic evidence.
+        self.assertEqual(audit_file.raw_text, body)
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIn("account_ref", event.validation_error)
+        # The non-string value is not stored in the indexed column...
+        self.assertEqual(event.account_ref, "")
+        # ...but the verbatim raw event preserves the original value.
+        self.assertEqual(event.raw_event["account_ref"], 123456)
+
+    def test_non_string_group_ref_returns_400_and_is_quarantined(self):
+        # A present-but-non-string group_ref (here a JSON list) must be flagged
+        # as a schema violation and quarantined. Previously it was coerced to ""
+        # so group_key_for_parsed_line() silently re-filed the event under the
+        # fallback "incoming" group with no validation error -- losing the
+        # explicit group attribution. Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        bad_event = audit_event(0)
+        bad_event["group_ref"] = ["not", "a", "string"]
+        body = jsonl(bad_event)
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("group_ref", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(audit_file.raw_text, body)
+        # The event is NOT silently re-bucketed under the fallback group: the
+        # whole file is quarantined, so no AuditGroup is created at all.
+        self.assertFalse(AuditGroup.objects.exists())
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIn("group_ref", event.validation_error)
+        self.assertEqual(event.group_ref, "")
+        self.assertEqual(event.raw_event["group_ref"], ["not", "a", "string"])
+
+    def test_numeric_group_ref_returns_400_and_is_quarantined(self):
+        # Same as above but with a JSON number rather than a list, covering the
+        # other common non-string shape. Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        bad_event = audit_event(0)
+        bad_event["group_ref"] = 42
+        body = jsonl(bad_event)
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("group_ref", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertFalse(AuditGroup.objects.exists())
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIn("group_ref", event.validation_error)
+        self.assertEqual(event.group_ref, "")
+        self.assertEqual(event.raw_event["group_ref"], 42)
+
     def test_overlong_msg_id_is_quarantined_not_500(self):
         # msg_id is an unbounded TextField carried by a single-column btree
         # index (Index(fields=["msg_id"])). copy_msg_field() previously only
