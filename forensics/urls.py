@@ -12,6 +12,8 @@ urlpatterns = [
         views.group_agent_export,
         name="group-agent-export",
     ),
+    path("groups/<slug:slug>/timeline.json", views.group_timeline, name="group-timeline"),
+    path("groups/<slug:slug>/tabs/<slug:tab>/", views.group_tab, name="group-tab"),
     path("groups/<slug:slug>/", views.group_detail, name="group-detail"),
     path("audit-files/<int:pk>/", views.audit_file_detail, name="audit-file-detail"),
     path(

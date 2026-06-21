@@ -10,22 +10,25 @@ from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
-from django.db.models import Count, Q
+from django.db.models import Count, Max, Min, Q
 from django.db.models.functions import Length, Substr
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .analysis import (
+    FORK_EVENT_TYPES,
+    PEELER_EVENT_TYPES,
     agent_state_export_for_group,
     audit_files_for_group,
+    color_index,
+    engine_initials,
     event_row,
     file_rows_for_group,
     fork_and_convergence_events,
     group_list_rows,
-    group_summary,
     human_action_groups_for_group,
     message_traces_for_group,
     missing_observations_for_group,
@@ -34,11 +37,20 @@ from .analysis import (
     valid_events_for_group,
 )
 from .ingest import ingest_audit_log_bytes
-from .models import AuditFile, AuditGroup, UploadToken
+from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 
 UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
 AUDIT_FILE_EVENT_PAGE_SIZE = 100
 RAW_TEXT_PREVIEW_CHARS = 32 * 1024
+GROUP_TIMELINE_EVENT_PAGE_SIZE = 2_000
+GROUP_TIMELINE_EVENT_MAX_PAGE_SIZE = 5_000
+GROUP_ENGINE_PREVIEW_LIMIT = 12
+GROUP_DETAIL_TAB_TEMPLATES = {
+    "actions": "forensics/partials/group_actions.html",
+    "messages": "forensics/partials/group_messages.html",
+    "integrity": "forensics/partials/group_integrity.html",
+    "files": "forensics/partials/group_files.html",
+}
 
 
 def healthz(_request: HttpRequest):
@@ -111,26 +123,198 @@ def upload_log_list(request: HttpRequest):
 @login_required
 def group_detail(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
-    audit_files = list(audit_files_for_group(group))
-    events = list(valid_events_for_group(group))
-    traces = message_traces_for_group(group, events=events)
     return render(
         request,
         "forensics/group_detail.html",
         {
             "group": group,
-            "summary": group_summary(group, audit_files, events=events),
-            "audit_files": file_rows_for_group(audit_files, group),
-            "human_action_groups": human_action_groups_for_group(events),
-            "message_traces": traces,
-            "missing_observations": missing_observations_for_group(group, traces=traces),
-            "fork_events": fork_and_convergence_events(group, events=events),
-            "peeler_events": peeler_and_rejection_events(group, events=events),
-            "timeline_payload": timeline_payload_for_group(
-                group, events, audit_files, traces=traces
-            ),
+            **group_detail_shell_context(group),
         },
     )
+
+
+def valid_group_event_queryset(group: AuditGroup):
+    return AuditEvent.objects.filter(
+        group=group,
+        audit_file__validation_status=AuditFile.STATUS_VALID,
+        parse_status=AuditEvent.STATUS_VALID,
+    )
+
+
+def group_detail_shell_context(group: AuditGroup) -> dict:
+    valid_events = valid_group_event_queryset(group)
+    event_stats = valid_events.aggregate(
+        event_count=Count("id"),
+        engine_count=Count("engine_id", filter=~Q(engine_id=""), distinct=True),
+        group_count=Count("group_ref", filter=~Q(group_ref=""), distinct=True),
+        message_count=Count("msg_id", filter=~Q(msg_id=""), distinct=True),
+        action_count=Count("id", filter=~Q(human_action_action="")),
+    )
+    file_count = AuditFile.objects.filter(events__group=group).distinct().count()
+    invalid_event_count = AuditEvent.objects.filter(
+        group=group, parse_status=AuditEvent.STATUS_INVALID
+    ).count()
+    integrity_count = valid_events.filter(
+        event_type__in=FORK_EVENT_TYPES + PEELER_EVENT_TYPES
+    ).count()
+    epoch_count = group_epoch_count(valid_events)
+    engine_preview = group_engine_preview(valid_events)
+    engine_count = event_stats["engine_count"] or 0
+    return {
+        "summary": {
+            "file_count": file_count,
+            "event_count": event_stats["event_count"],
+            "invalid_event_count": invalid_event_count,
+            "engine_count": engine_count,
+            "group_count": event_stats["group_count"],
+            "message_count": event_stats["message_count"],
+        },
+        "timeline_summary": {
+            "engines": engine_preview,
+            "engine_overflow_count": max(engine_count - len(engine_preview), 0),
+            "epoch_count": epoch_count,
+            "integrity": group_global_integrity_summary(group, valid_events),
+        },
+        "tab_counts": {
+            "timeline": epoch_count,
+            "actions": event_stats["action_count"],
+            "messages": event_stats["message_count"],
+            "integrity": integrity_count,
+            "files": file_count,
+        },
+    }
+
+
+def group_epoch_count(valid_events) -> int:
+    epochs = set()
+    for row in valid_events.values_list(
+        "epoch",
+        "source_epoch",
+        "to_epoch",
+        "pending_epoch",
+        "current_tip_epoch",
+        "selected_tip_epoch",
+    ):
+        epochs.update(value for value in row if value is not None)
+    return len(epochs)
+
+
+def group_engine_preview(valid_events) -> list[dict]:
+    rows = (
+        valid_events.exclude(engine_id="")
+        .values("engine_id")
+        .annotate(
+            event_count=Count("id"),
+            first_event_ms=Min("wall_time_ms"),
+            last_event_ms=Max("wall_time_ms"),
+            account_ref=Min("account_ref"),
+        )
+        .order_by("first_event_ms", "engine_id")[:GROUP_ENGINE_PREVIEW_LIMIT]
+    )
+    engines = []
+    for idx, row in enumerate(rows):
+        engine_id = row["engine_id"]
+        engines.append(
+            {
+                "engine_id": engine_id,
+                "account_ref": row["account_ref"] or "",
+                "label": "",
+                "color_index": color_index(engine_id),
+                "first_event_ms": row["first_event_ms"],
+                "last_event_ms": row["last_event_ms"],
+                "event_count": row["event_count"],
+                "idx": idx,
+                "short": engine_id[:8],
+                "initials": engine_initials("", engine_id),
+            }
+        )
+    return engines
+
+
+def group_global_integrity_summary(group: AuditGroup, valid_events=None) -> dict:
+    if valid_events is None:
+        valid_events = valid_group_event_queryset(group)
+    counts = valid_events.aggregate(
+        fork_resolution_count=Count("id", filter=Q(event_type="fork_resolution")),
+        rollback_count=Count("id", filter=Q(event_type="epoch_rolled_back")),
+    )
+    fork_count = counts["fork_resolution_count"] or 0
+    rollback_count = counts["rollback_count"] or 0
+    return {
+        "divergent_message_count": group.divergent_message_count,
+        # The timeline endpoint is windowed; listing every divergent msg_id would
+        # require rebuilding all message traces and reintroduce the unbounded
+        # payload path. Keep the cheap whole-group count global and leave the
+        # full IDs to the messages tab / export paths.
+        "divergent_msg_ids": [],
+        "fork_resolution_count": fork_count,
+        "rollback_count": rollback_count,
+        "has_fork_activity": bool(fork_count or rollback_count),
+    }
+
+
+@login_required
+def group_timeline(request: HttpRequest, slug: str):
+    group = get_object_or_404(AuditGroup, slug=slug)
+    page_size = bounded_positive_int(
+        request.GET.get("page_size"),
+        default=GROUP_TIMELINE_EVENT_PAGE_SIZE,
+        maximum=GROUP_TIMELINE_EVENT_MAX_PAGE_SIZE,
+    )
+    page = Paginator(valid_events_for_group(group), page_size).get_page(request.GET.get("page"))
+    events = list(page.object_list)
+    payload = timeline_payload_for_group(group, events, [])
+    payload["integrity"] = group_global_integrity_summary(group)
+    payload["pagination"] = {
+        "page": page.number,
+        "page_size": page_size,
+        "page_count": page.paginator.num_pages,
+        "event_count": page.paginator.count,
+        "has_next": page.has_next(),
+        "has_previous": page.has_previous(),
+    }
+    return JsonResponse(payload, json_dumps_params={"separators": (",", ":")})
+
+
+def bounded_positive_int(value: str | None, *, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, 1), maximum)
+
+
+@login_required
+def group_tab(request: HttpRequest, slug: str, tab: str):
+    template_name = GROUP_DETAIL_TAB_TEMPLATES.get(tab)
+    if template_name is None:
+        raise Http404("unknown group detail tab")
+    group = get_object_or_404(AuditGroup, slug=slug)
+    return render(request, template_name, group_tab_context(group, tab))
+
+
+def group_tab_context(group: AuditGroup, tab: str) -> dict:
+    if tab == "files":
+        audit_files = list(audit_files_for_group(group))
+        return {"group": group, "audit_files": file_rows_for_group(audit_files, group)}
+
+    events = list(valid_events_for_group(group))
+    if tab == "actions":
+        return {"group": group, "human_action_groups": human_action_groups_for_group(events)}
+    if tab == "messages":
+        traces = message_traces_for_group(group, events=events)
+        return {
+            "group": group,
+            "message_traces": traces,
+            "missing_observations": missing_observations_for_group(group, traces=traces),
+        }
+    if tab == "integrity":
+        return {
+            "group": group,
+            "fork_events": fork_and_convergence_events(group, events=events),
+            "peeler_events": peeler_and_rejection_events(group, events=events),
+        }
+    raise Http404("unknown group detail tab")
 
 
 @login_required

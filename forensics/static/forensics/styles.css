@@ -403,6 +403,7 @@ a.btn:hover { text-decoration: none; }
 
 .avatar--26 { width: 26px; height: 26px; font-size: 10px; }
 .avatar--36 { width: 36px; height: 36px; font-size: 14px; }
+.avatar--more { background: var(--surface-sunken); color: var(--text-muted); }
 
 .avatar-stack { display: inline-flex; }
 .avatar-stack > * + * { margin-left: -8px; }

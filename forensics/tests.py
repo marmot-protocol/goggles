@@ -2668,24 +2668,111 @@ class DashboardTests(TestCase):
         response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
 
         self.assertContains(response, "QA fork group")
-        self.assertContains(response, 'id="timeline-data"')
-        self.assertContains(response, ENGINE_ALICE)
-        self.assertContains(response, ENGINE_BOB)
+        self.assertContains(response, "Timeline")
         self.assertContains(response, "Actions")
-        self.assertContains(response, "update_group_profile")
-        self.assertContains(response, "Message trace")
-        self.assertContains(response, MSG_ID)
-        self.assertContains(response, "Fork &amp; convergence")
-        self.assertContains(response, "candidate")
-        self.assertContains(response, "Peeler &amp; rejections")
-        self.assertContains(response, "decrypt_failed")
-        self.assertContains(response, "Missing observations")
-        self.assertContains(response, OTHER_MSG_ID)
-        payload = response.context["timeline_payload"]
+        self.assertNotContains(response, 'id="timeline-data"')
+        self.assertNotContains(response, "update_group_profile")
+        self.assertNotContains(response, MSG_ID)
+
+        timeline_response = self.client.get(reverse("group-timeline", kwargs={"slug": group.slug}))
+        self.assertEqual(timeline_response.status_code, 200)
+        payload = timeline_response.json()
         self.assertEqual(
             sorted(payload),
-            ["engines", "epochs", "excluded", "group", "integrity", "items", "time", "version"],
+            [
+                "engines",
+                "epochs",
+                "excluded",
+                "group",
+                "integrity",
+                "items",
+                "pagination",
+                "time",
+                "version",
+            ],
         )
+        self.assertEqual(payload["pagination"]["event_count"], 6)
+        self.assertEqual(payload["pagination"]["page"], 1)
+        self.assertFalse(payload["pagination"]["has_next"])
+        engine_ids = {engine["engine_id"] for engine in payload["engines"]}
+        self.assertEqual(engine_ids, {ENGINE_ALICE, ENGINE_BOB})
+
+        actions_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "actions"})
+        )
+        self.assertContains(actions_response, "update_group_profile")
+
+        messages_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        )
+        self.assertContains(messages_response, "Message trace")
+        self.assertContains(messages_response, MSG_ID[:16])
+        self.assertContains(messages_response, "Missing observations")
+        self.assertContains(messages_response, OTHER_MSG_ID[:16])
+
+        integrity_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "integrity"})
+        )
+        self.assertContains(integrity_response, "Fork &amp; convergence")
+        self.assertContains(integrity_response, "candidate")
+        self.assertContains(integrity_response, "Peeler &amp; rejections")
+        self.assertContains(integrity_response, "decrypt_failed")
+
+    def test_group_detail_shell_size_stays_bounded_for_large_groups(self):
+        group = AuditGroup.objects.create(
+            name="Large response group",
+            slug="large-response-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="f" * 64,
+            byte_size=5_000_000,
+            raw_text="x" * 5_000_000,
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="huge.jsonl",
+            source_account_label="Alice",
+            source_device_label="MacBook",
+            total_line_count=3_000,
+            valid_event_count=3_000,
+        )
+        AuditEvent.objects.bulk_create(
+            AuditEvent(
+                audit_file=audit_file,
+                group=group,
+                line_number=i + 1,
+                line_hash=f"{i:064x}",
+                raw_line=f"RAW-LINE-MARKER-{i}",
+                parse_status=AuditEvent.STATUS_VALID,
+                event_type="ingest_entry",
+                engine_id=ENGINE_ALICE if i % 2 == 0 else ENGINE_BOB,
+                account_ref=ACCOUNT_ALICE,
+                group_ref=GROUP_REF,
+                seq=i,
+                wall_time_ms=1_700_000_000_000 + i,
+                msg_id=f"{i:064x}",
+            )
+            for i in range(3_000)
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(len(response.content), 250_000)
+        self.assertNotContains(response, "RAW-LINE-MARKER-2999")
+        self.assertNotContains(response, 'id="timeline-data"')
+
+        timeline_response = self.client.get(
+            reverse("group-timeline", kwargs={"slug": group.slug}), {"page_size": 50}
+        )
+
+        self.assertEqual(timeline_response.status_code, 200)
+        payload = timeline_response.json()
+        self.assertEqual(payload["pagination"]["event_count"], 3_000)
+        self.assertEqual(payload["pagination"]["page_size"], 50)
+        self.assertTrue(payload["pagination"]["has_next"])
+        self.assertLessEqual(len(payload["items"]), 50)
 
 
 class AuditFileDetailViewTests(TestCase):
@@ -3639,20 +3726,135 @@ class GroupListAnnotationTests(TestCase):
 
 
 class GroupDetailTimelineViewTests(TestCase):
-    def test_group_detail_embeds_timeline_json_script(self):
+    def test_group_detail_exposes_lazy_timeline_endpoint(self):
         ingest_body(representative_audit_log())
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
         response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
 
-        self.assertContains(response, 'id="timeline-data"')
+        self.assertNotContains(response, 'id="timeline-data"')
         self.assertContains(response, reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+        self.assertContains(response, reverse("group-timeline", kwargs={"slug": GROUP_REF}))
         self.assertContains(response, "Export JSON")
-        payload = response.context["timeline_payload"]
+
+        timeline_response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(timeline_response.status_code, 200)
+        payload = timeline_response.json()
         self.assertEqual(payload["version"], 1)
         self.assertEqual(len(payload["engines"]), 1)
+        self.assertEqual(payload["pagination"]["event_count"], 2)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
+
+    def test_group_timeline_integrity_uses_whole_group_summary_when_paged(self):
+        group = AuditGroup.objects.create(
+            name="Paged integrity group",
+            slug="paged-integrity-group",
+            group_ref=GROUP_REF,
+            divergent_message_count=4,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=100,
+            raw_text="{}\n{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="paged.jsonl",
+            total_line_count=2,
+            valid_event_count=2,
+        )
+        AuditEvent.objects.bulk_create(
+            [
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=1,
+                    line_hash="1" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="ingest_entry",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=1,
+                    wall_time_ms=1_700_000_000_001,
+                    msg_id=MSG_ID,
+                ),
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=2,
+                    line_hash="2" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="fork_resolution",
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    group_ref=GROUP_REF,
+                    seq=2,
+                    wall_time_ms=1_700_000_000_002,
+                    source_epoch=6,
+                    candidate_digest=DIGEST_A,
+                    incumbent_digest=DIGEST_B,
+                    winner="candidate",
+                    invalidated_msg_id=OTHER_MSG_ID,
+                ),
+            ]
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("group-timeline", kwargs={"slug": group.slug}), {"page_size": 1}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["pagination"]["event_count"], 2)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["integrity"]["divergent_message_count"], 4)
+        self.assertEqual(payload["integrity"]["fork_resolution_count"], 1)
+        self.assertTrue(payload["integrity"]["has_fork_activity"])
+
+    def test_group_detail_shows_engine_preview_overflow_count(self):
+        group = AuditGroup.objects.create(
+            name="Crowded group",
+            slug="crowded-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="b" * 64,
+            byte_size=1_000,
+            raw_text="\n".join("{}" for _ in range(14)),
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="crowded.jsonl",
+            total_line_count=14,
+            valid_event_count=14,
+        )
+        AuditEvent.objects.bulk_create(
+            AuditEvent(
+                audit_file=audit_file,
+                group=group,
+                line_number=i + 1,
+                line_hash=f"{i:064x}",
+                raw_line="{}",
+                parse_status=AuditEvent.STATUS_VALID,
+                event_type="ingest_entry",
+                engine_id=f"{i:032x}",
+                account_ref=ACCOUNT_ALICE,
+                group_ref=GROUP_REF,
+                seq=i,
+                wall_time_ms=1_700_000_000_000 + i,
+            )
+            for i in range(14)
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
+
+        self.assertContains(response, "+2")
+        self.assertContains(response, "2 more engines")
 
     def test_group_agent_export_requires_login(self):
         ingest_body(representative_audit_log())
@@ -3692,7 +3894,7 @@ class GroupDetailTimelineViewTests(TestCase):
         self.client.login(username="analyst", password="correct horse battery staple")
 
         with CaptureQueriesContext(connection) as ctx:
-            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+            response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
 
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 12)
@@ -3708,7 +3910,7 @@ class GroupDetailTimelineViewTests(TestCase):
             "message_traces_from_events",
             wraps=analysis_module.message_traces_from_events,
         ) as trace_builder:
-            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+            response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(trace_builder.call_count, 1)
@@ -3732,8 +3934,9 @@ class GroupDetailTimelineViewTests(TestCase):
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
+        files_url = reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "files"})
         with CaptureQueriesContext(connection) as few_ctx:
-            response_few = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+            response_few = self.client.get(files_url)
         self.assertEqual(response_few.status_code, 200)
         self.assertEqual(AuditFile.objects.count(), 2)
 
@@ -3742,7 +3945,7 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(AuditFile.objects.count(), len(engines))
 
         with CaptureQueriesContext(connection) as many_ctx:
-            response_many = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+            response_many = self.client.get(files_url)
         self.assertEqual(response_many.status_code, 200)
 
         # Confirm the per-file count is actually rendered (the value the N+1
@@ -3762,7 +3965,7 @@ class GroupDetailTimelineViewTests(TestCase):
         # count in SQL. It must NOT prefetch every AuditEvent of every related
         # file just to count, in Python, the matching subset. Prove it with a
         # file whose events span two groups: rendering group_detail for one
-        # group must report a count of only that group's events for the file
+        # files tab must report a count of only that group's events for the file
         # AND must never SELECT the file's events (incl. the other group's)
         # into the worker.
         body = jsonl(
@@ -3786,7 +3989,9 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(audit_file.events.count(), 2)  # one per group
 
         with CaptureQueriesContext(connection) as ctx:
-            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
+            response = self.client.get(
+                reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "files"})
+            )
 
         self.assertEqual(response.status_code, 200)
 
