@@ -1394,6 +1394,50 @@ class AuditLogIngestionTests(TestCase):
         self.assertLessEqual(len(queries), 35)
         self.assertEqual(AuditEvent.objects.count(), 20)
 
+    def test_upload_refreshes_all_touched_groups_with_one_update(self):
+        group_refs = [f"{index:064x}" for index in range(1, 4)]
+        groups = [
+            AuditGroup.objects.create(
+                name=f"Group {index}",
+                slug=f"group-{index}",
+                group_ref=group_ref,
+            )
+            for index, group_ref in enumerate(group_refs, start=1)
+        ]
+        body = jsonl(
+            *[
+                audit_event(
+                    seq,
+                    group_ref=group_ref,
+                    kind={
+                        "type": "ingest_entry",
+                        "msg_id": f"{seq:064x}",
+                        "envelope_kind": "group_message",
+                        "payload_len": 512,
+                        "payload_digest": DIGEST_A,
+                    },
+                )
+                for seq, group_ref in enumerate(group_refs, start=1)
+            ]
+        )
+        bumped_at = timezone.now()
+
+        with mock.patch.object(ingest_module.timezone, "now", return_value=bumped_at):
+            with CaptureQueriesContext(connection) as queries:
+                result = ingest_audit_log_bytes(dump_bytes=body.encode("utf-8"))
+
+        self.assertTrue(result.created)
+        group_update_queries = [
+            query["sql"]
+            for query in queries
+            if 'UPDATE "forensics_auditgroup"' in query["sql"] and '"updated_at"' in query["sql"]
+        ]
+        self.assertEqual(len(group_update_queries), 1, group_update_queries)
+        self.assertIn("CASE", group_update_queries[0])
+        for group in groups:
+            group.refresh_from_db()
+            self.assertEqual(group.updated_at, bumped_at)
+
     def test_audit_event_batch_size_stays_under_postgres_bind_limit(self):
         # AuditEvent.objects.bulk_create() must pass an explicit batch_size so a
         # single INSERT never exceeds Postgres' 65535 bind-parameter cap (the
