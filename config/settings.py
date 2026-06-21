@@ -127,6 +127,13 @@ LOGOUT_REDIRECT_URL = "login"
 GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
 DATA_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 FILE_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
+# The upload endpoint only ever ingests a single file part, and every part at
+# or under FILE_UPLOAD_MAX_MEMORY_SIZE is buffered in RAM. Capping the number
+# of files at 1 stops a multipart request from accumulating many sub-threshold
+# parts (each passing the per-file size check) into multiple gigabytes of
+# resident memory. MaxDumpSizeUploadHandler additionally bounds the cumulative
+# bytes across parts as defense in depth.
+DATA_UPLOAD_MAX_NUMBER_FILES = 1
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", False)

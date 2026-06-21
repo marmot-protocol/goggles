@@ -451,6 +451,69 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(AuditFile.objects.count(), 0)
         self.assertEqual(AuditEvent.objects.count(), 0)
 
+    @override_settings(
+        GOGGLES_MAX_DUMP_BYTES=1024,
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+        FILE_UPLOAD_MAX_MEMORY_SIZE=1024,
+        DATA_UPLOAD_MAX_NUMBER_FILES=1,
+    )
+    def test_api_rejects_many_sub_threshold_files_without_saving(self):
+        # Each individual part is comfortably under GOGGLES_MAX_DUMP_BYTES, so a
+        # per-file cap alone would accept them and buffer their sum in memory.
+        # DATA_UPLOAD_MAX_NUMBER_FILES=1 must reject the request before the view
+        # body runs (regression for the multi-file memory-exhaustion bug).
+        raw_token, _token = UploadToken.issue("ios test client")
+        files = {
+            f"audit_log_{index}": SimpleUploadedFile(
+                f"audit-{index}.jsonl",
+                b"x" * 100,
+                content_type="application/x-ndjson",
+            )
+            for index in range(5)
+        }
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=files,
+            HTTP_AUTHORIZATION="Bearer " + raw_token,
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"], "audit log exceeds maximum upload size")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+
+    @override_settings(
+        GOGGLES_MAX_DUMP_BYTES=150,
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+        FILE_UPLOAD_MAX_MEMORY_SIZE=1024,
+        DATA_UPLOAD_MAX_NUMBER_FILES=10,
+    )
+    def test_api_rejects_aggregate_over_cap_across_files_without_saving(self):
+        # Defense in depth: even when the file *count* is allowed, the handler's
+        # cumulative byte counter (not reset per file) must reject a request
+        # whose parts each pass the per-file check but together exceed the cap.
+        raw_token, _token = UploadToken.issue("ios test client")
+        files = {
+            f"audit_log_{index}": SimpleUploadedFile(
+                f"audit-{index}.jsonl",
+                b"x" * 100,
+                content_type="application/x-ndjson",
+            )
+            for index in range(3)
+        }
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=files,
+            HTTP_AUTHORIZATION="Bearer " + raw_token,
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"], "audit log exceeds maximum upload size")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+
     def test_multipart_audit_log_upload_is_accepted(self):
         raw_token, _token = UploadToken.issue("android qa client")
         body = representative_audit_log(ENGINE_BOB)
