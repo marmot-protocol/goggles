@@ -59,7 +59,32 @@ def group_list(request: HttpRequest):
 @login_required
 def upload_log_list(request: HttpRequest):
     audit_files = (
-        AuditFile.objects.select_related("upload_token", "uploaded_by")
+        AuditFile.objects.select_related("upload_token")
+        .only(
+            # Restrict to the columns the upload-log template actually renders so
+            # Postgres/Django never transfers or instantiates the heavy
+            # AuditFile.raw_text (or user_agent) for the recent-uploads list.
+            # Adding a new column to upload_log_list.html means adding it here.
+            "created_at",
+            "byte_size",
+            "validation_status",
+            "validation_error",
+            "source_name",
+            "source_account_label",
+            "source_device_label",
+            "source_platform",
+            "source_app_version",
+            "valid_event_count",
+            "invalid_event_count",
+            "duplicate_event_count",
+            "engine_ids",
+            "group_refs",
+            "source_ip",
+            # select_related("upload_token") joins these columns; list them so the
+            # related row is populated without a deferred-field follow-up query.
+            "upload_token__name",
+            "upload_token__token_prefix",
+        )
         .annotate(group_count=Count("events__group", distinct=True))
         .order_by("-created_at", "-id")[:100]
     )
@@ -68,7 +93,10 @@ def upload_log_list(request: HttpRequest):
         valid=Count("id", filter=Q(validation_status=AuditFile.STATUS_VALID)),
         invalid=Count("id", filter=Q(validation_status=AuditFile.STATUS_INVALID)),
     )
-    latest_upload = AuditFile.objects.order_by("-created_at", "-id").first()
+    # The template only renders latest_upload.created_at, so restrict this row to
+    # that column too — otherwise .first() loads the full row (incl. raw_text) for
+    # one potentially near-limit upload. See #39.
+    latest_upload = AuditFile.objects.only("created_at").order_by("-created_at", "-id").first()
     return render(
         request,
         "forensics/upload_log_list.html",

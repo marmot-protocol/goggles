@@ -2174,6 +2174,44 @@ class DashboardTests(TestCase):
             f'href="{reverse("audit-file-detail", args=[invalid_file.id])}"',
         )
 
+    def test_upload_log_list_does_not_select_raw_text(self):
+        # Regression for #39: the recent-uploads list renders only metadata, so
+        # the queryset must never transfer or instantiate the heavy
+        # AuditFile.raw_text column (nor reload it via a deferred-field query).
+        raw_token, _token = UploadToken.issue("ios test client")
+        user = User.objects.create_user(
+            username="analyst",
+            password="correct horse battery staple",
+        )
+        upload_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log(),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            HTTP_X_GOGGLES_ACCOUNT_LABEL="Alice",
+            HTTP_USER_AGENT="DarkMatter/1.2.3",
+            REMOTE_ADDR="203.0.113.10",
+        )
+        self.assertEqual(upload_response.status_code, 201)
+        self.assertTrue(AuditFile.objects.filter(raw_text__gt="").exists())
+
+        self.client.force_login(user)
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(reverse("upload-log-list"))
+
+        self.assertEqual(response.status_code, 200)
+        raw_text_queries = [
+            query["sql"] for query in captured.captured_queries if "raw_text" in query["sql"]
+        ]
+        self.assertEqual(
+            raw_text_queries,
+            [],
+            msg=(
+                "upload_log_list must not select AuditFile.raw_text; "
+                f"offending SQL: {raw_text_queries}"
+            ),
+        )
+
     def test_group_detail_is_login_required_and_shows_audit_workflows(self):
         group = AuditGroup.objects.create(
             name="QA fork group",
