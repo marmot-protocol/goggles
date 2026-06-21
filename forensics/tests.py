@@ -886,6 +886,106 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(event.group_ref, "")
         self.assertEqual(event.raw_event["group_ref"], 42)
 
+    def test_non_string_group_ref_with_fallback_group_is_not_rebucketed(self):
+        # The issue's second failure mode: a line that *declared* a group_ref
+        # but with a non-string value must not be silently re-filed under the
+        # upload's fallback group. Previously normalize_event() cleared the bad
+        # group_ref to "", so group_key_for_parsed_line() fell through to the
+        # fallback slug and attached the explicitly-(mis)grouped event to the
+        # catch-all group with no indication. The whole file is quarantined, so
+        # NO group -- including the fallback "mobile-qa" -- may be created or
+        # associated. Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        bad_event = audit_event(0)
+        bad_event["group_ref"] = ["not", "a", "string"]
+        body = jsonl(bad_event)
+
+        response = self.client.post(
+            reverse("api-group-audit-log-upload", kwargs={"group_slug": "mobile-qa"}),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("group_ref", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(audit_file.raw_text, body)
+        # No fallback re-bucketing: the malformed-group_ref event is NOT filed
+        # under "mobile-qa" (nor any other group).
+        self.assertFalse(AuditGroup.objects.exists())
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIsNone(event.group)
+        self.assertIn("group_ref", event.validation_error)
+        self.assertEqual(event.group_ref, "")
+        self.assertEqual(event.raw_event["group_ref"], ["not", "a", "string"])
+
+    def test_malformed_string_group_ref_with_fallback_group_is_not_rebucketed(self):
+        # Same suppression must apply to a present-but-malformed *string*
+        # group_ref (odd-length / non-hex): it declared a group, so quarantining
+        # it must not silently re-file the event under the fallback group.
+        # Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        bad_event = audit_event(0)
+        bad_event["group_ref"] = "nothex"
+        body = jsonl(bad_event)
+
+        response = self.client.post(
+            reverse("api-group-audit-log-upload", kwargs={"group_slug": "mobile-qa"}),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertIn("group_ref", response.json()["error"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertFalse(AuditGroup.objects.exists())
+
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_INVALID)
+        self.assertIsNone(event.group)
+        self.assertIn("group_ref", event.validation_error)
+        self.assertEqual(event.group_ref, "")
+        self.assertEqual(event.raw_event["group_ref"], "nothex")
+
+    def test_absent_group_ref_with_fallback_group_still_uses_fallback(self):
+        # Counterpart to the suppression tests: a *genuinely absent* group_ref
+        # (key omitted from the line) must STILL fall back to the upload's
+        # fallback group. The fix only suppresses fallback grouping for
+        # present-but-invalid group_ref, not for absent ones. Guards against
+        # over-correction. Regression for marmot-protocol/goggles#53.
+        raw_token, _token = UploadToken.issue("ios test client")
+        good_event = audit_event(0)
+        del good_event["group_ref"]
+        body = jsonl(good_event)
+
+        response = self.client.post(
+            reverse("api-group-audit-log-upload", kwargs={"group_slug": "mobile-qa"}),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["groups"], ["mobile-qa"])
+
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_VALID)
+
+        fallback_group = AuditGroup.objects.get(slug="mobile-qa")
+        event = audit_file.events.get()
+        self.assertEqual(event.parse_status, AuditEvent.STATUS_VALID)
+        self.assertEqual(event.group, fallback_group)
+
     def test_overlong_msg_id_is_quarantined_not_500(self):
         # msg_id is an unbounded TextField carried by a single-column btree
         # index (Index(fields=["msg_id"])). copy_msg_field() previously only

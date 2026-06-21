@@ -638,9 +638,39 @@ def group_key_for_parsed_line(
     group_ref = parsed.normalized.get("group_ref") or ""
     if valid_group_ref(group_ref):
         return ("ref", group_ref)
+    # A line that *declared* a group_ref but whose value was non-string or
+    # malformed has it normalized to "" with a validation error appended (see
+    # normalize_event()). Such a line must NOT silently inherit the fallback
+    # group: that re-buckets an event which explicitly named a (bad) group
+    # under the catch-all slug, discarding its original group attribution with
+    # no indication. Suppress the fallback for present-but-invalid group_ref;
+    # only a *genuinely absent* group_ref (None / missing in the source line)
+    # falls through to the fallback group slug. Mirrors how normalize_event()
+    # distinguishes "absent" (None) from "present but wrong type". Regression
+    # for marmot-protocol/goggles#53 (second failure mode: silent re-bucketing).
+    if declared_invalid_group_ref(parsed):
+        return None
     if fallback_group_slug:
         return ("slug", fallback_group_slug)
     return None
+
+
+def declared_invalid_group_ref(parsed: ParsedLine) -> bool:
+    """True when the source line declared a ``group_ref`` that is not a valid ref.
+
+    Distinguishes "absent" (``None`` / missing in the raw line) from
+    "present but invalid" (non-string, or a malformed/oversized hex string that
+    ``normalize_event()`` cleared to ``""``). A present-but-invalid declaration
+    must suppress fallback grouping so the quarantined event is not silently
+    filed under the catch-all fallback group.
+    """
+    data = parsed.data
+    if not isinstance(data, dict):
+        return False
+    declared = data.get("group_ref")
+    if declared is None:
+        return False
+    return not (isinstance(declared, str) and valid_group_ref(declared))
 
 
 def group_for_key(group_key: tuple[str, str], *, fallback_group_name: str) -> AuditGroup:
