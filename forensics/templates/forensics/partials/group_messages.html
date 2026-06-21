@@ -1,0 +1,61 @@
+<section class="card card--flush">
+  <header class="card__header"><span class="card__title">Message trace</span></header>
+  <div class="card__body table-scroll">
+    {% if message_traces %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Message</th>
+            <th>Engines</th>
+            <th>Event types</th>
+            <th>States / outcomes</th>
+            <th>Window (ms)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for trace in message_traces %}
+            <tr>
+              <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
+              <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
+              <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
+              <td class="is-muted is-wrap">{{ trace.states|join:", " }}</td>
+              <td class="is-mono is-muted">{{ trace.first_wall_time_ms }} – {{ trace.last_wall_time_ms }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No message-linked events yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header"><span class="card__title">Missing observations</span></header>
+  <div class="card__body table-scroll">
+    {% if missing_observations %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Message</th>
+            <th>Observed by</th>
+            <th>Missing from</th>
+            <th>Events</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for trace in missing_observations %}
+            <tr>
+              <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
+              <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
+              <td class="is-mono is-wrap"><span class="badge badge--danger"><span class="badge__dot"></span>{% for engine in trace.missing_engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</span></td>
+              <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No per-engine message gaps detected.</p>
+    {% endif %}
+  </div>
+</section>

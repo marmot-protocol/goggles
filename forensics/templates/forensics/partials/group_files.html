@@ -1,0 +1,45 @@
+<section class="card card--flush">
+  <header class="card__header"><span class="card__title">Audit files</span></header>
+  <div class="card__body table-scroll">
+    {% if audit_files %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Status</th>
+            <th class="is-right">Group events</th>
+            <th>Source</th>
+            <th class="is-right">Valid</th>
+            <th class="is-right">Invalid</th>
+            <th class="is-right">Duplicates</th>
+            <th>Engines</th>
+            <th>Uploaded</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for audit_file in audit_files %}
+            <tr>
+              <td><a href="{% url 'audit-file-detail' audit_file.id %}">{{ audit_file.source_name }}</a></td>
+              <td>
+                {% if audit_file.validation_status == "valid" %}
+                  <span class="badge badge--accent"><span class="badge__dot"></span>valid</span>
+                {% else %}
+                  <span class="badge badge--danger"><span class="badge__dot"></span>invalid</span>
+                {% endif %}
+              </td>
+              <td class="is-right is-mono is-muted">{{ audit_file.group_event_count }}</td>
+              <td class="is-muted">{{ audit_file.source_label|default:"–" }}</td>
+              <td class="is-right is-mono is-muted">{{ audit_file.valid_event_count }}</td>
+              <td class="is-right is-mono is-muted">{{ audit_file.invalid_event_count }}</td>
+              <td class="is-right is-mono is-muted">{{ audit_file.duplicate_event_count }}</td>
+              <td class="is-mono is-muted is-wrap">{% for engine_id in audit_file.engine_ids %}{{ engine_id|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</td>
+              <td class="is-mono is-muted">{{ audit_file.created_at|date:"Y-m-d H:i" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No audit logs uploaded for this group.</p>
+    {% endif %}
+  </div>
+</section>

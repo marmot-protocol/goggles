@@ -32,7 +32,7 @@
       <div class="tl-title-row">
         <h2>{{ group.name }}</h2>
         <span class="avatar-stack">
-          {% for engine in timeline_payload.engines %}
+          {% for engine in timeline_summary.engines %}
             <span class="avatar avatar--26" style="--avatar-color: var(--viz-{{ engine.color_index }})" title="{{ engine.label|default:engine.short }}">{{ engine.initials }}</span>
           {% endfor %}
         </span>
@@ -41,11 +41,11 @@
       {% if group.notes %}<p class="tl-notes">{{ group.notes }}</p>{% endif %}
     </div>
     <div class="tl-header__badges">
-      <span class="badge">{{ timeline_payload.epochs|length }} epoch{{ timeline_payload.epochs|length|pluralize }}</span>
-      {% if timeline_payload.integrity.divergent_message_count %}
-        <span class="badge badge--danger"><span class="badge__dot"></span>{{ timeline_payload.integrity.divergent_message_count }} divergent</span>
+      <span class="badge">{{ timeline_summary.epoch_count }} epoch{{ timeline_summary.epoch_count|pluralize }}</span>
+      {% if timeline_summary.integrity.divergent_message_count %}
+        <span class="badge badge--danger"><span class="badge__dot"></span>{{ timeline_summary.integrity.divergent_message_count }} divergent</span>
       {% endif %}
-      {% if timeline_payload.integrity.has_fork_activity %}
+      {% if timeline_summary.integrity.has_fork_activity %}
         <span class="badge badge--danger">fork detected</span>
       {% endif %}
       {% if summary.invalid_event_count %}
@@ -66,21 +66,19 @@
 
   <div class="tabs" role="tablist" aria-label="Group views">
     <button type="button" class="tab" role="tab" id="tab-timeline" data-panel="panel-timeline" aria-controls="panel-timeline" aria-selected="true">
-      Timeline <span class="tab__count">{{ timeline_payload.epochs|length }}</span>
+      Timeline <span class="tab__count">{{ tab_counts.timeline }}</span>
     </button>
     <button type="button" class="tab" role="tab" id="tab-actions" data-panel="panel-actions" aria-controls="panel-actions" aria-selected="false" tabindex="-1">
-      Actions <span class="tab__count">{{ human_action_groups|length }}</span>
+      Actions <span class="tab__count">{{ tab_counts.actions }}</span>
     </button>
     <button type="button" class="tab" role="tab" id="tab-messages" data-panel="panel-messages" aria-controls="panel-messages" aria-selected="false" tabindex="-1">
-      Messages <span class="tab__count">{{ message_traces|length }}</span>
+      Messages <span class="tab__count">{{ tab_counts.messages }}</span>
     </button>
     <button type="button" class="tab" role="tab" id="tab-integrity" data-panel="panel-integrity" aria-controls="panel-integrity" aria-selected="false" tabindex="-1">
-      {% with fork_count=fork_events|length peeler_count=peeler_events|length %}
-        Integrity <span class="tab__count">{{ fork_count|add:peeler_count }}</span>
-      {% endwith %}
+      Integrity <span class="tab__count">{{ tab_counts.integrity }}</span>
     </button>
     <button type="button" class="tab" role="tab" id="tab-files" data-panel="panel-files" aria-controls="panel-files" aria-selected="false" tabindex="-1">
-      Files <span class="tab__count">{{ audit_files|length }}</span>
+      Files <span class="tab__count">{{ tab_counts.files }}</span>
     </button>
   </div>
 </div>
@@ -88,252 +86,30 @@
 <div class="tab-panels">
   <section id="panel-timeline" class="tl-body" role="tabpanel" aria-labelledby="tab-timeline">
     <div class="tl-scroll">
-      <div id="timeline">
-        <noscript><p class="empty-state">The epoch timeline needs JavaScript. The Messages, Integrity, and Files tabs work without it.</p></noscript>
+      <div id="timeline" data-timeline-url="{% url 'group-timeline' group.slug %}">
+        <p class="empty-state">Loading timeline…</p>
+        <noscript><p class="empty-state">The epoch timeline needs JavaScript. Heavy detail tabs are loaded on demand.</p></noscript>
       </div>
     </div>
     <aside id="mls-rail" class="rail" aria-live="polite" aria-label="MLS state at selected epoch"></aside>
   </section>
 
-  <section id="panel-actions" class="tab-scroll" role="tabpanel" aria-labelledby="tab-actions" hidden>
-    {% if human_action_groups %}
-      {% for action_group in human_action_groups %}
-        <section class="action-group">
-          <header class="action-group__header">
-            <div class="action-group__title">
-              <span class="badge badge--accent"><span class="badge__dot"></span>{{ action_group.action }}</span>
-              <h3>{{ action_group.action_label }}</h3>
-            </div>
-            <div class="action-group__meta">
-              {% if action_group.origin %}<span>{{ action_group.origin }}</span>{% endif %}
-              {% if action_group.phase %}<span>{{ action_group.phase }}</span>{% endif %}
-              {% if action_group.operation_id %}<span class="is-mono">{{ action_group.operation_id }}</span>{% endif %}
-            </div>
-          </header>
-          <div class="action-group__facts">
-            <span><strong>Fields</strong> {% for field in action_group.fields %}{{ field }}{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
-            <span><strong>Components</strong> {% for component_id in action_group.component_ids %}<span class="is-mono">{{ component_id }}</span>{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
-            <span><strong>Targets</strong> {{ action_group.target_count|default_if_none:"–" }}</span>
-            <span><strong>Epoch</strong> {% if action_group.from_epoch != None or action_group.to_epoch != None %}<span class="is-mono">{{ action_group.from_epoch|default_if_none:"–" }} → {{ action_group.to_epoch|default_if_none:"–" }}</span>{% else %}–{% endif %}</span>
-            <span><strong>Messages</strong> {% for msg_id in action_group.message_ids|slice:":3" %}<span class="is-mono">{{ msg_id|truncatechars:13 }}</span>{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
-          </div>
-          <div class="table-scroll">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Time (ms)</th>
-                  <th>Type</th>
-                  <th>Message</th>
-                  <th>Relay</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for event in action_group.events %}
-                  <tr>
-                    <td class="is-mono is-muted">{{ event.wall_time_ms|default_if_none:"–" }}</td>
-                    <td>{{ event.event_type }}</td>
-                    <td class="is-mono is-muted">{% for msg_id in event.message_ids|slice:":2" %}{{ msg_id|truncatechars:13 }}{% if not forloop.last %}<br>{% endif %}{% empty %}–{% endfor %}</td>
-                    <td class="is-muted is-wrap">{{ event.relay_summary|default:"–" }}</td>
-                    <td class="is-muted is-wrap">{{ event.summary }}</td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      {% endfor %}
-    {% else %}
-      <p class="empty-state">No new-format human actions found for this group.</p>
-    {% endif %}
+  <section id="panel-actions" class="tab-scroll" role="tabpanel" aria-labelledby="tab-actions" data-lazy-url="{% url 'group-tab' group.slug 'actions' %}" hidden>
+    <p class="empty-state">Select Actions to load grouped human actions.</p>
   </section>
 
-  <section id="panel-messages" class="tab-scroll" role="tabpanel" aria-labelledby="tab-messages" hidden>
-    <section class="card card--flush">
-      <header class="card__header"><span class="card__title">Message trace</span></header>
-      <div class="card__body table-scroll">
-        {% if message_traces %}
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Message</th>
-                <th>Engines</th>
-                <th>Event types</th>
-                <th>States / outcomes</th>
-                <th>Window (ms)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for trace in message_traces %}
-                <tr>
-                  <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
-                  <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
-                  <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
-                  <td class="is-muted is-wrap">{{ trace.states|join:", " }}</td>
-                  <td class="is-mono is-muted">{{ trace.first_wall_time_ms }} – {{ trace.last_wall_time_ms }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="empty-state">No message-linked events yet.</p>
-        {% endif %}
-      </div>
-    </section>
-
-    <section class="card card--flush">
-      <header class="card__header"><span class="card__title">Missing observations</span></header>
-      <div class="card__body table-scroll">
-        {% if missing_observations %}
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Message</th>
-                <th>Observed by</th>
-                <th>Missing from</th>
-                <th>Events</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for trace in missing_observations %}
-                <tr>
-                  <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
-                  <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
-                  <td class="is-mono is-wrap"><span class="badge badge--danger"><span class="badge__dot"></span>{% for engine in trace.missing_engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</span></td>
-                  <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="empty-state">No per-engine message gaps detected.</p>
-        {% endif %}
-      </div>
-    </section>
+  <section id="panel-messages" class="tab-scroll" role="tabpanel" aria-labelledby="tab-messages" data-lazy-url="{% url 'group-tab' group.slug 'messages' %}" hidden>
+    <p class="empty-state">Select Messages to load message traces and missing observations.</p>
   </section>
 
-  <section id="panel-integrity" class="tab-scroll" role="tabpanel" aria-labelledby="tab-integrity" hidden>
-    <section class="card card--flush">
-      <header class="card__header"><span class="card__title">Fork &amp; convergence</span></header>
-      <div class="card__body table-scroll">
-        {% if fork_events %}
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Time (ms)</th>
-                <th>Engine</th>
-                <th>Type</th>
-                <th>Epoch</th>
-                <th>Digest</th>
-                <th>Outcome</th>
-                <th>Reason</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for event in fork_events %}
-                <tr>
-                  <td class="is-mono is-muted">{{ event.wall_time_ms }}</td>
-                  <td class="is-mono is-muted">{{ event.engine_id|truncatechars:9 }}</td>
-                  <td>{{ event.event_type }}</td>
-                  <td class="is-mono">{{ event.epoch|default_if_none:"–" }}</td>
-                  <td class="is-mono is-muted">{{ event.digest|default:"–"|truncatechars:17 }}</td>
-                  <td>{{ event.outcome|default:"–" }}</td>
-                  <td class="is-muted is-wrap">{{ event.reason|default:event.summary }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="empty-state">No fork or convergence events observed.</p>
-        {% endif %}
-      </div>
-    </section>
-
-    <section class="card card--flush">
-      <header class="card__header"><span class="card__title">Peeler &amp; rejections</span></header>
-      <div class="card__body table-scroll">
-        {% if peeler_events %}
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Time (ms)</th>
-                <th>Engine</th>
-                <th>Type</th>
-                <th>Message</th>
-                <th>Outcome</th>
-                <th>Reason</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for event in peeler_events %}
-                <tr>
-                  <td class="is-mono is-muted">{{ event.wall_time_ms }}</td>
-                  <td class="is-mono is-muted">{{ event.engine_id|truncatechars:9 }}</td>
-                  <td>{{ event.event_type }}</td>
-                  <td class="is-mono is-muted">{{ event.msg_id|default:"–"|truncatechars:17 }}</td>
-                  <td><span class="badge badge--danger">{{ event.outcome|default:"–" }}</span></td>
-                  <td class="is-muted is-wrap">{{ event.reason|default:event.summary }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="empty-state">No peeler issues or rejections observed.</p>
-        {% endif %}
-      </div>
-    </section>
+  <section id="panel-integrity" class="tab-scroll" role="tabpanel" aria-labelledby="tab-integrity" data-lazy-url="{% url 'group-tab' group.slug 'integrity' %}" hidden>
+    <p class="empty-state">Select Integrity to load fork, convergence, and peeler details.</p>
   </section>
 
-  <section id="panel-files" class="tab-scroll" role="tabpanel" aria-labelledby="tab-files" hidden>
-    <section class="card card--flush">
-      <header class="card__header"><span class="card__title">Audit files</span></header>
-      <div class="card__body table-scroll">
-        {% if audit_files %}
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>File</th>
-                <th>Status</th>
-                <th class="is-right">Group events</th>
-                <th>Source</th>
-                <th class="is-right">Valid</th>
-                <th class="is-right">Invalid</th>
-                <th class="is-right">Duplicates</th>
-                <th>Engines</th>
-                <th>Uploaded</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for audit_file in audit_files %}
-                <tr>
-                  <td><a href="{% url 'audit-file-detail' audit_file.id %}">{{ audit_file.source_name }}</a></td>
-                  <td>
-                    {% if audit_file.validation_status == "valid" %}
-                      <span class="badge badge--accent"><span class="badge__dot"></span>valid</span>
-                    {% else %}
-                      <span class="badge badge--danger"><span class="badge__dot"></span>invalid</span>
-                    {% endif %}
-                  </td>
-                  <td class="is-right is-mono is-muted">{{ audit_file.group_event_count }}</td>
-                  <td class="is-muted">{{ audit_file.source_label|default:"–" }}</td>
-                  <td class="is-right is-mono is-muted">{{ audit_file.valid_event_count }}</td>
-                  <td class="is-right is-mono is-muted">{{ audit_file.invalid_event_count }}</td>
-                  <td class="is-right is-mono is-muted">{{ audit_file.duplicate_event_count }}</td>
-                  <td class="is-mono is-muted is-wrap">{% for engine_id in audit_file.engine_ids %}{{ engine_id|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</td>
-                  <td class="is-mono is-muted">{{ audit_file.created_at|date:"Y-m-d H:i" }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="empty-state">No audit logs uploaded for this group.</p>
-        {% endif %}
-      </div>
-    </section>
+  <section id="panel-files" class="tab-scroll" role="tabpanel" aria-labelledby="tab-files" data-lazy-url="{% url 'group-tab' group.slug 'files' %}" hidden>
+    <p class="empty-state">Select Files to load member audit-log rows.</p>
   </section>
 </div>
-
-{{ timeline_payload|json_script:"timeline-data" }}
 {% endblock %}
 
 {% block scripts %}

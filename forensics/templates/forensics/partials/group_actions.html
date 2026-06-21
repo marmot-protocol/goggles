@@ -1,0 +1,50 @@
+{% if human_action_groups %}
+  {% for action_group in human_action_groups %}
+    <section class="action-group">
+      <header class="action-group__header">
+        <div class="action-group__title">
+          <span class="badge badge--accent"><span class="badge__dot"></span>{{ action_group.action }}</span>
+          <h3>{{ action_group.action_label }}</h3>
+        </div>
+        <div class="action-group__meta">
+          {% if action_group.origin %}<span>{{ action_group.origin }}</span>{% endif %}
+          {% if action_group.phase %}<span>{{ action_group.phase }}</span>{% endif %}
+          {% if action_group.operation_id %}<span class="is-mono">{{ action_group.operation_id }}</span>{% endif %}
+        </div>
+      </header>
+      <div class="action-group__facts">
+        <span><strong>Fields</strong> {% for field in action_group.fields %}{{ field }}{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
+        <span><strong>Components</strong> {% for component_id in action_group.component_ids %}<span class="is-mono">{{ component_id }}</span>{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
+        <span><strong>Targets</strong> {{ action_group.target_count|default_if_none:"–" }}</span>
+        <span><strong>Epoch</strong> {% if action_group.from_epoch != None or action_group.to_epoch != None %}<span class="is-mono">{{ action_group.from_epoch|default_if_none:"–" }} → {{ action_group.to_epoch|default_if_none:"–" }}</span>{% else %}–{% endif %}</span>
+        <span><strong>Messages</strong> {% for msg_id in action_group.message_ids|slice:":3" %}<span class="is-mono">{{ msg_id|truncatechars:13 }}</span>{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</span>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Time (ms)</th>
+              <th>Type</th>
+              <th>Message</th>
+              <th>Relay</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for event in action_group.events %}
+              <tr>
+                <td class="is-mono is-muted">{{ event.wall_time_ms|default_if_none:"–" }}</td>
+                <td>{{ event.event_type }}</td>
+                <td class="is-mono is-muted">{% for msg_id in event.message_ids|slice:":2" %}{{ msg_id|truncatechars:13 }}{% if not forloop.last %}<br>{% endif %}{% empty %}–{% endfor %}</td>
+                <td class="is-muted is-wrap">{{ event.relay_summary|default:"–" }}</td>
+                <td class="is-muted is-wrap">{{ event.summary }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endfor %}
+{% else %}
+  <p class="empty-state">No new-format human actions found for this group.</p>
+{% endif %}
