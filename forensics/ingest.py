@@ -13,6 +13,7 @@ from django.db.backends.base.operations import BaseDatabaseOperations
 from django.template.defaultfilters import slugify
 from django.utils import timezone
 
+from . import normalized_fields as normalized_field_config
 from .analysis import divergent_counts_for_group_ids
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 
@@ -953,62 +954,7 @@ def file_validation_errors(parsed_lines: list[ParsedLine]) -> list[str]:
 
 
 def normalized_fields() -> tuple[str, ...]:
-    return (
-        "msg_id",
-        "outbound_msg_id",
-        "outbound_welcome_msg_ids",
-        "target_kind",
-        "relay_urls",
-        "accepted_relay_urls",
-        "failed_relays",
-        "required_acks",
-        "met_required_acks",
-        "context_operation_id",
-        "context_human_action",
-        "context_transport",
-        "context_engine",
-        "context_group",
-        "human_action_action",
-        "human_action_origin",
-        "human_action_phase",
-        "human_action_fields",
-        "human_action_component_ids",
-        "human_action_target_count",
-        "human_action_message_ids",
-        "epoch",
-        "source_epoch",
-        "from_epoch",
-        "to_epoch",
-        "pending_epoch",
-        "restored_epoch",
-        "current_tip_epoch",
-        "selected_fork_epoch",
-        "selected_tip_epoch",
-        "payload_len",
-        "payload_digest",
-        "candidate_digest",
-        "incumbent_digest",
-        "envelope_kind",
-        "outcome",
-        "outcome_kind",
-        "stale_reason",
-        "decision",
-        "reason",
-        "winner",
-        "new_state",
-        "pending_kind",
-        "intent_kind",
-        "result_kind",
-        "proposal_kind",
-        "snapshot_name",
-        "selected_branch_id",
-        "detail",
-        "fallback_snapshot_used",
-        "invalidated_msg_id",
-        "max_rewind_commits",
-        "candidate_count",
-        "eligible_count",
-    )
+    return normalized_field_config.persisted_normalized_fields()
 
 
 def copy_human_action_fields(

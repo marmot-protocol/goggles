@@ -99,6 +99,179 @@ def jsonl(*events):
     return "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n"
 
 
+NORMALIZED_EVENT_BASE_FIELDS = frozenset(
+    {
+        "account_ref",
+        "engine_id",
+        "event_type",
+        "group_ref",
+        "raw_context",
+        "raw_kind",
+        "schema_version",
+        "seq",
+        "wall_time_ms",
+    }
+)
+
+NORMALIZED_KIND_EXAMPLES = (
+    (
+        "ingest_entry",
+        {
+            "type": "ingest_entry",
+            "msg_id": MSG_ID,
+            "envelope_kind": "group_message",
+            "payload_len": 512,
+            "payload_digest": DIGEST_A,
+        },
+    ),
+    (
+        "ingest_outcome",
+        {
+            "type": "ingest_outcome",
+            "msg_id": MSG_ID,
+            "outcome_kind": "processed",
+            "stale_reason": "none",
+            "epoch": 7,
+        },
+    ),
+    ("send_entry", {"type": "send_entry", "intent_kind": "group_message"}),
+    (
+        "send_outcome",
+        {
+            "type": "send_outcome",
+            "intent_kind": "group_message",
+            "result_kind": "published",
+            "outbound_msg_id": OTHER_MSG_ID,
+            "outbound_welcome_msg_ids": [MSG_ID, OTHER_MSG_ID],
+        },
+    ),
+    (
+        "human_action",
+        {
+            "type": "human_action",
+            "action": "update_group_profile",
+            "origin": "local_user",
+            "phase": "applied",
+            "fields": ["name"],
+            "component_ids": [32769],
+            "target_count": 2,
+            "message_ids": [MSG_ID],
+            "from_epoch": 3,
+            "to_epoch": 4,
+        },
+    ),
+    (
+        "publish_attempt",
+        {
+            "type": "publish_attempt",
+            "msg_id": MSG_ID,
+            "target_kind": "relay_set",
+            "required_acks": 2,
+            "relay_urls": ["wss://relay.example"],
+        },
+    ),
+    (
+        "publish_outcome",
+        {
+            "type": "publish_outcome",
+            "msg_id": MSG_ID,
+            "target_kind": "relay_set",
+            "required_acks": 2,
+            "accepted_relay_urls": ["wss://relay.example"],
+            "failed_relays": ["wss://relay.invalid"],
+            "met_required_acks": True,
+        },
+    ),
+    (
+        "publish_failure",
+        {
+            "type": "publish_failure",
+            "msg_id": MSG_ID,
+            "target_kind": "relay_set",
+            "required_acks": 2,
+            "reason": "relay_timeout",
+            "detail": "relay did not ack before timeout",
+            "relay_urls": ["wss://relay.example"],
+        },
+    ),
+    (
+        "epoch_confirmed",
+        {"type": "epoch_confirmed", "from_epoch": 6, "to_epoch": 7, "pending_kind": "commit"},
+    ),
+    (
+        "epoch_rolled_back",
+        {
+            "type": "epoch_rolled_back",
+            "pending_epoch": 8,
+            "restored_epoch": 7,
+            "pending_kind": "commit",
+        },
+    ),
+    (
+        "snapshot_created",
+        {
+            "type": "snapshot_created",
+            "snapshot_name": "before-rewind",
+            "source_epoch": 7,
+            "reason": "audit",
+        },
+    ),
+    (
+        "fork_resolution",
+        {
+            "type": "fork_resolution",
+            "source_epoch": 7,
+            "candidate_digest": DIGEST_A,
+            "incumbent_digest": DIGEST_B,
+            "winner": "candidate",
+            "invalidated_msg_id": OTHER_MSG_ID,
+        },
+    ),
+    (
+        "convergence_decision",
+        {
+            "type": "convergence_decision",
+            "current_tip_epoch": 9,
+            "candidate_count": 3,
+            "eligible_count": 2,
+            "max_rewind_commits": 4,
+            "selected_branch_id": "branch-a",
+            "selected_fork_epoch": 8,
+            "selected_tip_epoch": 9,
+        },
+    ),
+    (
+        "peeler_outcome",
+        {
+            "type": "peeler_outcome",
+            "msg_id": MSG_ID,
+            "outcome": "success",
+            "fallback_snapshot_used": False,
+            "detail": "decrypted",
+        },
+    ),
+    (
+        "auto_commit_decision",
+        {
+            "type": "auto_commit_decision",
+            "proposal_kind": "name_change",
+            "decision": "accept",
+            "reason": "local_user",
+        },
+    ),
+    (
+        "message_state_changed",
+        {
+            "type": "message_state_changed",
+            "msg_id": MSG_ID,
+            "new_state": "processed",
+            "reason": "acked",
+        },
+    ),
+    ("rejection", {"type": "rejection", "msg_id": MSG_ID, "reason": "malformed"}),
+)
+
+
 def representative_audit_log(engine_id=ENGINE_ALICE):
     return jsonl(
         audit_event(
@@ -123,6 +296,70 @@ def representative_audit_log(engine_id=ENGINE_ALICE):
             },
         ),
     )
+
+
+class NormalizedFieldConfigurationTests(SimpleTestCase):
+    def test_persisted_normalized_fields_are_derived_from_audit_event_model(self):
+        from . import normalized_fields as normalized_field_config
+
+        persisted = normalized_field_config.persisted_normalized_fields()
+        concrete_field_names = {field.name for field in AuditEvent._meta.local_concrete_fields}
+
+        self.assertEqual(len(persisted), len(set(persisted)))
+        self.assertEqual(
+            set(persisted),
+            concrete_field_names - normalized_field_config.NON_NORMALIZED_AUDIT_EVENT_FIELDS,
+        )
+        self.assertEqual(ingest_module.normalized_fields(), persisted)
+
+    def test_agent_export_fields_are_persisted_fields_minus_documented_exclusions(self):
+        from . import normalized_fields as normalized_field_config
+
+        persisted = normalized_field_config.persisted_normalized_fields()
+        export_excluded = normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE
+        export_extra = normalized_field_config.AGENT_EXPORT_NORMALIZED_FIELD_EXTRA
+        expected_export_fields = tuple(
+            field for field in persisted if field not in export_excluded
+        ) + tuple(export_extra)
+
+        self.assertLessEqual(export_excluded, set(persisted))
+        self.assertLessEqual(set(export_extra), {field.name for field in AuditEvent._meta.fields})
+        self.assertEqual(analysis_module.AGENT_EXPORT_NORMALIZED_FIELDS, expected_export_fields)
+
+    def test_every_normalized_key_produced_by_known_kinds_is_persisted(self):
+        persisted_fields = set(ingest_module.normalized_fields())
+        produced_fields = set()
+
+        for event_type, kind in NORMALIZED_KIND_EXAMPLES:
+            with self.subTest(event_type=event_type):
+                event = audit_event(
+                    100,
+                    context={
+                        "operation_id": "op-normalized-field-coverage",
+                        "human_action": {
+                            "action": "update_group_profile",
+                            "origin": "local_user",
+                            "phase": "applied",
+                            "fields": ["name"],
+                            "component_ids": [32769],
+                            "target_count": 2,
+                            "message_ids": [MSG_ID],
+                            "from_epoch": 1,
+                            "to_epoch": 2,
+                        },
+                        "transport": {"relay_urls": ["wss://relay.example"]},
+                        "engine": {"id": ENGINE_ALICE},
+                        "group": {"epoch": 7},
+                    },
+                    kind=kind,
+                )
+                normalized, errors = ingest_module.normalize_event(event)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(normalized["event_type"], event_type)
+                produced_fields.update(set(normalized) - NORMALIZED_EVENT_BASE_FIELDS)
+
+        self.assertEqual(sorted(produced_fields - persisted_fields), [])
 
 
 class UploadTokenHashKeyTests(TestCase):
