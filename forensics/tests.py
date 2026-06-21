@@ -2832,6 +2832,65 @@ class GroupListAnnotationTests(TestCase):
         self.assertContains(response, f">{GROUP_REF}</a>")
         self.assertNotContains(response, f"Group {GROUP_REF[:12]}")
 
+    def test_persisted_divergent_count_matches_live_trace_count(self):
+        """The persisted landing-page count and the live trace-based detail
+        count must agree for the same group.
+
+        Divergence is defined in two structurally linked analysis paths sharing
+        ``is_divergent_message``: the persisted aggregation written by ingest
+        (``AuditGroup.divergent_message_count``) and the trace-based
+        ``group_integrity_summary``. The migration 0006 backfill keeps a third,
+        intentionally self-contained copy (migrations must not import app code).
+        If anyone later changes the divergence definition in only one path, the
+        two counts drift apart and this test fails.
+
+        The fixture deliberately mixes message shapes so the assertion exercises
+        BOTH halves of the predicate and would catch a one-sided drift:
+          - MSG_ID:       seen by Alice AND Bob   -> convergent (NOT divergent)
+          - OTHER_MSG_ID: seen by Alice only      -> Bob missing   -> divergent
+          - THIRD_MSG_ID: seen by Bob only        -> Alice missing -> divergent
+        A predicate that dropped the "engines non-empty" half or the "missing
+        engines non-empty" half would count a different number of these three
+        traces, breaking parity with the persisted aggregation.
+        """
+        third_msg_id = "55" * 32
+
+        def message_event(seq, engine_id, account_ref, msg_id, wall_time_ms):
+            return audit_event(
+                seq,
+                engine_id=engine_id,
+                account_ref=account_ref,
+                kind={
+                    "type": "ingest_entry",
+                    "msg_id": msg_id,
+                    "envelope_kind": "group_message",
+                    "payload_len": 512,
+                    "payload_digest": DIGEST_A,
+                },
+                wall_time_ms=wall_time_ms,
+            )
+
+        ingest_body(
+            jsonl(
+                message_event(0, ENGINE_ALICE, ACCOUNT_ALICE, MSG_ID, T0),
+                message_event(1, ENGINE_ALICE, ACCOUNT_ALICE, OTHER_MSG_ID, T0 + 10),
+            )
+        )
+        ingest_body(
+            jsonl(
+                message_event(0, ENGINE_BOB, ACCOUNT_BOB, MSG_ID, T0 + 20),
+                message_event(1, ENGINE_BOB, ACCOUNT_BOB, third_msg_id, T0 + 30),
+            )
+        )
+
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        persisted = group.divergent_message_count
+        live = analysis_module.group_integrity_summary(group)["divergent_message_count"]
+
+        self.assertEqual(persisted, live)
+        # Two of the three messages are observed by only one of the two engines.
+        self.assertEqual(persisted, 2)
+
 
 class GroupDetailTimelineViewTests(TestCase):
     def test_group_detail_embeds_timeline_json_script(self):
