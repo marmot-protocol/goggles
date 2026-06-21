@@ -128,22 +128,26 @@ the password portion in `DATABASE_URL`.
 
 > **Existing deployments — migrating to `GOGGLES_TOKEN_HASH_KEY`.** Upload
 > tokens issued before `GOGGLES_TOKEN_HASH_KEY` existed were hashed under
-> `DJANGO_SECRET_KEY` (the historical fallback). Setting a **fresh**
-> `GOGGLES_TOKEN_HASH_KEY` on such a deployment immediately invalidates every
-> one of those tokens, because `UploadToken.authenticate()` only computes the
-> new-key hash and the raw secrets were shown once and never stored. Pick the
-> migration path deliberately:
+> `DJANGO_SECRET_KEY` (the historical fallback). After you configure a fresh
+> `GOGGLES_TOKEN_HASH_KEY`, Goggles still checks the current `DJANGO_SECRET_KEY`
+> as a legacy hash key. The first successful upload for each active, unexpired
+> legacy token rekeys that database row to `GOGGLES_TOKEN_HASH_KEY`, so clients
+> do not need an immediate raw-token rotation.
 >
-> - **Zero-downtime cutover (preserve existing tokens):** set
->   `GOGGLES_TOKEN_HASH_KEY` to the **current** `DJANGO_SECRET_KEY` value. This
->   reproduces the fallback hash exactly, so existing tokens keep working. You
->   can now rotate `DJANGO_SECRET_KEY` freely without breaking uploads. Later,
->   to fully decouple onto a fresh token-hash key, issue replacement tokens and
->   roll clients over **before** changing `GOGGLES_TOKEN_HASH_KEY`, then disable
->   the old tokens.
-> - **Clean cutover (reissue everything):** generate a fresh
->   `GOGGLES_TOKEN_HASH_KEY`, accept that all existing tokens break at that
->   moment, and reissue tokens to every client as part of the cutover.
+> Migration sequence for an existing deployment:
+>
+> 1. Deploy this code while keeping the current `DJANGO_SECRET_KEY` unchanged.
+> 2. Set a fresh, stable `GOGGLES_TOKEN_HASH_KEY` and restart the web service.
+> 3. Let every expected client upload once; each successful authentication
+>    migrates that token hash to the dedicated key.
+> 4. Rotate `DJANGO_SECRET_KEY` only after the clients you care about have
+>    authenticated under step 2. Any token that never authenticated before the
+>    `DJANGO_SECRET_KEY` rotation must be reissued.
+>
+> This lazy migration only covers the first move away from the historical
+> `DJANGO_SECRET_KEY` fallback. Rotating from one dedicated
+> `GOGGLES_TOKEN_HASH_KEY` value to another still requires issuing replacement
+> upload tokens before the key change, then disabling the old tokens.
 >
 > A brand-new deployment has no pre-existing tokens, so generate a fresh
 > `GOGGLES_TOKEN_HASH_KEY` directly with the command below.
@@ -237,14 +241,13 @@ Invalid JSONL is saved as a quarantined upload and returns `400`.
   key (sessions, CSRF, password reset) does **not** invalidate every issued
   upload token. If `GOGGLES_TOKEN_HASH_KEY` is unset it falls back to
   `DJANGO_SECRET_KEY`, which preserves existing token hashes but recouples
-  the two lifecycles — in that case rotating `DJANGO_SECRET_KEY` will
-  silently break every upload token, with no migration path because the raw
-  secrets were shown once and never stored. Treat `GOGGLES_TOKEN_HASH_KEY`
-  itself as long-lived: rotating it has the same token-invalidating effect,
-  so only change it deliberately and re-issue tokens afterward. When adopting
-  `GOGGLES_TOKEN_HASH_KEY` on an **existing** deployment, follow the migration
-  runbook under "Production Deployment" above — setting a fresh key without it
-  invalidates every previously issued token at once.
+  the two lifecycles. When adopting `GOGGLES_TOKEN_HASH_KEY` on an existing
+  deployment, keep the current `DJANGO_SECRET_KEY` in place until legacy
+  tokens have authenticated once and been lazily rekeyed; tokens that miss
+  that migration window must be reissued. Treat `GOGGLES_TOKEN_HASH_KEY`
+  itself as long-lived: rotating from one dedicated value to another has the
+  same token-invalidating effect, so only change it deliberately and issue
+  replacement tokens before the cutover.
 - Bound a token's lifetime by passing `--expires-in-days N` to
   `create_upload_token`; an expired token is rejected with 401. Tokens never
   expire by default.

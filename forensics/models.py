@@ -63,14 +63,29 @@ class UploadToken(models.Model):
         return raw_token, token
 
     @classmethod
-    def hash_secret(cls, secret: str) -> str:
+    def hash_secret(cls, secret: str, *, key: str | None = None) -> str:
         # Keyed on GOGGLES_TOKEN_HASH_KEY (a dedicated, independently
         # rotatable secret) rather than SECRET_KEY, so rotating the Django
         # signing key does not invalidate every issued upload token. The
         # setting falls back to SECRET_KEY when unset, preserving existing
         # hashes for deployments that have not provisioned a dedicated key.
-        key = settings.GOGGLES_TOKEN_HASH_KEY.encode("utf-8")
-        return hmac.new(key, secret.encode("utf-8"), hashlib.sha256).hexdigest()
+        hash_key = key or settings.GOGGLES_TOKEN_HASH_KEY
+        return hmac.new(
+            hash_key.encode("utf-8"), secret.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    @classmethod
+    def legacy_hash_keys(cls) -> tuple[str, ...]:
+        """Return fallback keys for one-way lazy migration of legacy hashes.
+
+        Before GOGGLES_TOKEN_HASH_KEY existed, token hashes were keyed on
+        SECRET_KEY. During the first dedicated-key cutover, an active token can
+        be authenticated against that legacy hash and then rekeyed to the
+        dedicated setting.
+        """
+        if settings.SECRET_KEY and settings.SECRET_KEY != settings.GOGGLES_TOKEN_HASH_KEY:
+            return (settings.SECRET_KEY,)
+        return ()
 
     def is_expired(self, *, at: datetime | None = None) -> bool:
         if self.expires_at is None:
@@ -89,10 +104,25 @@ class UploadToken(models.Model):
             token = cls.objects.get(token_prefix=prefix, is_active=True)
         except cls.DoesNotExist:
             return None
-        if not hmac.compare_digest(token.token_hash, cls.hash_secret(secret)):
-            return None
+
+        current_hash = cls.hash_secret(secret)
+        matched_legacy_key = False
+        if not hmac.compare_digest(token.token_hash, current_hash):
+            for legacy_key in cls.legacy_hash_keys():
+                legacy_hash = cls.hash_secret(secret, key=legacy_key)
+                if hmac.compare_digest(token.token_hash, legacy_hash):
+                    matched_legacy_key = True
+                    break
+            else:
+                return None
+
         if token.is_expired():
             return None
+
+        if matched_legacy_key:
+            token.token_hash = current_hash
+            token.save(update_fields=["token_hash"])
+
         return token
 
     def mark_used(self) -> None:
