@@ -155,7 +155,16 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
         message_count=Count("msg_id", filter=~Q(msg_id=""), distinct=True),
         action_count=Count("id", filter=~Q(human_action_action="")),
     )
-    file_count = AuditFile.objects.filter(events__group=group).distinct().count()
+    # Count linked files from the explicit AuditFile.groups M2M (goggles#37),
+    # NOT from stored AuditEvent rows. A duplicate-heavy upload whose group
+    # events were all deduplicated away has zero stored events for the group
+    # but is still genuinely linked to it via the M2M. Filtering on
+    # `events__group` (the old behavior) undercounted such files, so the
+    # header / Files-tab badge disagreed with the Files tab listing, the
+    # group-list table, and the agent export — all of which count via the M2M
+    # (audit_files_for_group, annotated_group_list, group_summary). See
+    # goggles#91.
+    file_count = AuditFile.objects.filter(groups=group).distinct().count()
     invalid_event_count = AuditEvent.objects.filter(
         group=group, parse_status=AuditEvent.STATUS_INVALID
     ).count()

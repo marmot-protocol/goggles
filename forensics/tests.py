@@ -43,6 +43,7 @@ from .views import (
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    group_detail_shell_context,
     groups_for_audit_file,
 )
 
@@ -1820,6 +1821,22 @@ class AuditLogIngestionTests(TestCase):
         # first and second files are linked to GROUP_REF.
         rows = {row.slug: row for row in group_list_rows()}
         self.assertEqual(rows[GROUP_REF].audit_file_count, 2)
+
+        # The group-detail shell count must agree with the Files tab listing
+        # and the group-list table: it counts linked files via the explicit
+        # AuditFile.groups M2M, so the duplicate-only file (zero stored events
+        # for GROUP_REF) is included. Before goggles#91 this used
+        # `events__group`, which excluded the duplicate-only file and made the
+        # header / Files-tab badge undercount to 1 while the Files tab itself
+        # listed 2.
+        shell_context = group_detail_shell_context(group)
+        self.assertEqual(shell_context["summary"]["file_count"], 2)
+        self.assertEqual(shell_context["tab_counts"]["files"], 2)
+        # The shell count must equal the number of files the Files tab lists.
+        self.assertEqual(
+            shell_context["summary"]["file_count"],
+            len(detail_files),
+        )
 
     def test_corrected_valid_upload_keeps_lines_seen_in_quarantined_upload(self):
         raw_token, _token = UploadToken.issue("ios test client")
