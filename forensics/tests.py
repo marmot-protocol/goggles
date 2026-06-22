@@ -1944,12 +1944,13 @@ class AuditLogIngestionTests(TestCase):
             for index, group_ref in enumerate(group_refs, start=1)
         ]
 
-        def message_event(seq, group_ref, engine_id, account_ref, msg_id):
+        def message_event(seq, group_ref, engine_id, account_ref, msg_id, wall_time_ms):
             return audit_event(
                 seq,
                 engine_id=engine_id,
                 account_ref=account_ref,
                 group_ref=group_ref,
+                wall_time_ms=wall_time_ms,
                 kind={
                     "type": "ingest_entry",
                     "msg_id": msg_id,
@@ -1959,22 +1960,43 @@ class AuditLogIngestionTests(TestCase):
                 },
             )
 
-        # Seed each group with Alice seeing one message. The captured Bob upload
-        # touches all three groups in one ingest and should refresh their
-        # persisted rollups in one batched UPDATE with per-group divergent counts
-        # of 0, 1, and 2 respectively.
+        def presence(seq, group_ref, engine_id, account_ref, wall_time_ms):
+            # An epoch confirmation carries no message; it only extends the
+            # engine's active window so a later message it never logged counts
+            # as a real (membership-aware) break rather than a late-joiner gap.
+            return audit_event(
+                seq,
+                engine_id=engine_id,
+                account_ref=account_ref,
+                group_ref=group_ref,
+                wall_time_ms=wall_time_ms,
+                kind={
+                    "type": "epoch_confirmed",
+                    "from_epoch": 4,
+                    "to_epoch": 5,
+                    "pending_kind": "commit",
+                },
+            )
+
+        # Alice sees the shared message in each group and stays active until
+        # T0+1000, so the Bob-only messages she never logged fall inside her
+        # window. The captured Bob upload touches all three groups in one ingest
+        # and should refresh their persisted rollups in one batched UPDATE with
+        # per-group divergent counts of 0, 1, and 2 respectively.
         alice_body = jsonl(
-            message_event(1, group_refs[0], ENGINE_ALICE, ACCOUNT_ALICE, "10" * 32),
-            message_event(2, group_refs[1], ENGINE_ALICE, ACCOUNT_ALICE, "20" * 32),
-            message_event(3, group_refs[2], ENGINE_ALICE, ACCOUNT_ALICE, "30" * 32),
+            message_event(1, group_refs[0], ENGINE_ALICE, ACCOUNT_ALICE, "10" * 32, T0 + 10),
+            message_event(2, group_refs[1], ENGINE_ALICE, ACCOUNT_ALICE, "20" * 32, T0 + 10),
+            message_event(3, group_refs[2], ENGINE_ALICE, ACCOUNT_ALICE, "30" * 32, T0 + 10),
+            presence(4, group_refs[1], ENGINE_ALICE, ACCOUNT_ALICE, T0 + 1000),
+            presence(5, group_refs[2], ENGINE_ALICE, ACCOUNT_ALICE, T0 + 1000),
         )
         bob_body = jsonl(
-            message_event(4, group_refs[0], ENGINE_BOB, ACCOUNT_BOB, "10" * 32),
-            message_event(5, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "20" * 32),
-            message_event(6, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "21" * 32),
-            message_event(7, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "30" * 32),
-            message_event(8, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "31" * 32),
-            message_event(9, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "32" * 32),
+            message_event(6, group_refs[0], ENGINE_BOB, ACCOUNT_BOB, "10" * 32, T0 + 20),
+            message_event(7, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "20" * 32, T0 + 20),
+            message_event(8, group_refs[1], ENGINE_BOB, ACCOUNT_BOB, "21" * 32, T0 + 30),
+            message_event(9, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "30" * 32, T0 + 20),
+            message_event(10, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "31" * 32, T0 + 30),
+            message_event(11, group_refs[2], ENGINE_BOB, ACCOUNT_BOB, "32" * 32, T0 + 40),
         )
         expected_divergent_counts = {
             groups[0].id: 0,
@@ -3307,6 +3329,39 @@ def epoch_confirmed(seq, engine_id, from_epoch, to_epoch, wall_time_ms):
     )
 
 
+def ingest_entry_event(seq, engine_id, account_ref, msg_id, wall_time_ms):
+    return audit_event(
+        seq,
+        engine_id=engine_id,
+        account_ref=account_ref,
+        wall_time_ms=wall_time_ms,
+        kind={
+            "type": "ingest_entry",
+            "msg_id": msg_id,
+            "envelope_kind": "group_message",
+            "payload_len": 512,
+            "payload_digest": DIGEST_A,
+        },
+    )
+
+
+def bob_presence_event(seq, wall_time_ms, from_epoch=4, to_epoch=5):
+    # An epoch confirmation carries no message; it only marks ENGINE_BOB active
+    # at ``wall_time_ms`` so divergence can tell a real break from a benign gap.
+    return audit_event(
+        seq,
+        engine_id=ENGINE_BOB,
+        account_ref=ACCOUNT_BOB,
+        wall_time_ms=wall_time_ms,
+        kind={
+            "type": "epoch_confirmed",
+            "from_epoch": from_epoch,
+            "to_epoch": to_epoch,
+            "pending_kind": "commit",
+        },
+    )
+
+
 class TimelinePayloadTests(TestCase):
     def test_first_timed_confirmer_gets_commit_role(self):
         ingest_body(
@@ -3767,13 +3822,28 @@ class GroupListAnnotationTests(TestCase):
         )
         ingest_body(
             jsonl(
+                # Bob is present from T0 (an early epoch confirmation) yet never
+                # logs MSG_ID that Alice ingested at T0 — a real, membership-aware
+                # break rather than a late-joiner gap.
                 audit_event(
                     0,
                     engine_id=ENGINE_BOB,
                     account_ref=ACCOUNT_BOB,
+                    kind={
+                        "type": "epoch_confirmed",
+                        "from_epoch": 4,
+                        "to_epoch": 5,
+                        "pending_kind": "commit",
+                    },
+                    wall_time_ms=T0,
+                ),
+                audit_event(
+                    1,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
                     kind={"type": "send_entry", "intent_kind": "message"},
                     wall_time_ms=T0 + 300,
-                )
+                ),
             )
         )
 
@@ -3806,11 +3876,12 @@ class GroupListAnnotationTests(TestCase):
         self.assertEqual(fork_group.engine_count, 2)
         self.assertEqual(fork_group.epoch_min, 4)
         self.assertEqual(fork_group.epoch_max, 5)
-        self.assertEqual(fork_group.event_count, 4)
+        self.assertEqual(fork_group.event_count, 5)
         self.assertEqual(fork_group.audit_file_count, 2)
         self.assertEqual(fork_group.last_activity_ms, T0 + 300)
         self.assertTrue(fork_group.has_fork_activity)
-        self.assertEqual(fork_group.divergent_count, 1)  # MSG_ID unseen by bob
+        # Bob is present from T0 but never logs MSG_ID Alice ingested at T0.
+        self.assertEqual(fork_group.divergent_count, 1)
         self.assertIsNotNone(fork_group.last_activity)
 
         clean_group = rows[OTHER_GROUP_REF]
@@ -3929,27 +4000,27 @@ class GroupListAnnotationTests(TestCase):
         Divergence is defined in two structurally linked analysis paths sharing
         ``is_divergent_message``: the persisted aggregation written by ingest
         (``AuditGroup.divergent_message_count``) and the trace-based
-        ``group_integrity_summary``. The migration 0006 backfill keeps a third,
-        intentionally self-contained copy (migrations must not import app code).
-        If anyone later changes the divergence definition in only one path, the
-        two counts drift apart and this test fails.
+        ``group_integrity_summary``. Both build the membership-aware in-scope
+        engine set identically, so a one-sided change to the definition drifts
+        the two counts apart and fails this test.
 
-        The fixture deliberately mixes message shapes so the assertion exercises
-        BOTH halves of the predicate and would catch a one-sided drift:
-          - MSG_ID:       seen by Alice AND Bob   -> convergent (NOT divergent)
-          - OTHER_MSG_ID: seen by Alice only      -> Bob missing   -> divergent
-          - THIRD_MSG_ID: seen by Bob only        -> Alice missing -> divergent
-        A predicate that dropped the "engines non-empty" half or the "missing
-        engines non-empty" half would count a different number of these three
-        traces, breaking parity with the persisted aggregation.
+        The fixture exercises the membership-aware predicate end to end. Alice
+        and Bob overlap from T0+10 onward; Bob has a pre-window gap that must
+        NOT count:
+          - SEEN_MSG:  observed by Alice AND Bob              -> convergent
+          - EARLY_MSG: Alice only, before Bob's window starts -> benign gap
+          - BREAK_MSG: Alice only, inside Bob's active window -> real break
         """
-        third_msg_id = "55" * 32
+        early_msg_id = "55" * 32
+        seen_msg_id = MSG_ID
+        break_msg_id = OTHER_MSG_ID
 
         def message_event(seq, engine_id, account_ref, msg_id, wall_time_ms):
             return audit_event(
                 seq,
                 engine_id=engine_id,
                 account_ref=account_ref,
+                wall_time_ms=wall_time_ms,
                 kind={
                     "type": "ingest_entry",
                     "msg_id": msg_id,
@@ -3957,29 +4028,120 @@ class GroupListAnnotationTests(TestCase):
                     "payload_len": 512,
                     "payload_digest": DIGEST_A,
                 },
-                wall_time_ms=wall_time_ms,
             )
 
         ingest_body(
             jsonl(
-                message_event(0, ENGINE_ALICE, ACCOUNT_ALICE, MSG_ID, T0),
-                message_event(1, ENGINE_ALICE, ACCOUNT_ALICE, OTHER_MSG_ID, T0 + 10),
+                message_event(0, ENGINE_ALICE, ACCOUNT_ALICE, early_msg_id, T0),
+                message_event(1, ENGINE_ALICE, ACCOUNT_ALICE, break_msg_id, T0 + 50),
+                message_event(2, ENGINE_ALICE, ACCOUNT_ALICE, seen_msg_id, T0 + 90),
             )
         )
         ingest_body(
             jsonl(
-                message_event(0, ENGINE_BOB, ACCOUNT_BOB, MSG_ID, T0 + 20),
-                message_event(1, ENGINE_BOB, ACCOUNT_BOB, third_msg_id, T0 + 30),
+                # An epoch confirmation carries no message, but it marks Bob
+                # active from T0+10: BREAK_MSG (T0+50) then lands inside his
+                # window while EARLY_MSG (T0) stays before it.
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=T0 + 10,
+                    kind={
+                        "type": "epoch_confirmed",
+                        "from_epoch": 4,
+                        "to_epoch": 5,
+                        "pending_kind": "commit",
+                    },
+                ),
+                message_event(1, ENGINE_BOB, ACCOUNT_BOB, seen_msg_id, T0 + 95),
             )
         )
 
         group = AuditGroup.objects.get(slug=GROUP_REF)
         persisted = group.divergent_message_count
-        live = analysis_module.group_integrity_summary(group)["divergent_message_count"]
+        summary = analysis_module.group_integrity_summary(group)
 
-        self.assertEqual(persisted, live)
-        # Two of the three messages are observed by only one of the two engines.
-        self.assertEqual(persisted, 2)
+        self.assertEqual(persisted, summary["divergent_message_count"])
+        # Only BREAK_MSG is a real break; the pre-window EARLY_MSG gap is benign.
+        self.assertEqual(persisted, 1)
+        self.assertEqual(summary["divergent_msg_ids"], [break_msg_id])
+
+        traces = {
+            trace["msg_id"]: trace for trace in analysis_module.message_traces_for_group(group)
+        }
+        self.assertFalse(traces[early_msg_id]["is_divergent"])
+        self.assertTrue(traces[break_msg_id]["is_divergent"])
+        self.assertEqual(traces[break_msg_id]["missed_by"], [ENGINE_BOB])
+        self.assertEqual(traces[early_msg_id]["absent_engines"], [ENGINE_BOB])
+
+
+class MessageObservationMatrixTests(TestCase):
+    SEEN_MSG = MSG_ID
+    EARLY_MSG = OTHER_MSG_ID
+    BREAK_MSG = "55" * 32
+
+    def seed_break_group(self):
+        # Alice and Bob overlap from T0+10. EARLY_MSG appears before Bob's
+        # window (benign late-joiner gap); BREAK_MSG appears inside it (a real
+        # present-member break); SEEN_MSG is observed by both (convergent).
+        ingest_body(
+            jsonl(
+                ingest_entry_event(0, ENGINE_ALICE, ACCOUNT_ALICE, self.EARLY_MSG, T0),
+                ingest_entry_event(1, ENGINE_ALICE, ACCOUNT_ALICE, self.BREAK_MSG, T0 + 50),
+                ingest_entry_event(2, ENGINE_ALICE, ACCOUNT_ALICE, self.SEEN_MSG, T0 + 90),
+            )
+        )
+        ingest_body(
+            jsonl(
+                bob_presence_event(0, T0 + 10),
+                ingest_entry_event(1, ENGINE_BOB, ACCOUNT_BOB, self.SEEN_MSG, T0 + 95),
+            )
+        )
+        return AuditGroup.objects.get(slug=GROUP_REF)
+
+    def test_matrix_marks_present_miss_observed_and_late_joiner_absent(self):
+        group = self.seed_break_group()
+        matrix = analysis_module.message_observation_matrix(list(valid_events_for_group(group)))
+        column = {engine["engine_id"]: engine["idx"] for engine in matrix["engines"]}
+        rows = {row["msg_id"]: row for row in matrix["rows"]}
+
+        # A demonstrably-present engine that never logged the message: real break.
+        break_row = rows[self.BREAK_MSG]
+        self.assertTrue(break_row["is_divergent"])
+        self.assertEqual(break_row["cells"][column[ENGINE_ALICE]]["status"], "observed")
+        self.assertEqual(break_row["cells"][column[ENGINE_BOB]]["status"], "missed")
+        self.assertEqual(break_row["missed_by"], [ENGINE_BOB])
+
+        # Bob had not started logging yet: a benign gap, not a break.
+        early_row = rows[self.EARLY_MSG]
+        self.assertFalse(early_row["is_divergent"])
+        self.assertEqual(early_row["cells"][column[ENGINE_BOB]]["status"], "absent")
+
+        # Observed by both engines: convergent.
+        seen_row = rows[self.SEEN_MSG]
+        self.assertFalse(seen_row["is_divergent"])
+        self.assertEqual(seen_row["cells"][column[ENGINE_BOB]]["status"], "observed")
+
+    def test_messages_tab_renders_matrix_and_membership_aware_breaks(self):
+        group = self.seed_break_group()
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Message trace")
+        self.assertContains(response, "Missing observations")
+        # The matrix renders a per-engine "missed" cell and flags the break row;
+        # both the matrix and the breaks list name the divergent message.
+        self.assertContains(response, "missed</span>")
+        self.assertContains(response, "break</span>")
+        self.assertContains(response, self.BREAK_MSG[:16])
+        # The benign late-joiner message is shown in the matrix but not flagged.
+        self.assertContains(response, self.EARLY_MSG[:16])
 
 
 class GroupDetailTimelineViewTests(TestCase):
