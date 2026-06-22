@@ -1700,6 +1700,41 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(payload["engines"], [])
         self.assertEqual(payload["items"], [])
 
+    def test_timeline_uses_valid_lines_from_partially_invalid_file(self):
+        raw_token, _token = UploadToken.issue("partial client")
+        bad_action = audit_event(
+            1,
+            kind={
+                "type": "human_action",
+                "action": "update_group_profile",
+                "origin": "local_user",
+                "phase": "succeeded",
+                "message_ids": [f"not-hex-{MSG_ID}"],
+            },
+        )
+        body = jsonl(audit_event(0), bad_action)
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(audit_file.valid_event_count, 1)
+        self.assertEqual(audit_file.invalid_event_count, 1)
+
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        events = list(valid_events_for_group(group))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].seq, 0)
+        payload = timeline_payload_for_group(group, events, [])
+        self.assertEqual(len(payload["engines"]), 1)
+        self.assertEqual(len(payload["items"]), 1)
+
     def test_reuploading_grown_append_only_log_deduplicates_existing_lines(self):
         raw_token, _token = UploadToken.issue("ios test client")
         first = representative_audit_log()

@@ -46,6 +46,10 @@ AGENT_EXPORT_NORMALIZED_FIELDS = normalized_field_config.agent_export_normalized
 VIZ_PALETTE_SIZE = 8
 GROUP_REF_FULL_DISPLAY_MAX = 80
 GROUP_REF_EDGE_DISPLAY_CHARS = 32
+STRUCTURAL_QUARANTINE_ERRORS = (
+    "audit log contains multiple engine_ids",
+    "audit log contains multiple account_refs",
+)
 
 
 def audit_files_for_group(group):
@@ -71,14 +75,40 @@ def audit_files_for_group(group):
     )
 
 
-def valid_events_for_group(group):
-    return (
+def valid_events_for_group(group, *, include_export_fields=False):
+    fields = [
+        "id",
+        "audit_file_id",
+        "audit_file__source_account_label",
+        "audit_file__source_device_label",
+        "audit_file__source_platform",
+        "line_number",
+        "parse_status",
+        "validation_error",
+        "seq",
+        "wall_time_ms",
+        "account_ref",
+        "engine_id",
+        "group_ref",
+        "event_type",
+        *AGENT_EXPORT_NORMALIZED_FIELDS,
+    ]
+    if include_export_fields:
+        fields.extend(
+            [
+                "line_hash",
+                "schema_version",
+                "raw_context",
+                "raw_kind",
+            ]
+        )
+    queryset = (
         AuditEvent.objects.filter(
             group=group,
-            audit_file__validation_status=AuditFile.STATUS_VALID,
             parse_status=AuditEvent.STATUS_VALID,
         )
         .select_related("audit_file")
+        .only(*fields)
         .order_by(
             "wall_time_ms",
             "engine_id",
@@ -86,6 +116,9 @@ def valid_events_for_group(group):
             "id",
         )
     )
+    for error in STRUCTURAL_QUARANTINE_ERRORS:
+        queryset = queryset.exclude(audit_file__validation_error__icontains=error)
+    return queryset
 
 
 def group_summary(group, audit_files, events=None):

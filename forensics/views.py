@@ -326,7 +326,7 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
 def group_agent_export(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
     audit_files = list(audit_files_for_group(group))
-    events = list(valid_events_for_group(group))
+    events = list(valid_events_for_group(group, include_export_fields=True))
     pretty = request.GET.get("pretty", "").lower() in {"1", "true", "yes"}
     json_dumps_params = {"sort_keys": True}
     if pretty:
