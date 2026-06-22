@@ -19,6 +19,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .analysis import (
+    ATTENTION_MESSAGE_STATES,
     FORK_EVENT_TYPES,
     PEELER_EVENT_TYPES,
     agent_state_export_for_group,
@@ -44,6 +45,7 @@ RAW_TEXT_PREVIEW_CHARS = 32 * 1024
 GROUP_TIMELINE_EVENT_PAGE_SIZE = 2_000
 GROUP_TIMELINE_EVENT_MAX_PAGE_SIZE = 5_000
 GROUP_ENGINE_PREVIEW_LIMIT = 12
+GROUP_DETAIL_TAB_EVENT_LIMIT = 100
 GROUP_DETAIL_TAB_TEMPLATES = {
     "actions": "forensics/partials/group_actions.html",
     "messages": "forensics/partials/group_messages.html",
@@ -302,23 +304,94 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
         audit_files = list(audit_files_for_group(group))
         return {"group": group, "audit_files": file_rows_for_group(audit_files, group)}
 
-    events = list(valid_events_for_group(group))
     if tab == "actions":
-        return {"group": group, "human_action_groups": human_action_groups_for_group(events)}
-    if tab == "messages":
-        matrix = message_observation_matrix(events)
+        events, has_more = limited_tab_events(
+            valid_events_for_group(group).exclude(human_action_action="")
+        )
         return {
             "group": group,
-            "message_matrix": matrix,
-            "breaks": [row for row in matrix["rows"] if row["is_divergent"]],
+            "human_action_groups": human_action_groups_for_group(events),
+            "human_action_groups_limited": has_more,
+            "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
+        }
+    if tab == "messages":
+        message_events, message_has_more = limited_tab_events(
+            valid_events_for_group(group).filter(message_linked_event_filter())
+        )
+        window_events, window_has_more = limited_tab_events(valid_events_for_group(group))
+        # This tab is intentionally sample-scoped once capped; the full export is
+        # the authoritative path for whole-group message divergence. Mix the
+        # bounded message sample with a bounded event-window sample so the
+        # membership-aware matrix can still distinguish real misses from late
+        # joiners without materializing the entire group.
+        matrix = message_observation_matrix(merge_tab_events(message_events, window_events))
+        rows = matrix["rows"]
+        visible_rows = rows[:GROUP_DETAIL_TAB_EVENT_LIMIT]
+        message_matrix = {**matrix, "rows": visible_rows}
+        return {
+            "group": group,
+            "message_matrix": message_matrix,
+            "breaks": [row for row in visible_rows if row["is_divergent"]],
+            "message_matrix_limited": (
+                message_has_more or window_has_more or len(rows) > GROUP_DETAIL_TAB_EVENT_LIMIT
+            ),
+            "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
         }
     if tab == "integrity":
+        fork_events, fork_has_more = limited_tab_events(
+            valid_events_for_group(group).filter(event_type__in=FORK_EVENT_TYPES)
+        )
+        peeler_events, peeler_has_more = limited_tab_events(
+            valid_events_for_group(group).filter(peeler_attention_event_filter())
+        )
+        # The SQL pre-filter mirrors peeler_and_rejection_events(); keep the
+        # Python helper as a defensive projection from AuditEvent to template rows.
         return {
             "group": group,
-            "fork_events": fork_and_convergence_events(group, events=events),
-            "peeler_events": peeler_and_rejection_events(group, events=events),
+            "fork_events": fork_and_convergence_events(group, events=fork_events),
+            "peeler_events": peeler_and_rejection_events(group, events=peeler_events),
+            "fork_events_limited": fork_has_more,
+            "peeler_events_limited": peeler_has_more,
+            "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
         }
     raise Http404("unknown group detail tab")
+
+
+def limited_tab_events(queryset, limit: int = GROUP_DETAIL_TAB_EVENT_LIMIT):
+    rows = list(queryset[: limit + 1])
+    return rows[:limit], len(rows) > limit
+
+
+def merge_tab_events(*event_lists):
+    events_by_id = {event.id: event for events in event_lists for event in events}
+    return sorted(
+        events_by_id.values(),
+        key=lambda event: (
+            event.wall_time_ms is None,
+            event.wall_time_ms or 0,
+            event.engine_id,
+            event.line_number,
+            event.id,
+        ),
+    )
+
+
+def message_linked_event_filter():
+    return (
+        ~Q(msg_id="")
+        | ~Q(outbound_msg_id="")
+        | ~Q(invalidated_msg_id="")
+        | ~Q(outbound_welcome_msg_ids=[])
+        | ~Q(human_action_message_ids=[])
+    )
+
+
+def peeler_attention_event_filter():
+    return (
+        (Q(event_type="peeler_outcome") & (~Q(outcome="success") | Q(fallback_snapshot_used=True)))
+        | Q(event_type="rejection")
+        | Q(event_type="message_state_changed", new_state__in=ATTENTION_MESSAGE_STATES)
+    )
 
 
 @login_required
