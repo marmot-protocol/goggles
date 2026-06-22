@@ -212,7 +212,12 @@ def group_engine_preview(valid_events) -> list[dict]:
             event_count=Count("id"),
             first_event_ms=Min("wall_time_ms"),
             last_event_ms=Max("wall_time_ms"),
-            account_ref=Min("account_ref"),
+            # Exclude blank account_refs so an engine with mixed
+            # present/absent refs reports a real one (matching
+            # timeline_engines()'s "first non-empty" semantics) instead of
+            # "" sorting to the front of the aggregate. Falls back to "" via
+            # `row["account_ref"] or ""` below when every event is blank.
+            account_ref=Min("account_ref", filter=~Q(account_ref="")),
         )
         .order_by("first_event_ms", "engine_id")[:GROUP_ENGINE_PREVIEW_LIMIT]
     )

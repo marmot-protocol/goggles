@@ -43,6 +43,7 @@ from .views import (
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    group_engine_preview,
     groups_for_audit_file,
 )
 
@@ -4077,6 +4078,104 @@ class GroupDetailTimelineViewTests(TestCase):
 
         self.assertContains(response, "+2")
         self.assertContains(response, "2 more engines")
+
+    def test_engine_preview_reports_non_blank_account_ref_for_mixed_engine(self):
+        # Regression for #93: an engine whose events mix a present and an
+        # absent account_ref must surface the real ref in the shell preview,
+        # matching timeline_engines()'s "first non-empty" semantics. The old
+        # Min("account_ref") returned "" because the empty string sorts before
+        # any hex value.
+        group = AuditGroup.objects.create(
+            name="Mixed ref group",
+            slug="mixed-ref-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="c" * 64,
+            byte_size=200,
+            raw_text="{}\n{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="mixed.jsonl",
+            total_line_count=2,
+            valid_event_count=2,
+        )
+        AuditEvent.objects.bulk_create(
+            [
+                # Event with no account_ref (e.g. a type that doesn't carry one).
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=1,
+                    line_hash="a" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="ingest_entry",
+                    engine_id=ENGINE_ALICE,
+                    account_ref="",
+                    group_ref=GROUP_REF,
+                    seq=1,
+                    wall_time_ms=1_700_000_000_001,
+                ),
+                # Later event for the same engine that DOES carry an account_ref.
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=2,
+                    line_hash="b" * 64,
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="ingest_entry",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=2,
+                    wall_time_ms=1_700_000_000_002,
+                ),
+            ]
+        )
+
+        preview = group_engine_preview(valid_events_for_group(group))
+
+        self.assertEqual(len(preview), 1)
+        self.assertEqual(preview[0]["engine_id"], ENGINE_ALICE)
+        self.assertEqual(preview[0]["account_ref"], ACCOUNT_ALICE)
+
+    def test_engine_preview_account_ref_blank_when_engine_has_none(self):
+        # When every event for an engine lacks an account_ref, the preview
+        # still reports "" (the filtered Min yields NULL -> "" fallback).
+        group = AuditGroup.objects.create(
+            name="No ref group",
+            slug="no-ref-group",
+            group_ref=OTHER_GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="d" * 64,
+            byte_size=100,
+            raw_text="{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="noref.jsonl",
+            total_line_count=1,
+            valid_event_count=1,
+        )
+        AuditEvent.objects.create(
+            audit_file=audit_file,
+            group=group,
+            line_number=1,
+            line_hash="e" * 64,
+            raw_line="{}",
+            parse_status=AuditEvent.STATUS_VALID,
+            event_type="ingest_entry",
+            engine_id=ENGINE_BOB,
+            account_ref="",
+            group_ref=OTHER_GROUP_REF,
+            seq=1,
+            wall_time_ms=1_700_000_000_003,
+        )
+
+        preview = group_engine_preview(valid_events_for_group(group))
+
+        self.assertEqual(len(preview), 1)
+        self.assertEqual(preview[0]["account_ref"], "")
 
     def test_group_agent_export_requires_login(self):
         ingest_body(representative_audit_log())
