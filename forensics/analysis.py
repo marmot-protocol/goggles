@@ -753,15 +753,19 @@ def message_ids_from_events(events):
 # assume cross-engine monotonicity. Epoch numbers are real and may be sparse.
 
 
-def timeline_payload_for_group(group, events, audit_files, traces=None):
+def timeline_payload_for_group(group, events, audit_files, traces=None, *, include_integrity=True):
+    """Build a timeline payload.
+
+    ``traces`` is only consumed when ``include_integrity`` is true. Callers that
+    set ``include_integrity=False`` are opting out of integrity construction and
+    any trace work because they will supply integrity separately.
+    """
     ordered = sorted_timeline_events(events)
     engines, engine_idx = timeline_engines(ordered)
     epochs, roles = timeline_epochs(ordered, engine_idx, len(engines))
     items, excluded = timeline_items(ordered, engine_idx, roles)
-    if traces is None:
-        traces = message_traces_from_events(ordered, {engine["engine_id"] for engine in engines})
     placed = [item["t"] for item in items]
-    return {
+    payload = {
         "version": 1,
         "group": {"name": group.name, "slug": group.slug, "group_ref": group.group_ref},
         "time": {
@@ -772,9 +776,15 @@ def timeline_payload_for_group(group, events, audit_files, traces=None):
         "engines": engines,
         "epochs": epochs,
         "items": items,
-        "integrity": group_integrity_summary(group, events=ordered, traces=traces),
         "excluded": excluded,
     }
+    if include_integrity:
+        if traces is None:
+            traces = message_traces_from_events(
+                ordered, {engine["engine_id"] for engine in engines}
+            )
+        payload["integrity"] = group_integrity_summary(group, events=ordered, traces=traces)
+    return payload
 
 
 def agent_state_export_for_group(group, events, audit_files):
