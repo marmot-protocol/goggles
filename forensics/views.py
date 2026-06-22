@@ -268,7 +268,7 @@ def group_timeline(request: HttpRequest, slug: str):
     )
     page = Paginator(valid_events_for_group(group), page_size).get_page(request.GET.get("page"))
     events = list(page.object_list)
-    payload = timeline_payload_for_group(group, events, [])
+    payload = timeline_payload_for_group(group, events, [], include_integrity=False)
     payload["integrity"] = group_global_integrity_summary(group)
     payload["pagination"] = {
         "page": page.number,
