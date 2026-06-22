@@ -1,25 +1,41 @@
 <section class="card card--flush">
-  <header class="card__header"><span class="card__title">Message trace</span></header>
+  <header class="card__header">
+    <span class="card__title">Message trace</span>
+    <span class="is-muted">per engine · what each one saw</span>
+  </header>
   <div class="card__body table-scroll">
-    {% if message_traces %}
-      <table class="data-table">
+    {% if message_matrix.rows %}
+      <table class="data-table msg-matrix">
         <thead>
           <tr>
             <th>Message</th>
-            <th>Engines</th>
-            <th>Event types</th>
-            <th>States / outcomes</th>
-            <th>Window (ms)</th>
+            {% for engine in message_matrix.engines %}
+              <th class="is-center" title="{{ engine.label|default:engine.engine_id }} · {{ engine.engine_id }}">
+                <span class="avatar avatar--20" style="--avatar-color: var(--viz-{{ engine.color_index }})">{{ engine.initials }}</span>
+                <span class="msg-matrix__engine">{{ engine.display_name }}</span>
+              </th>
+            {% endfor %}
+            <th class="is-right">First seen (ms)</th>
           </tr>
         </thead>
         <tbody>
-          {% for trace in message_traces %}
-            <tr>
-              <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
-              <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
-              <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
-              <td class="is-muted is-wrap">{{ trace.states|join:", " }}</td>
-              <td class="is-mono is-muted">{{ trace.first_wall_time_ms }} – {{ trace.last_wall_time_ms }}</td>
+          {% for row in message_matrix.rows %}
+            <tr{% if row.is_divergent %} class="is-divergent"{% endif %}>
+              <td class="is-mono">
+                {% if row.is_divergent %}<span class="badge badge--danger"><span class="badge__dot"></span>break</span> {% endif %}{{ row.msg_id|truncatechars:17 }}
+              </td>
+              {% for cell in row.cells %}
+                <td class="is-center">
+                  {% if cell.status == "observed" %}
+                    <span class="badge badge--accent" title="{{ cell.event_types|join:', ' }}{% if cell.states %} · {{ cell.states|join:', ' }}{% endif %}"><svg class="icon" width="11" height="11" aria-hidden="true"><use href="#i-check"/></svg>seen</span>
+                  {% elif cell.status == "missed" %}
+                    <span class="badge badge--danger" title="active in this window but logged no event for this message"><svg class="icon" width="11" height="11" aria-hidden="true"><use href="#i-x"/></svg>missed</span>
+                  {% else %}
+                    <span class="is-faint" title="not active when this message appeared">–</span>
+                  {% endif %}
+                </td>
+              {% endfor %}
+              <td class="is-right is-mono is-muted">{{ row.reference_ms|default_if_none:"–" }}</td>
             </tr>
           {% endfor %}
         </tbody>
@@ -31,31 +47,34 @@
 </section>
 
 <section class="card card--flush">
-  <header class="card__header"><span class="card__title">Missing observations</span></header>
+  <header class="card__header">
+    <span class="card__title">Missing observations</span>
+    <span class="is-muted">present members that never logged the message</span>
+  </header>
   <div class="card__body table-scroll">
-    {% if missing_observations %}
+    {% if breaks %}
       <table class="data-table">
         <thead>
           <tr>
             <th>Message</th>
             <th>Observed by</th>
-            <th>Missing from</th>
-            <th>Events</th>
+            <th>Missing from (present)</th>
+            <th class="is-right">First seen (ms)</th>
           </tr>
         </thead>
         <tbody>
-          {% for trace in missing_observations %}
+          {% for row in breaks %}
             <tr>
-              <td class="is-mono">{{ trace.msg_id|truncatechars:17 }}</td>
-              <td class="is-mono is-muted is-wrap">{% for engine in trace.engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
-              <td class="is-mono is-wrap"><span class="badge badge--danger"><span class="badge__dot"></span>{% for engine in trace.missing_engines %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</span></td>
-              <td class="is-muted is-wrap">{{ trace.event_types|join:", " }}</td>
+              <td class="is-mono">{{ row.msg_id|truncatechars:17 }}</td>
+              <td class="is-mono is-muted is-wrap">{% for engine in row.observers %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</td>
+              <td class="is-mono is-wrap"><span class="badge badge--danger"><span class="badge__dot"></span>{% for engine in row.missed_by %}{{ engine|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% endfor %}</span></td>
+              <td class="is-right is-mono is-muted">{{ row.reference_ms|default_if_none:"–" }}</td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
     {% else %}
-      <p class="empty-state">No per-engine message gaps detected.</p>
+      <p class="empty-state">No present-member message gaps detected. Late joiners that legitimately missed earlier traffic are excluded.</p>
     {% endif %}
   </div>
 </section>

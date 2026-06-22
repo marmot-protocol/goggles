@@ -253,22 +253,71 @@ def divergent_counts_for_groups(groups):
     return divergent_counts_for_group_ids([group.pk for group in groups if group.pk])
 
 
-def is_divergent_message(engines, all_engines):
-    """A message is divergent when at least one engine observed it AND at
-    least one other engine in the group did not.
+def is_divergent_message(engines, in_scope_engines):
+    """A message is divergent when at least one engine observed it AND at least
+    one *in-scope* engine did not.
 
-    Single source of truth for the divergence definition shared by the
-    lightweight persisted aggregation (divergent_counts_for_group_ids,
+    ``in_scope_engines`` is the membership-aware universe for a single message:
+    its observers plus the engines that were demonstrably active when it first
+    appeared (see ``engines_present_but_missing``). Scoping to in-scope engines
+    keeps a late joiner — or an engine whose log ends earlier — from being
+    counted as "missing" traffic it could never have seen, so the headline
+    divergent count reflects real breaks rather than benign membership gaps.
+
+    Single source of truth for the divergence predicate, shared by the
+    lightweight persisted aggregation (``divergent_counts_for_group_ids``,
     landing-page hot path) and the trace-based detail computation
-    (missing_observations_for_group / group_integrity_summary). Keep these
-    callers structurally linked so the landing-page count and the detail-page
-    count cannot silently drift. The standalone copy in migration 0006 is
-    intentionally self-contained (migrations must not import app code) and is
-    guarded by the parity regression test instead.
+    (``missing_observations_for_group`` / ``group_integrity_summary``). Both
+    callers build the in-scope set identically, so the landing-page count and
+    the detail-page count cannot silently drift; the parity regression test
+    guards that. Migration 0006 backfilled the original (pre-membership)
+    definition and is frozen history; migration 0009 recomputes existing rows
+    with this membership-aware definition.
     """
-    engines = set(engines)
-    all_engines = set(all_engines)
-    return bool(engines) and bool(all_engines - engines)
+    observed = set(engines)
+    in_scope = set(in_scope_engines)
+    return bool(observed) and bool(in_scope - observed)
+
+
+def engine_windows(events):
+    """Per-engine ``[first_ms, last_ms]`` wall-clock observation window.
+
+    The window is the span of timestamps an engine actually emitted within the
+    event set. Events without a wall time can't be placed, so they don't widen
+    it. This bounds where an engine is treated as an active member for
+    divergence: a message is only "missed" by an engine if it appeared inside
+    that engine's window.
+    """
+    windows: dict[str, tuple[int, int]] = {}
+    for event in events:
+        engine_id = event.engine_id
+        wall_time_ms = event.wall_time_ms
+        if not engine_id or wall_time_ms is None:
+            continue
+        first, last = windows.get(engine_id, (wall_time_ms, wall_time_ms))
+        windows[engine_id] = (min(first, wall_time_ms), max(last, wall_time_ms))
+    return windows
+
+
+def engines_present_but_missing(observers, reference_ms, windows, all_engines):
+    """Engines that were demonstrably active when a message first appeared but
+    hold no event for it — the membership-aware definition of a real break.
+
+    ``reference_ms`` is the earliest time any engine observed the message. A
+    non-observer counts as a present-but-missing break only when that instant
+    lies inside its ``engine_windows`` span. A ``None`` reference (the message
+    was never observed with a wall time) accuses no one.
+    """
+    if reference_ms is None:
+        return set()
+    missing = set()
+    for engine_id in all_engines:
+        if engine_id in observers:
+            continue
+        window = windows.get(engine_id)
+        if window is not None and window[0] <= reference_ms <= window[1]:
+            missing.add(engine_id)
+    return missing
 
 
 def divergent_counts_for_group_ids(group_ids):
@@ -279,7 +328,9 @@ def divergent_counts_for_group_ids(group_ids):
         return counts
 
     engines_by_group = defaultdict(set)
+    windows_by_group: dict[int, dict[str, tuple[int, int]]] = defaultdict(dict)
     message_engines_by_group = defaultdict(lambda: defaultdict(set))
+    message_reference_by_group: dict[int, dict[str, int]] = defaultdict(dict)
     rows = AuditEvent.objects.filter(
         group_id__in=group_ids,
         parse_status=AuditEvent.STATUS_VALID,
@@ -287,6 +338,7 @@ def divergent_counts_for_group_ids(group_ids):
     ).values_list(
         "group_id",
         "engine_id",
+        "wall_time_ms",
         "msg_id",
         "outbound_msg_id",
         "invalidated_msg_id",
@@ -297,28 +349,46 @@ def divergent_counts_for_group_ids(group_ids):
     for (
         group_id,
         engine_id,
+        wall_time_ms,
         msg_id,
         outbound_msg_id,
         invalidated_msg_id,
         outbound_welcome_msg_ids,
         human_action_message_ids,
     ) in rows.iterator(chunk_size=2_000):
-        if engine_id:
-            engines_by_group[group_id].add(engine_id)
-            for message_id in event_message_id_values(
-                msg_id,
-                outbound_msg_id,
-                invalidated_msg_id,
-                outbound_welcome_msg_ids,
-                human_action_message_ids,
-            ):
-                message_engines_by_group[group_id][message_id].add(engine_id)
+        if not engine_id:
+            continue
+        engines_by_group[group_id].add(engine_id)
+        if wall_time_ms is not None:
+            windows = windows_by_group[group_id]
+            first, last = windows.get(engine_id, (wall_time_ms, wall_time_ms))
+            windows[engine_id] = (min(first, wall_time_ms), max(last, wall_time_ms))
+        for message_id in event_message_id_values(
+            msg_id,
+            outbound_msg_id,
+            invalidated_msg_id,
+            outbound_welcome_msg_ids,
+            human_action_message_ids,
+        ):
+            message_engines_by_group[group_id][message_id].add(engine_id)
+            if wall_time_ms is not None:
+                references = message_reference_by_group[group_id]
+                current = references.get(message_id)
+                if current is None or wall_time_ms < current:
+                    references[message_id] = wall_time_ms
 
     for group_id, message_engines in message_engines_by_group.items():
         all_engines = engines_by_group[group_id]
-        counts[group_id] = sum(
-            1 for engines in message_engines.values() if is_divergent_message(engines, all_engines)
-        )
+        windows = windows_by_group[group_id]
+        references = message_reference_by_group[group_id]
+        divergent = 0
+        for message_id, observers in message_engines.items():
+            missing = engines_present_but_missing(
+                observers, references.get(message_id), windows, all_engines
+            )
+            if is_divergent_message(observers, observers | missing):
+                divergent += 1
+        counts[group_id] = divergent
     return counts
 
 
@@ -351,6 +421,8 @@ def message_traces_for_group(group, events=None):
 
 
 def message_traces_from_events(events, all_engines):
+    all_engines = set(all_engines)
+    windows = engine_windows(events)
     by_msg = defaultdict(list)
     for event in events:
         for msg_id in event_message_ids(event):
@@ -358,7 +430,7 @@ def message_traces_from_events(events, all_engines):
 
     traces = []
     for msg_id, msg_events in sorted(by_msg.items()):
-        engines = sorted({event.engine_id for event in msg_events if event.engine_id})
+        observers = {event.engine_id for event in msg_events if event.engine_id}
         event_types = sorted({event.event_type for event in msg_events if event.event_type})
         states = sorted(
             {
@@ -368,21 +440,27 @@ def message_traces_from_events(events, all_engines):
                 if value
             }
         )
+        wall_times = [event.wall_time_ms for event in msg_events if event.wall_time_ms is not None]
+        reference_ms = min(wall_times) if wall_times else None
+        missed_by = engines_present_but_missing(observers, reference_ms, windows, all_engines)
         traces.append(
             {
                 "msg_id": msg_id,
-                "engines": engines,
-                "missing_engines": sorted(set(all_engines) - set(engines)),
+                "engines": sorted(observers),
+                # Engines with no record of the message, split into a real break
+                # (``missed_by``: active in-window when it appeared) and a benign
+                # gap (``absent_engines``: joined later / their log ended earlier).
+                # ``missing_engines`` keeps the old observers-complement union for
+                # back-compatible consumers such as the agent-state export.
+                "missing_engines": sorted(all_engines - observers),
+                "missed_by": sorted(missed_by),
+                "absent_engines": sorted(all_engines - observers - missed_by),
+                "reference_ms": reference_ms,
+                "is_divergent": is_divergent_message(observers, observers | missed_by),
                 "event_types": event_types,
                 "states": states,
-                "first_wall_time_ms": min(
-                    (event.wall_time_ms for event in msg_events if event.wall_time_ms is not None),
-                    default=None,
-                ),
-                "last_wall_time_ms": max(
-                    (event.wall_time_ms for event in msg_events if event.wall_time_ms is not None),
-                    default=None,
-                ),
+                "first_wall_time_ms": reference_ms,
+                "last_wall_time_ms": max(wall_times) if wall_times else None,
                 "event_count": len(msg_events),
             }
         )
@@ -405,15 +483,96 @@ def missing_observations_for_group(group, traces=None):
 
 
 def trace_is_divergent(trace):
-    """Apply the shared divergence predicate to a message trace.
+    """Whether a message trace is a real, membership-aware divergence.
 
-    ``missing_engines == sorted(all_engines - engines)`` per
-    ``message_traces_from_events``, so reconstructing the group's full engine
-    set as ``engines | missing_engines`` makes this predicate call identical to
-    the persisted aggregation path (``divergent_counts_for_group_ids``).
+    ``message_traces_from_events`` already applies the shared predicate
+    (``is_divergent_message`` over each message's in-scope engine set —
+    observers plus present-but-missing engines) and stores the result, so the
+    detail path and the persisted landing-page aggregation stay in lockstep.
     """
-    all_engines_for_trace = set(trace["engines"]) | set(trace["missing_engines"])
-    return is_divergent_message(trace["engines"], all_engines_for_trace)
+    return trace["is_divergent"]
+
+
+def message_observation_matrix(events):
+    """Per-message × per-engine observation grid for the Messages tab.
+
+    Rows are messages; columns are the group's engines in timeline order. Each
+    cell states what that engine did with the message:
+
+      - ``observed``: the engine logged at least one event for it
+      - ``missed``:   the engine was active when the message appeared but logged
+                      nothing for it (a real break — see ``is_divergent_message``)
+      - ``absent``:   the engine was not active in that window (benign — a late
+                      joiner or a log that ended earlier)
+
+    This is the "what did each engine see" view the union-merged trace table
+    could not express. Divergence here uses the same shared predicate as the
+    landing-page count, so the matrix and the badge agree.
+    """
+    engines, _engine_idx = timeline_engines(events)
+    for engine in engines:
+        # Compact column header: the human account name (first label segment)
+        # falls back to the short engine id. The full label stays available for
+        # the column's title tooltip in the template.
+        label = engine.get("label") or ""
+        engine["display_name"] = label.split(" / ")[0] if label else engine["short"]
+    all_engines = {engine["engine_id"] for engine in engines}
+    windows = engine_windows(events)
+
+    by_msg = defaultdict(list)
+    for event in events:
+        for msg_id in event_message_ids(event):
+            by_msg[msg_id].append(event)
+
+    rows = []
+    for msg_id, msg_events in sorted(by_msg.items()):
+        observers = {event.engine_id for event in msg_events if event.engine_id}
+        wall_times = [event.wall_time_ms for event in msg_events if event.wall_time_ms is not None]
+        reference_ms = min(wall_times) if wall_times else None
+        missed_by = engines_present_but_missing(observers, reference_ms, windows, all_engines)
+
+        detail_by_engine = defaultdict(lambda: {"event_types": set(), "states": set()})
+        for event in msg_events:
+            if not event.engine_id:
+                continue
+            detail = detail_by_engine[event.engine_id]
+            if event.event_type:
+                detail["event_types"].add(event.event_type)
+            for value in (event.new_state, event.outcome, event.outcome_kind, event.reason):
+                if value:
+                    detail["states"].add(value)
+
+        cells = []
+        for engine in engines:
+            engine_id = engine["engine_id"]
+            if engine_id in observers:
+                detail = detail_by_engine[engine_id]
+                cells.append(
+                    {
+                        "status": "observed",
+                        "event_types": sorted(detail["event_types"]),
+                        "states": sorted(detail["states"]),
+                    }
+                )
+            elif engine_id in missed_by:
+                cells.append({"status": "missed", "event_types": [], "states": []})
+            else:
+                cells.append({"status": "absent", "event_types": [], "states": []})
+
+        rows.append(
+            {
+                "msg_id": msg_id,
+                "reference_ms": reference_ms,
+                "first_wall_time_ms": reference_ms,
+                "last_wall_time_ms": max(wall_times) if wall_times else None,
+                "event_count": len(msg_events),
+                "observers": sorted(observers),
+                "missed_by": sorted(missed_by),
+                "is_divergent": is_divergent_message(observers, observers | missed_by),
+                "cells": cells,
+            }
+        )
+    return {"engines": engines, "rows": rows}
 
 
 def fork_and_convergence_events(group, events=None):

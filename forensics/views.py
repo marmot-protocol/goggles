@@ -30,8 +30,7 @@ from .analysis import (
     fork_and_convergence_events,
     group_list_rows,
     human_action_groups_for_group,
-    message_traces_for_group,
-    missing_observations_for_group,
+    message_observation_matrix,
     peeler_and_rejection_events,
     timeline_payload_for_group,
     valid_events_for_group,
@@ -307,11 +306,11 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
     if tab == "actions":
         return {"group": group, "human_action_groups": human_action_groups_for_group(events)}
     if tab == "messages":
-        traces = message_traces_for_group(group, events=events)
+        matrix = message_observation_matrix(events)
         return {
             "group": group,
-            "message_traces": traces,
-            "missing_observations": missing_observations_for_group(group, traces=traces),
+            "message_matrix": matrix,
+            "breaks": [row for row in matrix["rows"] if row["is_divergent"]],
         }
     if tab == "integrity":
         return {
