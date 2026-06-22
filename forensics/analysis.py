@@ -754,6 +754,12 @@ def message_ids_from_events(events):
 
 
 def timeline_payload_for_group(group, events, audit_files, traces=None, *, include_integrity=True):
+    """Build a timeline payload.
+
+    ``traces`` is only consumed when ``include_integrity`` is true. Callers that
+    set ``include_integrity=False`` are opting out of integrity construction and
+    any trace work because they will supply integrity separately.
+    """
     ordered = sorted_timeline_events(events)
     engines, engine_idx = timeline_engines(ordered)
     epochs, roles = timeline_epochs(ordered, engine_idx, len(engines))
