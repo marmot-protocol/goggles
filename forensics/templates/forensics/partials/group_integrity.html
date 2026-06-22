@@ -1,6 +1,9 @@
 <section class="card card--flush">
   <header class="card__header"><span class="card__title">Fork &amp; convergence</span></header>
   <div class="card__body table-scroll">
+    {% if fork_events_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} fork/convergence events. Export JSON for full detail.</p>
+    {% endif %}
     {% if fork_events %}
       <table class="data-table">
         <thead>
@@ -37,6 +40,9 @@
 <section class="card card--flush">
   <header class="card__header"><span class="card__title">Peeler &amp; rejections</span></header>
   <div class="card__body table-scroll">
+    {% if peeler_events_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} peeler/rejection events. Export JSON for full detail.</p>
+    {% endif %}
     {% if peeler_events %}
       <table class="data-table">
         <thead>

@@ -1,4 +1,7 @@
 {% if human_action_groups %}
+  {% if human_action_groups_limited %}
+    <p class="empty-state">Showing first {{ tab_event_limit }} matching events. Export JSON for full detail.</p>
+  {% endif %}
   {% for action_group in human_action_groups %}
     <section class="action-group">
       <header class="action-group__header">

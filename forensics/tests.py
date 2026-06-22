@@ -40,6 +40,7 @@ from .ingest import (
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
+    GROUP_DETAIL_TAB_EVENT_LIMIT,
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
@@ -2996,6 +2997,227 @@ class DashboardTests(TestCase):
         self.assertContains(integrity_response, "candidate")
         self.assertContains(integrity_response, "Peeler &amp; rejections")
         self.assertContains(integrity_response, "decrypt_failed")
+
+    def test_group_detail_tabs_cap_large_group_rows(self):
+        tab_limit = GROUP_DETAIL_TAB_EVENT_LIMIT
+        row_count = tab_limit + 5
+        group = AuditGroup.objects.create(
+            name="Large tab group",
+            slug="large-tab-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="e" * 64,
+            byte_size=5_000_000,
+            raw_text="x" * 5_000_000,
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="large-tabs.jsonl",
+            total_line_count=row_count * 4,
+            valid_event_count=row_count * 4,
+        )
+        events = []
+        line_number = 1
+        for i in range(row_count):
+            shared_action = i < 2
+            events.append(
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=line_number,
+                    line_hash=f"action-{i:056x}",
+                    raw_line=f"ACTION-RAW-MARKER-{i}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="human_action",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=line_number,
+                    wall_time_ms=1_700_000_000_000 + line_number,
+                    context_operation_id=(
+                        "shared-action-op" if shared_action else f"action-op-{i:03d}"
+                    ),
+                    human_action_action="action_000" if shared_action else f"action_{i:03d}",
+                    human_action_origin="local_user",
+                )
+            )
+            line_number += 1
+        for i in range(row_count):
+            events.append(
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=line_number,
+                    line_hash=f"message-{i:055x}",
+                    raw_line=f"MESSAGE-RAW-MARKER-{i}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="ingest_entry",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=line_number,
+                    wall_time_ms=1_700_000_100_000 + i,
+                    msg_id=f"{i:016x}" + "a" * 48,
+                )
+            )
+            line_number += 1
+        for i in range(row_count):
+            events.append(
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=line_number,
+                    line_hash=f"fork-{i:058x}",
+                    raw_line=f"FORK-RAW-MARKER-{i}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="fork_resolution",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=line_number,
+                    wall_time_ms=1_700_000_200_000 + i,
+                    source_epoch=i,
+                    candidate_digest=f"{i:016x}" + "b" * 48,
+                    reason=f"fork-marker-{i:03d}",
+                    winner="candidate",
+                )
+            )
+            line_number += 1
+        for i in range(row_count):
+            events.append(
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=line_number,
+                    line_hash=f"peeler-{i:056x}",
+                    raw_line=f"PEELER-RAW-MARKER-{i}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="peeler_outcome",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=line_number,
+                    wall_time_ms=1_700_000_300_000 + i,
+                    msg_id=f"{i:016x}" + "c" * 48,
+                    outcome="decrypt_failed",
+                    detail=f"peeler-marker-{i:03d}",
+                )
+            )
+            line_number += 1
+        AuditEvent.objects.bulk_create(events)
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        actions_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "actions"})
+        )
+        messages_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        )
+        integrity_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "integrity"})
+        )
+
+        self.assertEqual(actions_response.status_code, 200)
+        human_action_groups = actions_response.context["human_action_groups"]
+        self.assertEqual(len(human_action_groups), tab_limit - 1)
+        shared_group = next(
+            group for group in human_action_groups if group["operation_id"] == "shared-action-op"
+        )
+        self.assertEqual(len(shared_group["events"]), 2)
+        self.assertContains(actions_response, f"Showing first {tab_limit} matching events")
+        self.assertContains(actions_response, "action_000")
+        self.assertNotContains(actions_response, f"action_{row_count - 1:03d}")
+
+        self.assertEqual(messages_response.status_code, 200)
+        self.assertEqual(len(messages_response.context["message_matrix"]["rows"]), tab_limit)
+        self.assertContains(messages_response, f"Showing first {tab_limit} matching")
+        self.assertContains(messages_response, "0000000000000000")
+        self.assertNotContains(messages_response, f"{row_count - 1:016x}")
+
+        self.assertEqual(integrity_response.status_code, 200)
+        self.assertEqual(len(integrity_response.context["fork_events"]), tab_limit)
+        self.assertEqual(len(integrity_response.context["peeler_events"]), tab_limit)
+        self.assertContains(
+            integrity_response,
+            f"Showing first {tab_limit} fork/convergence events",
+        )
+        self.assertContains(
+            integrity_response,
+            f"Showing first {tab_limit} peeler/rejection events",
+        )
+        self.assertContains(integrity_response, "fork-marker-000")
+        self.assertNotContains(integrity_response, f"fork-marker-{row_count - 1:03d}")
+        self.assertContains(integrity_response, "peeler-marker-000")
+        self.assertNotContains(integrity_response, f"peeler-marker-{row_count - 1:03d}")
+
+    def test_group_messages_tab_caps_trace_expansion_consistently(self):
+        tab_limit = GROUP_DETAIL_TAB_EVENT_LIMIT
+        visible_msg_ids = [f"{i:064x}" for i in range(tab_limit)]
+        hidden_msg_id = "f" * 64
+        group = AuditGroup.objects.create(
+            name="Expanded trace group",
+            slug="expanded-trace-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="d" * 64,
+            byte_size=4096,
+            raw_text="x" * 4096,
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="expanded-traces.jsonl",
+            total_line_count=2,
+            valid_event_count=2,
+        )
+        AuditEvent.objects.bulk_create(
+            [
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=1,
+                    line_hash="a" * 64,
+                    raw_line="TRACE-EXPANSION-ALICE",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="send_outcome",
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    group_ref=GROUP_REF,
+                    seq=1,
+                    wall_time_ms=1_700_000_000_001,
+                    outcome_kind="published",
+                    outbound_welcome_msg_ids=visible_msg_ids + [hidden_msg_id],
+                ),
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=2,
+                    line_hash="b" * 64,
+                    raw_line="TRACE-EXPANSION-BOB",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="send_outcome",
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    group_ref=GROUP_REF,
+                    seq=2,
+                    wall_time_ms=1_700_000_000_001,
+                    outcome_kind="published",
+                    outbound_welcome_msg_ids=visible_msg_ids,
+                ),
+            ]
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["message_matrix_limited"])
+        self.assertEqual(len(response.context["message_matrix"]["rows"]), tab_limit)
+        self.assertEqual(response.context["breaks"], [])
+        self.assertContains(response, f"Showing first {tab_limit} matching")
+        self.assertContains(response, visible_msg_ids[0][:16])
+        self.assertNotContains(response, hidden_msg_id[:16])
 
     def test_group_detail_shell_size_stays_bounded_for_large_groups(self):
         group = AuditGroup.objects.create(

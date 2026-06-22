@@ -4,6 +4,9 @@
     <span class="is-muted">per engine · what each one saw</span>
   </header>
   <div class="card__body table-scroll">
+    {% if message_matrix_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} matching messages/events from the sampled tab window. Export JSON for full detail.</p>
+    {% endif %}
     {% if message_matrix.rows %}
       <table class="data-table msg-matrix">
         <thead>
