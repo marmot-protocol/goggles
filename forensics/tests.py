@@ -4406,10 +4406,30 @@ class GroupListAnnotationTests(TestCase):
                 "message_ids": [f"not-hex-{MSG_ID}"],
             },
         )
+        # An epoch-carrying valid event that lives in the *partially-invalid*
+        # file. group_epoch_count counts distinct values across the epoch fields
+        # (to_epoch among them); its to_epoch=9 appears nowhere else, so under
+        # the old valid-files-only predicate this file was dropped and epoch 9
+        # vanished from the Timeline badge while the timeline tab body
+        # (valid_events_for_group) still rendered it — the exact Timeline-tab gap
+        # goggles#103 calls out.
+        alice_epoch = audit_event(
+            2,
+            engine_id=ENGINE_ALICE,
+            account_ref=ACCOUNT_ALICE,
+            wall_time_ms=T0 + 70,
+            kind={
+                "type": "epoch_confirmed",
+                "from_epoch": 8,
+                "to_epoch": 9,
+                "pending_kind": "commit",
+            },
+        )
         alice_result = ingest_body(
             jsonl(
                 ingest_entry_event(0, ENGINE_ALICE, ACCOUNT_ALICE, break_msg_id, T0 + 50),
                 ingest_entry_event(1, ENGINE_ALICE, ACCOUNT_ALICE, seen_msg_id, T0 + 90),
+                alice_epoch,
                 bad_action,
             )
         )
@@ -4447,6 +4467,23 @@ class GroupListAnnotationTests(TestCase):
         timeline = timeline_payload_for_group(group, content_events, audit_files)
         content_engine_count = len({e.engine_id for e in content_events if e.engine_id})
         content_message_count = len({e.msg_id for e in content_events if e.msg_id})
+        # Epoch set the Timeline tab body renders, grounded in the content path
+        # (mirrors views.group_epoch_count). Alice's partial-invalid file
+        # contributes to_epoch=9; if the badge predicate dropped that file the
+        # badge would understate this set.
+        content_epochs = set()
+        for event in content_events:
+            for value in (
+                event.epoch,
+                event.source_epoch,
+                event.to_epoch,
+                event.pending_epoch,
+                event.current_tip_epoch,
+                event.selected_tip_epoch,
+            ):
+                if value is not None:
+                    content_epochs.add(value)
+        content_epoch_count = len(content_epochs)
         trace_summary = analysis_module.group_integrity_summary(group, events=content_events)
         trace_divergent = trace_summary["divergent_message_count"]
         break_rows = sum(
@@ -4460,6 +4497,13 @@ class GroupListAnnotationTests(TestCase):
         self.assertEqual(len(timeline["engines"]), 2)
         self.assertEqual(trace_divergent, 1)
         self.assertEqual(break_rows, 1)
+        # The epoch carried only by Alice's partially-invalid file is part of
+        # the timeline content (regression guard: must be non-trivial and must
+        # include the partial-invalid file's epoch). group_epoch_count counts
+        # distinct epoch values across the epoch fields, so Bob's to_epoch=5 and
+        # Alice's to_epoch=9 give 2 distinct epochs.
+        self.assertEqual(content_epoch_count, 2)
+        self.assertIn(9, content_epochs)
 
         # --- Header summary + tab badges (views.valid_group_event_queryset). ---
         shell = group_detail_shell_context(group)
@@ -4487,6 +4531,10 @@ class GroupListAnnotationTests(TestCase):
                 in (analysis_module.FORK_EVENT_TYPES + analysis_module.PEELER_EVENT_TYPES)
             ),
         )
+        # Timeline badge: the epoch count must match the timeline content,
+        # including the epoch that only the partially-invalid file carries.
+        self.assertEqual(shell["tab_counts"]["timeline"], content_epoch_count)
+        self.assertEqual(shell["timeline_summary"]["epoch_count"], content_epoch_count)
 
         # --- Persisted divergent count (divergent_counts_for_group_ids). ---
         persisted = group.divergent_message_count
@@ -4501,6 +4549,91 @@ class GroupListAnnotationTests(TestCase):
         self.assertEqual(landing.engine_count, content_engine_count)
         self.assertEqual(landing.event_count, len(content_events))
         self.assertEqual(landing.divergent_count, trace_divergent)
+
+    def test_migration_0010_backfills_stale_valid_files_only_divergent_count(self):
+        """A group uploaded before this fix deployed keeps a stale, valid-files-
+        only ``divergent_message_count`` until some later ingest happens to
+        touch it; the read paths (landing/header) render that stored value
+        directly. Migration 0010's recompute must repair such a group to the
+        partial-invalid-aware count without waiting for re-ingest (goggles#103,
+        adversarial-review blocking finding).
+
+        The break (BREAK_MSG, Alice-only, inside Bob's window) lives entirely in
+        a *partially-invalid* file, so the old valid-files-only predicate scored
+        the group at 0. We seed that stale value and assert the migration's
+        recompute fixes it to the live trace count of 1.
+        """
+        from importlib import import_module
+
+        from django.apps import apps as global_apps
+
+        break_msg_id = OTHER_MSG_ID
+        seen_msg_id = MSG_ID
+
+        bad_action = audit_event(
+            99,
+            engine_id=ENGINE_ALICE,
+            account_ref=ACCOUNT_ALICE,
+            kind={
+                "type": "human_action",
+                "action": "update_group_profile",
+                "origin": "local_user",
+                "phase": "succeeded",
+                "message_ids": [f"not-hex-{MSG_ID}"],
+            },
+        )
+        alice_result = ingest_body(
+            jsonl(
+                ingest_entry_event(0, ENGINE_ALICE, ACCOUNT_ALICE, break_msg_id, T0 + 50),
+                ingest_entry_event(1, ENGINE_ALICE, ACCOUNT_ALICE, seen_msg_id, T0 + 90),
+                bad_action,
+            )
+        )
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=T0 + 10,
+                    kind={
+                        "type": "epoch_confirmed",
+                        "from_epoch": 4,
+                        "to_epoch": 5,
+                        "pending_kind": "commit",
+                    },
+                ),
+                ingest_entry_event(1, ENGINE_BOB, ACCOUNT_BOB, seen_msg_id, T0 + 95),
+            )
+        )
+
+        self.assertEqual(alice_result.audit_file.validation_status, AuditFile.STATUS_INVALID)
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        trace_divergent = analysis_module.group_integrity_summary(group)["divergent_message_count"]
+        self.assertEqual(trace_divergent, 1)
+
+        # Simulate a pre-deploy row: the stale valid-files-only value (the break
+        # file is INVALID, so the old predicate dropped it and scored 0). Write
+        # it directly to bypass the now-correct ingest rollup.
+        AuditGroup.objects.filter(pk=group.pk).update(divergent_message_count=0)
+        self.assertEqual(AuditGroup.objects.get(pk=group.pk).divergent_message_count, 0)
+
+        # Run the forward data migration's recompute against the real app
+        # registry; it must repair the stored value to the trace count.
+        migration = import_module(
+            "forensics.migrations.0010_recompute_divergent_counts_partial_invalid"
+        )
+        migration.recompute_divergent_message_counts(global_apps, None)
+
+        self.assertEqual(
+            AuditGroup.objects.get(pk=group.pk).divergent_message_count, trace_divergent
+        )
+        # The self-contained migration computation must equal the runtime one.
+        self.assertEqual(
+            analysis_module.divergent_counts_for_group_ids([group.pk])[group.pk],
+            trace_divergent,
+        )
 
 
 class MessageObservationMatrixTests(TestCase):
