@@ -44,7 +44,9 @@ from .views import (
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    group_epoch_count,
     groups_for_audit_file,
+    valid_group_event_queryset,
 )
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
@@ -3218,6 +3220,72 @@ class DashboardTests(TestCase):
         self.assertContains(response, f"Showing first {tab_limit} matching")
         self.assertContains(response, visible_msg_ids[0][:16])
         self.assertNotContains(response, hidden_msg_id[:16])
+
+    def test_group_epoch_count_counts_distinct_epochs_in_database(self):
+        group = AuditGroup.objects.create(
+            name="Epoch union group",
+            slug="epoch-union-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="c" * 64,
+            byte_size=1024,
+            raw_text="{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="epochs.jsonl",
+            total_line_count=3,
+            valid_event_count=3,
+        )
+        AuditEvent.objects.bulk_create(
+            [
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=1,
+                    line_hash="epoch-1".ljust(64, "0"),
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="convergence_decision",
+                    epoch=1,
+                    source_epoch=2,
+                    to_epoch=3,
+                    current_tip_epoch=4,
+                    selected_tip_epoch=5,
+                ),
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=2,
+                    line_hash="epoch-2".ljust(64, "0"),
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="epoch_rolled_back",
+                    epoch=1,
+                    source_epoch=6,
+                    pending_epoch=5,
+                    current_tip_epoch=7,
+                    selected_tip_epoch=7,
+                ),
+                AuditEvent(
+                    audit_file=audit_file,
+                    group=group,
+                    line_number=3,
+                    line_hash="epoch-3".ljust(64, "0"),
+                    raw_line="{}",
+                    parse_status=AuditEvent.STATUS_VALID,
+                    event_type="send_entry",
+                ),
+            ]
+        )
+
+        with CaptureQueriesContext(connection) as captured:
+            epoch_count = group_epoch_count(valid_group_event_queryset(group))
+
+        self.assertEqual(epoch_count, 7)
+        self.assertEqual(len(captured), 1)
+        sql = captured[0]["sql"].upper()
+        self.assertIn("COUNT", sql)
+        self.assertEqual(sql.count("UNION"), 5)
 
     def test_group_detail_shell_size_stays_bounded_for_large_groups(self):
         group = AuditGroup.objects.create(

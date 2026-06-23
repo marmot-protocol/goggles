@@ -46,6 +46,14 @@ GROUP_TIMELINE_EVENT_PAGE_SIZE = 2_000
 GROUP_TIMELINE_EVENT_MAX_PAGE_SIZE = 5_000
 GROUP_ENGINE_PREVIEW_LIMIT = 12
 GROUP_DETAIL_TAB_EVENT_LIMIT = 100
+GROUP_EPOCH_FIELDS = (
+    "epoch",
+    "source_epoch",
+    "to_epoch",
+    "pending_epoch",
+    "current_tip_epoch",
+    "selected_tip_epoch",
+)
 GROUP_DETAIL_TAB_TEMPLATES = {
     "actions": "forensics/partials/group_actions.html",
     "messages": "forensics/partials/group_messages.html",
@@ -192,17 +200,11 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
 
 
 def group_epoch_count(valid_events) -> int:
-    epochs = set()
-    for row in valid_events.values_list(
-        "epoch",
-        "source_epoch",
-        "to_epoch",
-        "pending_epoch",
-        "current_tip_epoch",
-        "selected_tip_epoch",
-    ):
-        epochs.update(value for value in row if value is not None)
-    return len(epochs)
+    epoch_queries = [
+        valid_events.exclude(**{f"{field}__isnull": True}).order_by().values_list(field, flat=True)
+        for field in GROUP_EPOCH_FIELDS
+    ]
+    return epoch_queries[0].union(*epoch_queries[1:]).count()
 
 
 def group_engine_preview(valid_events) -> list[dict]:
