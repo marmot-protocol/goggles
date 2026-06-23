@@ -172,7 +172,7 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
         message_count=Count("msg_id", filter=~Q(msg_id=""), distinct=True),
         action_count=Count("id", filter=~Q(human_action_action="")),
     )
-    file_count = AuditFile.objects.filter(events__group=group).distinct().count()
+    file_count = AuditFile.objects.filter(groups=group).count()
     invalid_event_count = AuditEvent.objects.filter(
         group=group, parse_status=AuditEvent.STATUS_INVALID
     ).count()
