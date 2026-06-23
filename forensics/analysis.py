@@ -52,6 +52,30 @@ STRUCTURAL_QUARANTINE_ERRORS = (
 )
 
 
+def structural_quarantine_exclusion(field_prefix: str = "") -> Q:
+    """The ``Q`` that excludes events belonging to a *structurally* quarantined
+    file (multi-engine / multi-account uploads), the single definition shared by
+    every "events that count for a group" path.
+
+    A file marked ``validation_status=INVALID`` for a non-structural reason
+    (e.g. one malformed JSONL line) still contributes its ``parse_status=VALID``
+    events to the group: those events are real evidence and are rendered in the
+    timeline/tabs/export (goggles#80, commit ``0ac4442``). Only the structural
+    quarantine errors above mean the *whole* file's engine/account attribution
+    is untrustworthy and must be dropped wholesale.
+
+    ``field_prefix`` adapts the predicate to the relation path of the caller:
+    ``""`` for a queryset already rooted on ``AuditEvent``
+    (``audit_file__validation_error``), or ``"audit_events__"`` for the
+    reverse relation used when annotating ``AuditGroup``
+    (``audit_events__audit_file__validation_error``).
+    """
+    predicate = Q()
+    for error in STRUCTURAL_QUARANTINE_ERRORS:
+        predicate &= ~Q(**{f"{field_prefix}audit_file__validation_error__icontains": error})
+    return predicate
+
+
 def audit_files_for_group(group):
     # File membership comes from the explicit AuditFile.groups M2M (goggles#37),
     # NOT from stored AuditEvent rows. A duplicate-heavy upload whose group
@@ -102,8 +126,9 @@ def valid_events_for_group(group, *, include_export_fields=False):
                 "raw_kind",
             ]
         )
-    queryset = (
+    return (
         AuditEvent.objects.filter(
+            structural_quarantine_exclusion(),
             group=group,
             parse_status=AuditEvent.STATUS_VALID,
         )
@@ -116,9 +141,6 @@ def valid_events_for_group(group, *, include_export_fields=False):
             "id",
         )
     )
-    for error in STRUCTURAL_QUARANTINE_ERRORS:
-        queryset = queryset.exclude(audit_file__validation_error__icontains=error)
-    return queryset
 
 
 def group_summary(group, audit_files, events=None):
@@ -176,15 +198,19 @@ def file_rows_for_group(audit_files, group):
 
 
 def annotated_group_list():
+    # Count the same events the group-detail tabs/timeline render: valid-parse
+    # events, excluding only structurally-quarantined files (goggles#103). A
+    # file marked INVALID for a non-structural reason still contributes its
+    # valid events, so the landing-page per-group counts match the detail views.
     valid = Q(
+        structural_quarantine_exclusion("audit_events__"),
         audit_events__parse_status=AuditEvent.STATUS_VALID,
-        audit_events__audit_file__validation_status=AuditFile.STATUS_VALID,
     )
     confirmed = valid & Q(audit_events__event_type="epoch_confirmed")
     fork_activity = AuditEvent.objects.filter(
+        structural_quarantine_exclusion(),
         group=OuterRef("pk"),
         parse_status=AuditEvent.STATUS_VALID,
-        audit_file__validation_status=AuditFile.STATUS_VALID,
         event_type__in=["fork_resolution", "epoch_rolled_back"],
     )
     return AuditGroup.objects.annotate(
@@ -332,9 +358,9 @@ def divergent_counts_for_group_ids(group_ids):
     message_engines_by_group = defaultdict(lambda: defaultdict(set))
     message_reference_by_group: dict[int, dict[str, int]] = defaultdict(dict)
     rows = AuditEvent.objects.filter(
+        structural_quarantine_exclusion(),
         group_id__in=group_ids,
         parse_status=AuditEvent.STATUS_VALID,
-        audit_file__validation_status=AuditFile.STATUS_VALID,
     ).values_list(
         "group_id",
         "engine_id",

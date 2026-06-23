@@ -33,6 +33,7 @@ from .analysis import (
     human_action_groups_for_group,
     message_observation_matrix,
     peeler_and_rejection_events,
+    structural_quarantine_exclusion,
     timeline_payload_for_group,
     valid_events_for_group,
 )
@@ -148,9 +149,16 @@ def group_detail(request: HttpRequest, slug: str):
 
 
 def valid_group_event_queryset(group: AuditGroup):
+    # The canonical "events that count for this group": valid-parse events,
+    # excluding only structurally-quarantined files. This MUST match
+    # analysis.valid_events_for_group so the header summary, tab-count badges and
+    # engine preview (which read this queryset) agree with the timeline/tab
+    # bodies and the agent export (which read valid_events_for_group). See
+    # goggles#103 — a file marked INVALID for a non-structural reason still
+    # contributes its valid events to both.
     return AuditEvent.objects.filter(
+        structural_quarantine_exclusion(),
         group=group,
-        audit_file__validation_status=AuditFile.STATUS_VALID,
         parse_status=AuditEvent.STATUS_VALID,
     )
 
