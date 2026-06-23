@@ -41,6 +41,7 @@ from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     GROUP_DETAIL_TAB_EVENT_LIMIT,
+    GROUP_EPOCH_FIELDS,
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
@@ -3285,7 +3286,7 @@ class DashboardTests(TestCase):
         self.assertEqual(len(captured), 1)
         sql = captured[0]["sql"].upper()
         self.assertIn("COUNT", sql)
-        self.assertEqual(sql.count("UNION"), 5)
+        self.assertEqual(sql.count("UNION"), len(GROUP_EPOCH_FIELDS) - 1)
 
     def test_group_detail_shell_size_stays_bounded_for_large_groups(self):
         group = AuditGroup.objects.create(
