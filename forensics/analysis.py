@@ -214,12 +214,6 @@ def annotated_group_list():
         event_type__in=["fork_resolution", "epoch_rolled_back"],
     )
     return AuditGroup.objects.annotate(
-        # File count comes from the explicit AuditFile.groups M2M (goggles#37,
-        # reverse accessor `audit_files_linked`) rather than inferring links from
-        # stored AuditEvent rows (`audit_events__audit_file`). Duplicate-heavy
-        # uploads whose group events were all deduplicated away still count
-        # toward the group's linked-file total.
-        audit_file_count=Count("audit_files_linked", distinct=True),
         event_count=Count("audit_events", filter=valid, distinct=True),
         engine_count=Count(
             "audit_events__engine_id",
@@ -234,14 +228,82 @@ def annotated_group_list():
 
 
 def group_list_rows():
-    groups = list(annotated_group_list())
+    groups = list(AuditGroup.objects.all())
+    group_file_counts = audit_file_counts_for_groups(groups)
+    group_event_stats, fork_group_ids = event_stats_for_groups(groups)
     for group in groups:
+        stats = group_event_stats.get(group.pk, {})
         search_ref = group.group_ref or group.slug
         group.search_ref = search_ref
         group.display_ref = display_group_ref(search_ref)
+        group.audit_file_count = group_file_counts.get(group.pk, 0)
+        group.event_count = stats.get("event_count", 0)
+        group.engine_count = stats.get("engine_count", 0)
+        group.epoch_min = stats.get("epoch_min")
+        group.epoch_max = stats.get("epoch_max")
+        group.last_activity_ms = stats.get("last_activity_ms")
+        group.has_fork_activity = group.pk in fork_group_ids
         group.divergent_count = group.divergent_message_count
         group.last_activity = _last_activity_datetime(group.last_activity_ms)
     return groups
+
+
+def event_stats_for_groups(groups):
+    """Aggregate group-list event stats from ``AuditEvent`` directly.
+
+    Joining ``AuditGroup`` to every event and every related file in one
+    annotation makes the landing page sensitive to planner choices once the
+    structural-quarantine predicate is included. Group from the event side
+    instead; this preserves the canonical predicate while keeping the work
+    proportional to stored events, not multiplied group joins.
+    """
+    group_ids = [group.pk for group in groups if group.pk]
+    if not group_ids:
+        return {}, set()
+    valid_events = AuditEvent.objects.filter(
+        structural_quarantine_exclusion(),
+        group_id__in=group_ids,
+        parse_status=AuditEvent.STATUS_VALID,
+    )
+    stats = {
+        row["group_id"]: row
+        for row in valid_events.values("group_id").annotate(
+            event_count=Count("id", distinct=True),
+            engine_count=Count("engine_id", filter=~Q(engine_id=""), distinct=True),
+            epoch_min=Min("from_epoch", filter=Q(event_type="epoch_confirmed")),
+            epoch_max=Max("to_epoch", filter=Q(event_type="epoch_confirmed")),
+            last_activity_ms=Max("wall_time_ms"),
+        )
+    }
+    fork_group_ids = set(
+        valid_events.filter(event_type__in=["fork_resolution", "epoch_rolled_back"])
+        .values_list("group_id", flat=True)
+        .distinct()
+    )
+    return stats, fork_group_ids
+
+
+def audit_file_counts_for_groups(groups):
+    """Count explicit group-file memberships without multiplying event rows.
+
+    Combining the ``AuditFile.groups`` M2M join with the event aggregates in
+    ``annotated_group_list`` makes Postgres compute DISTINCT counts over the
+    event x file-membership product for each group. On production-sized uploads
+    that can time out the landing page. Keep the event aggregate query narrow,
+    then count the M2M table independently.
+    """
+    group_ids = [group.pk for group in groups if group.pk]
+    if not group_ids:
+        return {}
+    through = AuditFile.groups.through
+    return {
+        row["auditgroup_id"]: row["count"]
+        for row in (
+            through.objects.filter(auditgroup_id__in=group_ids)
+            .values("auditgroup_id")
+            .annotate(count=Count("auditfile_id", distinct=True))
+        )
+    }
 
 
 def _last_activity_datetime(last_activity_ms):
