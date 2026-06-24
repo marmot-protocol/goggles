@@ -1855,9 +1855,9 @@ class AuditLogIngestionTests(TestCase):
         self.assertIn(second_file.id, detail_files)
         self.assertEqual(detail_files[second_file.id].group_event_count, 0)
 
-        # Group-list audit_file_count (annotated_group_list) counts the
-        # duplicate-only file toward GROUP_REF's linked-file total. Both the
-        # first and second files are linked to GROUP_REF.
+        # Group-list audit_file_count counts the duplicate-only file toward
+        # GROUP_REF's linked-file total. Both the first and second files are
+        # linked to GROUP_REF.
         rows = {row.slug: row for row in group_list_rows()}
         self.assertEqual(rows[GROUP_REF].audit_file_count, 2)
 
@@ -4378,7 +4378,7 @@ class GroupListAnnotationTests(TestCase):
         INVALID for a non-structural reason (one malformed JSONL line). The
         summary/badge (``valid_group_event_queryset``), persisted-aggregate
         (``divergent_counts_for_group_ids``) and landing-page
-        (``annotated_group_list``) paths used to additionally require
+        (``group_list_rows``) paths used to additionally require
         ``validation_status=VALID``, so they dropped that file and understated
         every headline figure relative to what the detail views render.
 
@@ -4543,7 +4543,7 @@ class GroupListAnnotationTests(TestCase):
         self.assertEqual(live_persisted, trace_divergent)
         self.assertEqual(persisted, break_rows)
 
-        # --- Landing page per-group annotations (annotated_group_list). ---
+        # --- Landing page per-group rows. ---
         rows = {row.slug: row for row in group_list_rows()}
         landing = rows[group.slug]
         self.assertEqual(landing.engine_count, content_engine_count)

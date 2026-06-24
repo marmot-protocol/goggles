@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from itertools import count
 
-from django.db.models import Count, Exists, Max, Min, OuterRef, Q
+from django.db.models import Count, Max, Min, Q
 from django.utils import timezone
 
 from . import normalized_fields as normalized_field_config
@@ -197,36 +197,6 @@ def file_rows_for_group(audit_files, group):
 # ---------------------------------------------------------------------------
 
 
-def annotated_group_list():
-    # Count the same events the group-detail tabs/timeline render: valid-parse
-    # events, excluding only structurally-quarantined files (goggles#103). A
-    # file marked INVALID for a non-structural reason still contributes its
-    # valid events, so the landing-page per-group counts match the detail views.
-    valid = Q(
-        structural_quarantine_exclusion("audit_events__"),
-        audit_events__parse_status=AuditEvent.STATUS_VALID,
-    )
-    confirmed = valid & Q(audit_events__event_type="epoch_confirmed")
-    fork_activity = AuditEvent.objects.filter(
-        structural_quarantine_exclusion(),
-        group=OuterRef("pk"),
-        parse_status=AuditEvent.STATUS_VALID,
-        event_type__in=["fork_resolution", "epoch_rolled_back"],
-    )
-    return AuditGroup.objects.annotate(
-        event_count=Count("audit_events", filter=valid, distinct=True),
-        engine_count=Count(
-            "audit_events__engine_id",
-            filter=valid & ~Q(audit_events__engine_id=""),
-            distinct=True,
-        ),
-        epoch_min=Min("audit_events__from_epoch", filter=confirmed),
-        epoch_max=Max("audit_events__to_epoch", filter=confirmed),
-        last_activity_ms=Max("audit_events__wall_time_ms", filter=valid),
-        has_fork_activity=Exists(fork_activity),
-    )
-
-
 def group_list_rows():
     groups = list(AuditGroup.objects.all())
     group_file_counts = audit_file_counts_for_groups(groups)
@@ -286,8 +256,8 @@ def event_stats_for_groups(groups):
 def audit_file_counts_for_groups(groups):
     """Count explicit group-file memberships without multiplying event rows.
 
-    Combining the ``AuditFile.groups`` M2M join with the event aggregates in
-    ``annotated_group_list`` makes Postgres compute DISTINCT counts over the
+    Combining the ``AuditFile.groups`` M2M join with the event aggregates in a
+    single group-list annotation makes Postgres compute DISTINCT counts over the
     event x file-membership product for each group. On production-sized uploads
     that can time out the landing page. Keep the event aggregate query narrow,
     then count the M2M table independently.
