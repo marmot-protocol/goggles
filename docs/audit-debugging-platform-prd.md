@@ -293,6 +293,9 @@ Near-term support for the latest Dark Matter master should include:
 The latest audit changes are a strong foundation, but Goggles probably needs
 additional Dark Matter events for complete explainability.
 
+A first draft of the proposed V2 event-line schema is in
+[`docs/schemas/audit-log-event.v2.schema.json`](schemas/audit-log-event.v2.schema.json).
+
 Message and transport gaps:
 
 - Explicit inbound transport receipt rows before engine processing, with delivery
