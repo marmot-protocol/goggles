@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 
 from django.conf import settings
 from django.contrib import messages
@@ -12,7 +13,13 @@ from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
 from django.db.models import Count, Max, Min, Q
 from django.db.models.functions import Length, Substr
-from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.views.decorators.csrf import csrf_exempt
@@ -22,7 +29,8 @@ from .analysis import (
     ATTENTION_MESSAGE_STATES,
     FORK_EVENT_TYPES,
     PEELER_EVENT_TYPES,
-    agent_state_export_for_group,
+    agent_event_rows_for_group,
+    agent_state_export_header_for_group,
     audit_files_for_group,
     color_index,
     engine_initials,
@@ -408,19 +416,60 @@ def peeler_attention_event_filter():
 def group_agent_export(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
     audit_files = list(audit_files_for_group(group))
-    events = list(valid_events_for_group(group, include_export_fields=True))
+    # Build every section EXCEPT the per-event array from the group's events
+    # fetched WITHOUT the raw_context/raw_kind JSON blobs: only the per-event
+    # rows need those, and they are streamed separately below so the export
+    # never holds every event row (with its raw JSON) resident at once, never
+    # builds one giant export dict, and never serializes one giant JSON string
+    # (goggles#109). Completeness is preserved -- there is no cap or truncation;
+    # the full event set is still emitted, just chunk-by-chunk.
+    header_events = list(valid_events_for_group(group))
+    header = agent_state_export_header_for_group(group, header_events, audit_files)
     pretty = request.GET.get("pretty", "").lower() in {"1", "true", "yes"}
-    json_dumps_params = {"sort_keys": True}
-    if pretty:
-        json_dumps_params["indent"] = 2
-    else:
-        json_dumps_params["separators"] = (",", ":")
-    response = JsonResponse(
-        agent_state_export_for_group(group, events, audit_files),
-        json_dumps_params=json_dumps_params,
+
+    response = StreamingHttpResponse(
+        _stream_agent_state_export(group, header, pretty=pretty),
+        content_type="application/json",
     )
     response["Content-Disposition"] = f'attachment; filename="{group.slug}-agent-state.json"'
     return response
+
+
+def _stream_agent_state_export(group, header, *, pretty: bool):
+    """Yield the agent-state export JSON as a sequence of chunks.
+
+    The bounded ``header`` object is serialized once, then its closing brace is
+    replaced by a streamed ``"events": [...]`` array whose rows are pulled from
+    the database in chunks via ``agent_event_rows_for_group`` -- so the per-event
+    rows (and their raw_context/raw_kind JSON) are only ever a chunk at a time in
+    memory, and the response body is written incrementally instead of buffered
+    (goggles#109). Object key order is not semantically significant, so appending
+    ``events`` after the (sort_keys) header keeps the JSON valid and stable.
+    """
+    if pretty:
+        row_dumps = {"sort_keys": True, "indent": 2}
+        header_str = json.dumps(header, sort_keys=True, indent=2)
+        # Drop the final "\n}" so we can append the events array as another
+        # top-level member, then re-close the object.
+        prefix = header_str[: header_str.rfind("\n}")]
+        yield prefix + ',\n  "events": ['
+        first = True
+        for row in agent_event_rows_for_group(group):
+            # Indent each serialized row by 4 spaces to sit inside the array.
+            row_str = json.dumps(row, **row_dumps).replace("\n", "\n    ")
+            yield ("\n    " if first else ",\n    ") + row_str
+            first = False
+        yield ("\n  ]\n}" if not first else "]\n}")
+    else:
+        row_dumps = {"sort_keys": True, "separators": (",", ":")}
+        header_str = json.dumps(header, sort_keys=True, separators=(",", ":"))
+        # Strip the trailing "}" and append a streamed "events" array.
+        yield header_str[:-1] + ',"events":['
+        first = True
+        for row in agent_event_rows_for_group(group):
+            yield ("" if first else ",") + json.dumps(row, **row_dumps)
+            first = False
+        yield "]}"
 
 
 @login_required

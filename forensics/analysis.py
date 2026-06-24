@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from itertools import count
 
-from django.db.models import Count, Max, Min, Q
+from django.db.models import Count, F, Max, Min, Q
 from django.utils import timezone
 
 from . import normalized_fields as normalized_field_config
@@ -1004,7 +1004,30 @@ def timeline_payload_for_group(group, events, audit_files, traces=None, *, inclu
     return payload
 
 
-def agent_state_export_for_group(group, events, audit_files):
+# Chunk size for streaming the export's per-event rows out of the database.
+# Mirrors the chunked iteration already used elsewhere in this module
+# (audit_files_for_group's 2_000-row chunks) so the export holds only a chunk
+# of event rows -- and their raw_context/raw_kind JSON blobs -- resident at a
+# time instead of the whole group (goggles#109).
+AGENT_EXPORT_EVENT_CHUNK_SIZE = 2_000
+
+
+def agent_state_export_header_for_group(group, events, audit_files):
+    """Build every export section EXCEPT the per-event ``events`` array.
+
+    ``events`` is the group's valid events fetched WITHOUT the export-only
+    ``raw_context``/``raw_kind`` JSON blobs (``include_export_fields=False``):
+    none of the aggregate sections below read those columns -- only
+    ``agent_event_row`` does -- so the header is built from the same lean rows
+    the bounded timeline/tab paths already load. The per-event rows (which DO
+    carry the raw JSON) are streamed separately by
+    ``agent_event_rows_for_group`` so they are never all resident at once
+    (goggles#109).
+
+    The aggregate sections are bounded by engine/message/action cardinality,
+    not raw event count, so materializing the lean event list to build them is
+    the same memory profile as the other bounded group-scoped views.
+    """
     ordered = sorted_timeline_events(events)
     timeline = timeline_payload_for_group(group, ordered, audit_files)
     engine_ids = {engine["engine_id"] for engine in timeline["engines"]}
@@ -1034,8 +1057,32 @@ def agent_state_export_for_group(group, events, audit_files):
         "timeline": timeline,
         "actions": human_action_groups_for_group(ordered),
         "messages": message_traces_from_events(ordered, engine_ids),
-        "events": [agent_event_row(event) for event in ordered],
     }
+
+
+def agent_event_rows_for_group(group):
+    """Yield ``agent_event_row`` dicts for the group, streamed from the DB.
+
+    Iterates the valid events (WITH the export-only ``raw_context``/``raw_kind``
+    JSON via ``include_export_fields=True``) in fixed-size chunks so only one
+    chunk of rows -- and their raw JSON -- is resident at a time, instead of the
+    whole group (goggles#109). The view serializes each yielded row on its own,
+    so the export is never buffered as one large JSON string either.
+
+    Ordering matches ``sorted_timeline_events`` -- ``wall_time_ms`` ascending
+    with NULLs last (None-timestamp events sort last), then ``line_number``,
+    then ``id`` -- but expressed in SQL via ``nulls_last=True`` so the rows
+    stream in the final order without a Python re-sort that would force full
+    materialization. ``nulls_last`` is honored portably across SQLite and
+    Postgres by Django's ORM.
+    """
+    queryset = valid_events_for_group(group, include_export_fields=True).order_by(
+        F("wall_time_ms").asc(nulls_last=True),
+        "line_number",
+        "id",
+    )
+    for event in queryset.iterator(chunk_size=AGENT_EXPORT_EVENT_CHUNK_SIZE):
+        yield agent_event_row(event)
 
 
 def agent_source_row(audit_file):

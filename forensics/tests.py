@@ -14,6 +14,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.http import StreamingHttpResponse
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -4851,10 +4852,15 @@ class GroupDetailTimelineViewTests(TestCase):
         response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
 
         self.assertEqual(response.status_code, 200)
+        # The export streams (goggles#109): it must not buffer the whole group in
+        # one heap-resident dict + JSON string. Verify it is a streaming response
+        # and that the streamed body is still complete, valid JSON.
+        self.assertTrue(response.streaming)
         self.assertEqual(response["Content-Type"], "application/json")
         self.assertIn("attachment", response["Content-Disposition"])
         self.assertIn(f"{GROUP_REF}-agent-state.json", response["Content-Disposition"])
-        payload = response.json()
+        body = b"".join(response.streaming_content).decode("utf-8")
+        payload = json.loads(body)
         self.assertEqual(payload["schema_version"], "goggles-agent-group-state/v1")
         self.assertEqual(payload["group"]["slug"], GROUP_REF)
         self.assertEqual(payload["summary"]["event_count"], 2)
@@ -4865,6 +4871,83 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertIn("line_hash", payload["events"][0]["source"])
         self.assertNotIn("raw_line", payload["events"][0])
         self.assertIn("raw_upload_bodies", payload["sensitivity"]["omits"])
+
+    def test_group_agent_export_streams_events_lazily_in_chunks(self):
+        """The export must not materialize every event row at once (goggles#109).
+
+        agent_event_rows_for_group is the per-event source; it must be a lazy
+        generator that pulls rows from the DB via a chunked .iterator(), so the
+        view never holds the whole group (and its raw_context/raw_kind JSON)
+        resident. We assert the source is a generator and that the view wires it
+        through StreamingHttpResponse rather than buffering one big dict.
+        """
+        import inspect
+
+        ingest_body(representative_audit_log())
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        rows = analysis_module.agent_event_rows_for_group(group)
+        # A generator is lazy: nothing is fetched/built until iterated.
+        self.assertTrue(inspect.isgenerator(rows))
+        materialized = list(rows)
+        self.assertEqual(len(materialized), 2)
+        self.assertEqual(materialized[0]["kind"]["type"], "ingest_entry")
+
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+        self.assertIsInstance(response, StreamingHttpResponse)
+
+    def test_group_agent_export_streams_complete_events_in_timeline_order(self):
+        """Streaming must preserve completeness and deterministic order.
+
+        The export is the authoritative whole-group artifact, so streaming must
+        emit *every* valid event (no cap/truncation) and in the same order the
+        buffered build used -- sorted_timeline_events: wall_time_ms ascending
+        (NULLs last), then line_number, then id (goggles#109).
+        """
+        ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
+        ingest_body(representative_audit_log(engine_id=ENGINE_BOB))
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+
+        expected_ids = [
+            event.id
+            for event in analysis_module.sorted_timeline_events(list(valid_events_for_group(group)))
+        ]
+
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        body = b"".join(response.streaming_content).decode("utf-8")
+        payload = json.loads(body)
+
+        # Completeness: every valid event is present, none dropped.
+        self.assertEqual(payload["summary"]["event_count"], len(expected_ids))
+        self.assertEqual(len(payload["events"]), len(expected_ids))
+        # Order matches the buffered sorted_timeline_events order exactly.
+        self.assertEqual([event["id"] for event in payload["events"]], expected_ids)
+        # Per-event raw JSON (raw_context/raw_kind) still surfaces under the
+        # export-only context/kind fields.
+        self.assertEqual(payload["events"][0]["kind"]["type"], "ingest_entry")
+
+    def test_group_agent_export_pretty_streams_valid_json(self):
+        """?pretty=1 must still produce valid, complete, indented JSON when streamed."""
+        ingest_body(representative_audit_log())
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("group-agent-export", kwargs={"slug": GROUP_REF}), {"pretty": "1"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = b"".join(response.streaming_content).decode("utf-8")
+        # Indented output (the compact separators path would have no newlines).
+        self.assertIn("\n", body)
+        payload = json.loads(body)
+        self.assertEqual(payload["schema_version"], "goggles-agent-group-state/v1")
+        self.assertEqual(len(payload["events"]), 2)
 
     def test_group_detail_fetches_events_with_bounded_queries(self):
         ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
