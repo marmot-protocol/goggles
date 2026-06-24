@@ -321,6 +321,7 @@ def save_invalid_upload(
                 validation_error=error,
             )
             if fallback_group is not None:
+                audit_file.groups.add(fallback_group)
                 AuditGroup.objects.filter(id=fallback_group.id).update(updated_at=timezone.now())
             return IngestionResult(audit_file=audit_file, created=True)
     except IntegrityError:
