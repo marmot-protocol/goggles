@@ -128,10 +128,10 @@ sensitive forensic capture:
 
 Full data auditing should be off by default, require an explicit user or admin
 action to enable, present prominent warnings in clients and Goggles, and produce
-mode-change audit rows. Dark Matter should define whether mode changes take
-effect immediately on the active recorder or only after engine restart/session
-reopen. Goggles should make mixed-mode evidence obvious when comparing engines,
-because one engine may have plaintext evidence while another only has digests.
+mode-change audit rows. Toggling full data auditing should restart or reopen the
+active recorder session so the audit file has an explicit mode boundary. Goggles
+should make mixed-mode evidence obvious when comparing engines, because one
+engine may have plaintext evidence while another only has digests.
 
 ## Users
 
@@ -177,9 +177,14 @@ Important distinction:
 
 Question: What did the convergence engine see, what did it choose, and why?
 
-The view should organize events by convergence run. A run begins when an engine
+The view should organize events by convergence run. Once Dark Matter emits a
+stable `convergence_run_id`, that id should define the run. Before then, Goggles
+can infer provisional runs from contiguous convergence and epoch-state events
+with the same engine id and group ref. An inferred run begins when an engine
 starts quiescing or evaluating stored candidates for a group, and ends when it
-selects a branch, blocks, fails, or marks the group unrecoverable.
+selects a branch, blocks, fails, returns to stable, or marks the group
+unrecoverable. Inferred runs must be labeled as inferred because adjacent passes
+can otherwise be merged or split incorrectly.
 
 Each run should show:
 
@@ -190,7 +195,9 @@ Each run should show:
 - branch fork epoch, tip epoch, commit ids, and state digest;
 - eligibility result for each branch;
 - rejection reasons and selector errors;
-- scoring, weighting, or rule decisions where available;
+- every branch-selection rule evaluated, the rule inputs that matter for
+  explainability, and the rule that actually selected or rejected a branch;
+- scoring, weighting, or rule decisions where applicable;
 - selected branch id and selected tip epoch;
 - resulting epoch-state transition;
 - raw evidence links for every row.
@@ -241,8 +248,10 @@ drilldown rather than the main workflow.
 ## Derived Data Model
 
 Goggles should retain raw `AuditFile` and `AuditEvent` records, then build
-derived projections. These can be tables, materialized JSON projections, or
-computed API responses depending on performance.
+normalized relational tables for the derived projections. The product should
+optimize for fast investigation workflows. Materialized JSON snapshots or cached
+API responses can be added where they improve performance, but relational
+derived tables should be the primary projection model.
 
 Recommended derived objects:
 
@@ -252,6 +261,8 @@ Recommended derived objects:
   payload carrier.
 - `EngineObservation`: one engine's observed lifecycle for one message.
 - `TransportObservation`: publish attempt/outcome or inbound transport arrival.
+- `RecipientExpectation`: expected recipient set for a group message, including
+  welcome-message exceptions.
 - `ConvergenceRun`: one canonicalization/quiescing/selection pass.
 - `BranchCandidate`: candidate branch shape, eligibility, scoring, and outcome.
 - `GroupStateDelta`: authenticated durable group-state change.
@@ -290,6 +301,10 @@ Message and transport gaps:
   group-state application.
 - Publish attempt and outcome rows that can be correlated to expected recipients
   or delivery planes where the protocol can know that safely.
+- Expected-recipient rows or fields based on group membership at send time. Group
+  messages are expected to reach all other current group members. Welcome
+  messages are the exception: the welcome is expected only by the added member,
+  while existing members receive the commit that adds that member.
 - Optional relay/server-side receipts if "did not arrive" must become factual
   rather than inferred.
 
@@ -315,7 +330,10 @@ Convergence gaps:
 - Candidate branch rows with branch id, fork epoch, tip epoch, commit ids,
   commit count, state digest, retained-anchor status, and last input time.
 - Per-candidate eligibility and rejection reasons.
-- Scoring, weighting, or rule-output rows when the selector compares candidates.
+- Rule-output rows for every decision rule the convergence engine evaluates,
+  including the rule name, inputs needed for explanation, result, and whether the
+  rule was decisive.
+- Scoring or weighting rows when the selector compares candidates numerically.
 - Selected winner row that names the selected branch and the losing branches.
 - Applied branch outcome rows that link selection to `group_state_changed`.
 
@@ -324,8 +342,9 @@ Client and library gaps:
 - TypeScript library support for the same audit-log contract.
 - TypeScript, Swift, Kotlin, and Rust client controls for selecting the audit
   data mode, including warnings for full data auditing.
-- Client source metadata that identifies app version, platform, account/device
-  labels, and upload trigger without exposing raw credentials.
+- Client source metadata that identifies app version, platform, upload trigger,
+  stable device id, human-readable device name where available, and the logged-in
+  account public key or npub without exposing raw credentials.
 - Consistent upload scheduling after send, receive, convergence, startup sync,
   catch-up, and recovery operations.
 
@@ -352,6 +371,9 @@ API behavior:
 
 - Require authentication.
 - Return stable JSON schemas with version fields.
+- Treat this as an internal stable API rather than a public platform contract:
+  version responses, keep existing fields stable where practical, and document
+  intentional breaking changes.
 - Support pagination and time-window filtering.
 - Support filters for engine id, account ref, event type, message id, epoch, and
   severity.
@@ -383,6 +405,8 @@ API behavior:
 - Add convergence-run and branch-candidate projections.
 - Add state-delta projections with origin commit links.
 - Add message-flow matrix with observed versus inferred-missing states.
+- Add recipient-expectation projection tables so delivery gaps can be computed
+  quickly.
 - Add UI and API handling for full data auditing, including field-level
   authorization, warnings, exports, and mixed-mode comparisons.
 - Add downloadable group forensic JSON exports derived from the engine-scoped
@@ -442,23 +466,43 @@ Phase 4: Producer Gaps
 - Add TypeScript/client audit-log parity.
 - Validate emitted logs against the committed schema.
 
-## Open Questions
+## Decisions From Initial Review
 
-- What exact definition should Goggles use for a convergence run before Dark
-  Matter emits a stable `convergence_run_id`?
-- Which branch-selection rules need to be visible to explain a decision
-  adequately?
-- Can Dark Matter know expected recipients for a message safely enough to render
-  delivery gaps, or should Goggles only compare engines that uploaded logs?
-- Should Goggles store derived projections in tables, compute them on demand, or
-  materialize JSON snapshots per group?
-- What source metadata should clients provide so investigators can map engine id
-  to human-readable device/account labels?
-- Should full data auditing be switchable while an engine is running, or only
-  after the recorder/session is reopened?
-- What retention, deletion, and access-control policy should apply to audit
-  files containing decrypted message content?
-- What API stability guarantee do downstream automation and analysis agents need?
+- Convergence runs should eventually be keyed by a Dark Matter emitted
+  `convergence_run_id`. Until then, Goggles may infer provisional runs from
+  contiguous convergence and epoch-state rows with the same engine id and group
+  ref, and must label those runs as inferred.
+- All convergence branch-selection rules must be visible. Goggles should show
+  which rules were evaluated, what inputs mattered, what each rule returned, and
+  which rule or rules were decisive.
+- Expected recipients are knowable from group membership for most messages.
+  Normal group messages are expected to reach all other current group members.
+  Welcome messages are special: the welcome is expected only by the added member,
+  while existing members receive the commit that adds that member.
+- Goggles should build relational derived projection tables from raw audit
+  events and optimize them for fast investigation workflows. Cached or
+  materialized JSON responses can be added later where they help performance.
+- Clients should provide app version, platform, upload trigger, stable device id,
+  human-readable device name where available, and the logged-in account public
+  key or npub.
+- Switching into or out of full data auditing should restart or reopen the
+  active recorder session so audit files have an explicit mode boundary.
+- During the internal-testing phase, Goggles should retain uploaded audit files,
+  including full data auditing files. Access is limited to authenticated internal
+  Goggles users. Deletion tools can be added later in the Goggles app.
+- The read API should be a stable internal API. It does not need a public
+  availability guarantee, but it should be versioned, documented, and reliable
+  enough for automation and analysis agents.
+
+## Remaining Open Questions
+
+- What exact schema names and field shapes should Dark Matter use for
+  convergence rule outputs, expected-recipient sets, and full data auditing
+  message contents?
+- Which derived projection tables and indexes are required for the first fast
+  Goggles implementation?
+- What should the eventual deletion UI and retention policy look like after the
+  internal-testing phase?
 
 ## Risks
 
