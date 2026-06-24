@@ -2146,6 +2146,35 @@ class AuditLogIngestionTests(TestCase):
         # The raw upload text is preserved intact as evidence, not dropped.
         self.assertEqual(audit_file.raw_text, body)
 
+    def test_unexpected_ingest_error_group_upload_links_file_to_fallback_group(self):
+        from django.db import DataError
+
+        raw_token, _token = UploadToken.issue("ios test client")
+        body = representative_audit_log()
+
+        with mock.patch.object(
+            ingest_module, "create_events", side_effect=DataError("simulated bind overflow")
+        ):
+            response = self.client.post(
+                reverse("api-group-audit-log-upload", kwargs={"group_slug": "mobile-qa"}),
+                data=body,
+                content_type="application/x-ndjson",
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], AuditFile.STATUS_INVALID)
+        self.assertEqual(response.json()["group"], "mobile-qa")
+        self.assertEqual(response.json()["groups"], ["mobile-qa"])
+
+        audit_file = AuditFile.objects.get()
+        fallback_group = AuditGroup.objects.get(slug="mobile-qa")
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(audit_file.raw_text, body)
+        self.assertEqual(audit_file.events.get().group, fallback_group)
+        self.assertEqual(groups_for_audit_file(audit_file), [fallback_group])
+        self.assertEqual(list(audit_files_for_group(fallback_group)), [audit_file])
+
     def test_all_supported_audit_kind_variants_are_normalized(self):
         raw_token, _token = UploadToken.issue("ios test client")
         cases = [
