@@ -4949,6 +4949,43 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertEqual(payload["schema_version"], "goggles-agent-group-state/v1")
         self.assertEqual(len(payload["events"]), 2)
 
+    @override_settings(GOGGLES_AGENT_EXPORT_MAX_EVENTS=1)
+    def test_group_agent_export_returns_413_when_group_exceeds_event_cap(self):
+        """Oversized groups must fail predictably, not OOM the worker (goggles#109).
+
+        The export header is inherently O(group events) (timeline items,
+        excluded ids, human-action rows), so a group above the configured cap
+        is rejected with a 413 + JSON error before any header is built --
+        rather than spiking a worker's RSS and degrading it for all users.
+        """
+        # representative_audit_log ingests 2 valid events; cap is 1.
+        ingest_body(representative_audit_log())
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 413)
+        # A predictable JSON error body, not a streamed export.
+        self.assertFalse(getattr(response, "streaming", False))
+        payload = json.loads(response.content.decode("utf-8"))
+        self.assertEqual(payload["event_count"], 2)
+        self.assertEqual(payload["max_events"], 1)
+
+    @override_settings(GOGGLES_AGENT_EXPORT_MAX_EVENTS=0)
+    def test_group_agent_export_cap_can_be_disabled(self):
+        """A non-positive cap disables the guard and streams the full export."""
+        ingest_body(representative_audit_log())
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        payload = json.loads(b"".join(response.streaming_content).decode("utf-8"))
+        self.assertEqual(len(payload["events"]), 2)
+
     def test_group_detail_fetches_events_with_bounded_queries(self):
         ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
         ingest_body(representative_audit_log(engine_id=ENGINE_BOB))

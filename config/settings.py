@@ -127,6 +127,16 @@ LOGOUT_REDIRECT_URL = "login"
 GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
 DATA_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 FILE_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
+
+# Upper bound on the number of valid events the agent-state export will build a
+# full header (timeline/actions/messages) for in a single request. The per-event
+# rows are streamed chunk-by-chunk, but the header's timeline items, excluded
+# ids, and human-action rows are inherently O(group events) and are buffered to
+# build the response; without a ceiling a very large group could still spike a
+# worker's RSS and degrade it for all users (goggles#109). When a group exceeds
+# this count the export fails predictably with a 413 instead of OOMing the
+# worker. 0 (or negative) disables the guard.
+GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 250_000))
 # The upload endpoint only ever ingests a single file part, and every part at
 # or under FILE_UPLOAD_MAX_MEMORY_SIZE is buffered in RAM. Capping the number
 # of files at 1 stops a multipart request from accumulating many sub-threshold

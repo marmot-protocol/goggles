@@ -416,13 +416,33 @@ def peeler_attention_event_filter():
 def group_agent_export(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
     audit_files = list(audit_files_for_group(group))
+    # The per-event array is streamed chunk-by-chunk below, but the export's
+    # header (timeline items, excluded ids, human-action rows, summary) is
+    # inherently O(group events) -- it places one entry per event -- and must be
+    # buffered to build the response. Gate on the valid-event count (a single
+    # SQL COUNT, no event rows materialized) so an oversized group fails
+    # predictably with a 413 instead of spiking a worker's RSS and degrading it
+    # for every user. The ceiling is configurable; <= 0 disables the guard
+    # (goggles#109).
+    max_events = settings.GOGGLES_AGENT_EXPORT_MAX_EVENTS
+    if max_events > 0:
+        event_count = valid_events_for_group(group).count()
+        if event_count > max_events:
+            return JsonResponse(
+                {
+                    "error": "group too large for agent-state export",
+                    "event_count": event_count,
+                    "max_events": max_events,
+                },
+                status=413,
+            )
     # Build every section EXCEPT the per-event array from the group's events
     # fetched WITHOUT the raw_context/raw_kind JSON blobs: only the per-event
     # rows need those, and they are streamed separately below so the export
     # never holds every event row (with its raw JSON) resident at once, never
     # builds one giant export dict, and never serializes one giant JSON string
-    # (goggles#109). Completeness is preserved -- there is no cap or truncation;
-    # the full event set is still emitted, just chunk-by-chunk.
+    # (goggles#109). Completeness is preserved -- there is no cap or truncation
+    # below the guard; the full event set is still emitted, just chunk-by-chunk.
     header_events = list(valid_events_for_group(group))
     header = agent_state_export_header_for_group(group, header_events, audit_files)
     pretty = request.GET.get("pretty", "").lower() in {"1", "true", "yes"}

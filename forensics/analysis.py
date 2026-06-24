@@ -1024,9 +1024,12 @@ def agent_state_export_header_for_group(group, events, audit_files):
     ``agent_event_rows_for_group`` so they are never all resident at once
     (goggles#109).
 
-    The aggregate sections are bounded by engine/message/action cardinality,
-    not raw event count, so materializing the lean event list to build them is
-    the same memory profile as the other bounded group-scoped views.
+    The aggregate sections place one entry per event (timeline ``items``,
+    ``excluded`` ids, and human-action rows), so the header is O(group events)
+    in size. That is inherent to the export's completeness contract, so the
+    view gates the endpoint on the valid-event count and returns 413 for
+    oversized groups (``GOGGLES_AGENT_EXPORT_MAX_EVENTS``) rather than letting
+    an arbitrarily large group spike a worker's RSS (goggles#109).
     """
     ordered = sorted_timeline_events(events)
     timeline = timeline_payload_for_group(group, ordered, audit_files)
