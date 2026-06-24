@@ -1,0 +1,474 @@
+# Goggles Audit Debugging Platform PRD
+
+Status: Draft  
+Date: 2026-06-24  
+Audience: Dark Matter, Goggles, and client application engineers
+
+## Summary
+
+Goggles should evolve from a generic audit-log event browser into a forensic
+debugging workstation for Marmot group behavior. The redesigned product should
+help investigators answer three high-value questions quickly:
+
+1. What message traffic did each engine send, publish, receive from transport,
+   process, defer, or fail?
+2. What did the convergence state machine see when it quiesced, which branch
+   won, and why?
+3. Once a branch or commit won, how did the underlying MLS-authenticated group
+   state actually change?
+
+The audit files are sensitive forensic artifacts. Goggles must continue to
+preserve raw uploads, raw JSONL lines, source metadata, and line-level evidence
+while adding derived views, APIs, and normalized projections that make incidents
+debuggable without manually reading every row. The audit pipeline should also
+support an explicit data-mode toggle so routine logs keep today's obfuscated
+sensitive data while opt-in forensic sessions can include full decrypted message
+content and transport wire identifiers.
+
+## Background
+
+Dark Matter audit logging currently writes sensitive JSONL records using
+`schema_version = "marmot-forensics-audit/v1"`. Goggles ingests those files,
+preserves exact raw text, normalizes common fields into database columns, and
+renders group-level dashboards.
+
+The latest Dark Matter audit changes add richer group and epoch breadcrumbs:
+
+- `epoch_state_changed` records engine epoch-state transitions such as stable,
+  pending publish, recovering, and unrecoverable.
+- `group_state_changed` records MLS-authenticated group-state deltas such as
+  membership, admin, profile, avatar, and message-retention changes.
+- `convergence_decision.error_kinds` explains selector failures such as missing
+  retained anchors.
+- Rows without explicit user intent are now stamped with
+  `context.human_action.origin = "system"` so downstream tools can keep
+  attribution on every row.
+
+These changes are necessary but not sufficient. Goggles needs new product
+surfaces, derived data models, and programmatic APIs. Dark Matter and client
+libraries may also need additional audit events so Goggles can explain branch
+selection, transport gaps, and client/device behavior with confidence.
+
+## Goals
+
+- Make message delivery and processing visible across engines.
+- Make convergence decisions explainable, including branch candidates, rules,
+  eligibility, rejection reasons, and selected winners.
+- Make MLS group-state evolution visible as domain events, not raw JSON rows.
+- Preserve chain-of-custody for every derived object by linking back to raw file,
+  line number, line hash, and raw event JSON.
+- Support explicit audit data modes: default obfuscated sensitive data and
+  opt-in full data auditing.
+- Provide stable APIs for programmatic readout by group, account, engine, message,
+  convergence run, and evidence line.
+- Support future Rust, Swift, Kotlin, and TypeScript clients emitting compatible
+  audit logs.
+
+## Non-Goals
+
+- Do not turn audit logs into privacy-safe telemetry. They remain sensitive
+  forensic data.
+- Do not store bearer tokens, raw upload request bodies in logs, or any upload
+  authorization secret in derived views.
+- Do not log private keys, bearer tokens, upload tokens, authorization headers,
+  or client credentials in any audit data mode.
+- Do not add encrypted ciphertext or raw MLS bytes to full data auditing unless
+  there is a separate product and security decision. The proposed full mode is
+  for decrypted message content and transport identifiers.
+- Do not require perfect certainty for inferred missing transport arrivals.
+  Goggles should distinguish observed facts from cross-engine inference.
+- Do not remove raw event browsing. The raw evidence path remains required even
+  after higher-level views exist.
+- Do not split recorder output into per-group files. Keep one append-only audit
+  file per engine, and let Goggles provide group-level filtering, APIs, and
+  JSON exports.
+
+## Audit Data Modes
+
+The audit recorder should expose a two-option data-mode setting. The selected
+mode must be stored in Dark Matter settings, stamped into recorder or session
+context, visible in Goggles, included in API responses, and auditable when it
+changes.
+
+### Obfuscated Sensitive Data
+
+This is the default and should match the current safety posture:
+
+- No decrypted message content.
+- No encrypted ciphertext or raw MLS bytes.
+- Payload length and SHA-256 digest instead of payload bytes.
+- Member refs or otherwise obfuscated member public keys.
+- Value length and value digest for profile, avatar, retention, and similar
+  state changes.
+- Transport and message identifiers only where they are already part of the
+  current obfuscated audit contract, with clear marking that they remain
+  sensitive forensic metadata.
+
+This mode should be sufficient for routine debugging, convergence analysis, and
+delivery tracing where payload contents are not required.
+
+### Full Data Auditing
+
+This mode is explicit opt-in and should be treated as a substantially more
+sensitive forensic capture:
+
+- Include decrypted application or message content after successful MLS and
+  application-payload decoding.
+- Include the message author's full hex public key, account id, member id, or
+  other canonical author identifier when available.
+- Include decoded inner application event fields where applicable, such as
+  `kind`, `content`, `pubkey`, `tags`, client message id, reply/thread
+  references, attachments metadata, and application-level timestamps.
+- Include actual transport or on-wire identifiers for Nostr kind 445 group
+  messages and other transport envelopes, such as Nostr event id, event kind,
+  event pubkey, relay URL, subscription id, transport group id, gift-wrap or
+  welcome ids, and publish result ids where available.
+- Continue excluding bearer tokens, upload tokens, private keys, auth headers,
+  cookies, and any other credential material.
+
+Full data auditing should be off by default, require an explicit user or admin
+action to enable, present prominent warnings in clients and Goggles, and produce
+mode-change audit rows. Dark Matter should define whether mode changes take
+effect immediately on the active recorder or only after engine restart/session
+reopen. Goggles should make mixed-mode evidence obvious when comparing engines,
+because one engine may have plaintext evidence while another only has digests.
+
+## Users
+
+- Incident investigator: needs to compare multiple devices and identify where a
+  group diverged.
+- Engine developer: needs to understand convergence, branch selection, pending
+  publish, fork recovery, and MLS state transitions.
+- Client engineer: needs to determine whether app/client behavior produced,
+  omitted, delayed, or failed upload and transport events.
+- Automation or analysis agent: needs structured API output suitable for scripts,
+  issue comments, reports, and regression analysis.
+
+## Core Investigation Views
+
+### 1. Transport Message Flow
+
+Question: What actually moved through transport, and where did it stop?
+
+The view should organize evidence by message id, commit id, welcome id, or
+application-message id. Each row is one message-like artifact. Each column is an
+engine/account-device. Cells should summarize the observed lifecycle:
+
+- user or system intent created;
+- outbound message generated;
+- publish attempted;
+- relay or endpoint acknowledged;
+- received from transport adapter;
+- peeled or decrypted;
+- buffered, processed, stale, retryable, or failed;
+- applied to group state;
+- missing from an engine where comparable logs suggest it should have appeared.
+
+Important distinction:
+
+- "Arrived from transport" is a fact only when the receiving engine logs an
+  inbound transport event.
+- "Did not arrive from transport" is usually an inference from the absence of
+  a row in an engine's observation window.
+- To turn non-arrival into fact, the system may need relay/server-side receipts
+  or transport adapter delivery logs.
+
+### 2. Convergence State Machine
+
+Question: What did the convergence engine see, what did it choose, and why?
+
+The view should organize events by convergence run. A run begins when an engine
+starts quiescing or evaluating stored candidates for a group, and ends when it
+selects a branch, blocks, fails, or marks the group unrecoverable.
+
+Each run should show:
+
+- run id and engine id;
+- group ref and wall-clock window;
+- starting stable epoch and retained-anchor horizon;
+- candidate branch list;
+- branch fork epoch, tip epoch, commit ids, and state digest;
+- eligibility result for each branch;
+- rejection reasons and selector errors;
+- scoring, weighting, or rule decisions where available;
+- selected branch id and selected tip epoch;
+- resulting epoch-state transition;
+- raw evidence links for every row.
+
+Current Dark Matter data can show high-level decisions through
+`convergence_decision`, `error_kinds`, and `epoch_state_changed`. It likely does
+not yet expose enough candidate-level detail to fully explain branch selection.
+
+### 3. MLS and Group State Evolution
+
+Question: After a commit or branch won, did the MLS-authenticated group state
+change correctly?
+
+The view should organize durable state changes by epoch and origin commit:
+
+- member added, removed, or left;
+- admin added or removed;
+- group renamed;
+- group avatar changed;
+- message retention changed;
+- actor member ref when attributable;
+- subject member ref when applicable;
+- origin commit id when attributable;
+- value digest and value length for value-bearing changes;
+- previous and new engine epoch-state.
+
+This should render as a human-readable state history while retaining hashed or
+redacted identifiers. The view must make it easy to jump from a state delta to
+the commit/message trace and raw JSONL evidence that produced it.
+
+## Proposed Information Architecture
+
+Goggles should keep the group as the primary workspace, but replace the current
+event-first mental model with derived forensic objects.
+
+Group workspace tabs:
+
+- Overview: health summary, engines, files, latest activity, current alerts.
+- Messages: transport and processing matrix by message id.
+- Convergence: convergence runs, branch candidates, decision reasons, outcomes.
+- State: MLS-authenticated group-state changes and epoch-state transitions.
+- Evidence: raw files, raw lines, invalid lines, duplicates, schema versions.
+- Exports: API links, downloadable JSON exports, and analysis-agent payloads.
+
+The raw audit event list should remain available, but it should be an evidence
+drilldown rather than the main workflow.
+
+## Derived Data Model
+
+Goggles should retain raw `AuditFile` and `AuditEvent` records, then build
+derived projections. These can be tables, materialized JSON projections, or
+computed API responses depending on performance.
+
+Recommended derived objects:
+
+- `SourceFile`: upload metadata, file hash, source labels, raw text preservation.
+- `Engine`: account ref, engine id, source labels, first and last activity.
+- `MessageTrace`: cross-engine lifecycle for a message, commit, welcome, or app
+  payload carrier.
+- `EngineObservation`: one engine's observed lifecycle for one message.
+- `TransportObservation`: publish attempt/outcome or inbound transport arrival.
+- `ConvergenceRun`: one canonicalization/quiescing/selection pass.
+- `BranchCandidate`: candidate branch shape, eligibility, scoring, and outcome.
+- `GroupStateDelta`: authenticated durable group-state change.
+- `EpochStateTransition`: engine epoch-state state-machine transition.
+- `EvidenceRef`: raw file id, line number, line hash, raw kind type, and raw JSON.
+
+Every derived object must carry evidence references.
+
+## Current Goggles Changes Needed
+
+Near-term support for the latest Dark Matter master should include:
+
+- Normalize `epoch_state_changed`.
+- Normalize `group_state_changed`.
+- Normalize `convergence_decision.error_kinds`.
+- Normalize and display audit data mode from recorder/session context and any
+  per-row stamps.
+- Separate real app/user actions from system-stamped attribution rows.
+- Update action counts so the Actions tab does not become "every audit row."
+- Add clear full-data badges, warnings, and access checks anywhere decrypted
+  message content or full transport identifiers can appear.
+- Add state/convergence visibility to timeline and integrity surfaces.
+- Update fixtures and parser tests for the current JSON Schema.
+- Include new normalized fields in agent export and API output.
+
+## Dark Matter Audit Data Gaps
+
+The latest audit changes are a strong foundation, but Goggles probably needs
+additional Dark Matter events for complete explainability.
+
+Message and transport gaps:
+
+- Explicit inbound transport receipt rows before engine processing, with delivery
+  plane, relay URL, subscription id, envelope kind, payload digest, and msg id.
+- Clear distinction between adapter receipt, peel/decrypt, MLS processing, and
+  group-state application.
+- Publish attempt and outcome rows that can be correlated to expected recipients
+  or delivery planes where the protocol can know that safely.
+- Optional relay/server-side receipts if "did not arrive" must become factual
+  rather than inferred.
+
+Audit data mode gaps:
+
+- Extend `AuditLogSettings` beyond `enabled` to include a stable data-mode enum,
+  initially `obfuscated_sensitive_data` and `full_data`.
+- Stamp the selected data mode into audit file/session context and make mode
+  changes auditable.
+- Add schema fields for decrypted message content, decoded application event
+  fields, and full author identifiers in full data mode.
+- Add schema fields for transport/on-wire ids, including Nostr kind 445 event
+  ids and equivalent identifiers for other transport message types.
+- Add producer tests proving obfuscated mode excludes plaintext, ciphertext, raw
+  MLS bytes, and full author keys, while full mode includes only the intended
+  decrypted content and transport identifiers.
+
+Convergence gaps:
+
+- A stable `convergence_run_id` on all rows emitted during one convergence pass.
+- Quiescing lifecycle rows: started, waiting, evaluating, selected, blocked,
+  applied, failed, or unrecoverable.
+- Candidate branch rows with branch id, fork epoch, tip epoch, commit ids,
+  commit count, state digest, retained-anchor status, and last input time.
+- Per-candidate eligibility and rejection reasons.
+- Scoring, weighting, or rule-output rows when the selector compares candidates.
+- Selected winner row that names the selected branch and the losing branches.
+- Applied branch outcome rows that link selection to `group_state_changed`.
+
+Client and library gaps:
+
+- TypeScript library support for the same audit-log contract.
+- TypeScript, Swift, Kotlin, and Rust client controls for selecting the audit
+  data mode, including warnings for full data auditing.
+- Client source metadata that identifies app version, platform, account/device
+  labels, and upload trigger without exposing raw credentials.
+- Consistent upload scheduling after send, receive, convergence, startup sync,
+  catch-up, and recovery operations.
+
+## API Requirements
+
+APIs should be optimized for forensic readout, not only raw event access.
+
+Initial endpoints:
+
+- `GET /api/v1/groups/`
+- `GET /api/v1/groups/{group_slug}/`
+- `GET /api/v1/groups/{group_slug}/messages/`
+- `GET /api/v1/groups/{group_slug}/messages/{msg_id}/`
+- `GET /api/v1/groups/{group_slug}/convergence-runs/`
+- `GET /api/v1/groups/{group_slug}/convergence-runs/{run_id}/`
+- `GET /api/v1/groups/{group_slug}/state-deltas/`
+- `GET /api/v1/groups/{group_slug}/engines/`
+- `GET /api/v1/groups/{group_slug}/events/`
+- `GET /api/v1/events/{event_id}/evidence/`
+- `GET /api/v1/accounts/{account_ref}/groups/`
+- `GET /api/v1/engines/{engine_id}/groups/`
+
+API behavior:
+
+- Require authentication.
+- Return stable JSON schemas with version fields.
+- Support pagination and time-window filtering.
+- Support filters for engine id, account ref, event type, message id, epoch, and
+  severity.
+- Support filters for audit data mode and a response-level classification that
+  tells clients whether decrypted content may be present.
+- Include evidence refs on every derived object.
+- Exclude bearer tokens, upload secrets, source IPs, and user agents unless an
+  explicit administrative evidence endpoint is introduced.
+- Require elevated authorization for endpoints or fields that expose full data
+  auditing content, including decrypted message content, full author public keys,
+  and transport wire identifiers.
+
+## Functional Requirements
+
+### P0
+
+- Ingest and normalize the latest Dark Matter audit fields.
+- Preserve raw lines and evidence refs exactly as today.
+- Define the audit data-mode schema and display mode metadata in raw and derived
+  views.
+- Distinguish system attribution from real app/user actions.
+- Provide API readout for group summary, raw events, message traces, state
+  deltas, and evidence refs.
+- Add tests for the current schema variants and parser behavior.
+
+### P1
+
+- Redesign the group workspace around Messages, Convergence, State, and Evidence.
+- Add convergence-run and branch-candidate projections.
+- Add state-delta projections with origin commit links.
+- Add message-flow matrix with observed versus inferred-missing states.
+- Add UI and API handling for full data auditing, including field-level
+  authorization, warnings, exports, and mixed-mode comparisons.
+- Add downloadable group forensic JSON exports derived from the engine-scoped
+  source files.
+
+### P2
+
+- Add branch graph visualization.
+- Add relay/server receipt integration if available.
+- Add cross-group/account-level investigation views.
+- Add saved investigations, annotations, and shareable internal report links.
+
+## Success Metrics
+
+- An investigator can answer "did this message arrive and process on each
+  engine?" without opening raw JSON.
+- An engine developer can answer "why did this branch win?" from the convergence
+  view, with evidence links.
+- A client engineer can identify missing transport receipt, publish failure,
+  deferred peel, or MLS processing failure from one message trace.
+- Every rendered conclusion links back to raw upload evidence.
+- Programmatic API output can reproduce the same conclusions shown in the UI.
+
+## Rollout Plan
+
+Phase 0: Alignment
+
+- Review this PRD with Dark Matter, Goggles, and client owners.
+- Turn P0 items into issues.
+- Decide which Dark Matter schema gaps are required before UI redesign.
+
+Phase 1: Current Schema Support
+
+- Add normalized fields and migrations for the latest audit events.
+- Add audit data-mode normalization and display for current and future rows.
+- Update parser tests and fixtures.
+- Fix system-action counting.
+- Extend agent export with the new fields.
+
+Phase 2: API and Projections
+
+- Add derived message, state, and convergence projections.
+- Add read APIs with stable schemas and evidence refs.
+- Keep raw event endpoints as a fallback.
+
+Phase 3: UI Redesign
+
+- Build the new group workspace tabs.
+- Prioritize message matrix, convergence runs, and state deltas.
+- Keep raw evidence drilldowns available from every derived object.
+
+Phase 4: Producer Gaps
+
+- Add Dark Matter audit settings and schema support for obfuscated versus full
+  data auditing.
+- Add missing Dark Matter audit events for convergence branch explainability.
+- Add TypeScript/client audit-log parity.
+- Validate emitted logs against the committed schema.
+
+## Open Questions
+
+- What exact definition should Goggles use for a convergence run before Dark
+  Matter emits a stable `convergence_run_id`?
+- Which branch-selection rules need to be visible to explain a decision
+  adequately?
+- Can Dark Matter know expected recipients for a message safely enough to render
+  delivery gaps, or should Goggles only compare engines that uploaded logs?
+- Should Goggles store derived projections in tables, compute them on demand, or
+  materialize JSON snapshots per group?
+- What source metadata should clients provide so investigators can map engine id
+  to human-readable device/account labels?
+- Should full data auditing be switchable while an engine is running, or only
+  after the recorder/session is reopened?
+- What retention, deletion, and access-control policy should apply to audit
+  files containing decrypted message content?
+- What API stability guarantee do downstream automation and analysis agents need?
+
+## Risks
+
+- Inferred missing transport events may be mistaken for proven non-delivery.
+- System-stamped audit rows may overwhelm human-action views if not separated.
+- Branch explainability will be incomplete unless Dark Matter emits candidate
+  details, not just final decisions.
+- Rich APIs may accidentally expose sensitive forensic data too broadly without
+  tight authentication and careful response design.
+- Full data auditing materially increases sensitivity because audit files may
+  contain decrypted user messages, full author public keys, and transport ids.
+- Mixed-mode uploads may make cross-engine comparisons confusing unless Goggles
+  clearly labels which engines have plaintext versus digest-only evidence.
