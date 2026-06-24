@@ -82,6 +82,10 @@ selection, transport gaps, and client/device behavior with confidence.
 - Do not split recorder output into per-group files. Keep one append-only audit
   file per engine, and let Goggles provide group-level filtering, APIs, and
   JSON exports.
+- Do not migrate or preserve the current Goggles local database contents. This
+  redesign can start from a reset database and simpler migrations.
+- Do not keep the all-events timeline as a primary investigation surface. It is
+  too broad for the new debugging workflow.
 
 ## Audit Data Modes
 
@@ -231,19 +235,25 @@ the commit/message trace and raw JSONL evidence that produced it.
 ## Proposed Information Architecture
 
 Goggles should keep the group as the primary workspace, but replace the current
-event-first mental model with derived forensic objects.
+event-first mental model with derived forensic objects. The all-events timeline
+should be removed as a primary tab. Raw events remain available through Evidence
+drilldowns, but the main workflow should be split by investigation concern.
 
 Group workspace tabs:
 
-- Overview: health summary, engines, files, latest activity, current alerts.
-- Messages: transport and processing matrix by message id.
+- Overview: health summary, engines, audit data modes, latest activity, and
+  current alerts.
+- Delivery: message, commit, and welcome lifecycle matrix by artifact id.
+- Network: transport receipts, publish attempts, relay acknowledgements,
+  failures, and wire ids.
 - Convergence: convergence runs, branch candidates, decision reasons, outcomes.
 - State: MLS-authenticated group-state changes and epoch-state transitions.
 - Evidence: raw files, raw lines, invalid lines, duplicates, schema versions.
 - Exports: API links, downloadable JSON exports, and analysis-agent payloads.
 
-The raw audit event list should remain available, but it should be an evidence
-drilldown rather than the main workflow.
+The Evidence tab can show raw lines and raw event JSON, but should not become a
+global chronological event feed. Every derived object should deep-link to the
+specific evidence lines that support it.
 
 ## Derived Data Model
 
@@ -257,9 +267,8 @@ Recommended derived objects:
 
 - `SourceFile`: upload metadata, file hash, source labels, raw text preservation.
 - `Engine`: account ref, engine id, source labels, first and last activity.
-- `MessageTrace`: cross-engine lifecycle for a message, commit, welcome, or app
-  payload carrier.
-- `EngineObservation`: one engine's observed lifecycle for one message.
+- `MessageArtifact`: canonical message, commit, welcome, or app payload carrier.
+- `EngineMessageObservation`: one engine's observed lifecycle for one artifact.
 - `TransportObservation`: publish attempt/outcome or inbound transport arrival.
 - `RecipientExpectation`: expected recipient set for a group message, including
   welcome-message exceptions.
@@ -273,20 +282,23 @@ Every derived object must carry evidence references.
 
 ## Current Goggles Changes Needed
 
-Near-term support for the latest Dark Matter master should include:
+Near-term support should assume a greenfield database reset and V2-first
+projection model:
 
-- Normalize `epoch_state_changed`.
-- Normalize `group_state_changed`.
-- Normalize `convergence_decision.error_kinds`.
-- Normalize and display audit data mode from recorder/session context and any
-  per-row stamps.
+- Accept V1 and V2 raw event rows, but make V2 the target normalized contract.
+- Add a compact raw-evidence layer for files, lines, schema version, event type,
+  refs, audit data mode, and evidence hashes.
+- Add relational projection tables for Delivery, Network, Convergence, and
+  State instead of expanding the single `AuditEvent` table indefinitely.
+- Normalize and display audit data mode from top-level rows, recorder/session
+  context, and source metadata.
 - Separate real app/user actions from system-stamped attribution rows.
-- Update action counts so the Actions tab does not become "every audit row."
+- Remove the all-events timeline and replace it with smaller purpose-built
+  group tabs.
 - Add clear full-data badges, warnings, and access checks anywhere decrypted
   message content or full transport identifiers can appear.
-- Add state/convergence visibility to timeline and integrity surfaces.
-- Update fixtures and parser tests for the current JSON Schema.
-- Include new normalized fields in agent export and API output.
+- Update fixtures and parser tests for the V2 JSON Schema.
+- Include derived projections in agent export and API output.
 
 ## Dark Matter Audit Data Gaps
 
@@ -359,13 +371,13 @@ Initial endpoints:
 
 - `GET /api/v1/groups/`
 - `GET /api/v1/groups/{group_slug}/`
-- `GET /api/v1/groups/{group_slug}/messages/`
-- `GET /api/v1/groups/{group_slug}/messages/{msg_id}/`
+- `GET /api/v1/groups/{group_slug}/delivery/`
+- `GET /api/v1/groups/{group_slug}/delivery/{artifact_id}/`
+- `GET /api/v1/groups/{group_slug}/network/`
 - `GET /api/v1/groups/{group_slug}/convergence-runs/`
 - `GET /api/v1/groups/{group_slug}/convergence-runs/{run_id}/`
 - `GET /api/v1/groups/{group_slug}/state-deltas/`
 - `GET /api/v1/groups/{group_slug}/engines/`
-- `GET /api/v1/groups/{group_slug}/events/`
 - `GET /api/v1/events/{event_id}/evidence/`
 - `GET /api/v1/accounts/{account_ref}/groups/`
 - `GET /api/v1/engines/{engine_id}/groups/`
@@ -393,23 +405,28 @@ API behavior:
 
 ### P0
 
-- Ingest and normalize the latest Dark Matter audit fields.
-- Preserve raw lines and evidence refs exactly as today.
-- Define the audit data-mode schema and display mode metadata in raw and derived
-  views.
-- Distinguish system attribution from real app/user actions.
-- Provide API readout for group summary, raw events, message traces, state
-  deltas, and evidence refs.
-- Add tests for the current schema variants and parser behavior.
+- Reset the Goggles database model around raw evidence plus derived projections.
+- Ingest V1 and V2 raw event rows while preserving raw lines and evidence refs.
+- Define and store audit data-mode metadata in raw and derived views.
+- Add Delivery and Network projection tables from V2 message, recipient, publish,
+  receive, ingest, peel, and decode rows.
+- Add Convergence projection tables from run, candidate, score, and rule-trace
+  rows.
+- Add State projection tables from group-state and epoch-state rows.
+- Remove the all-events timeline tab from the group workspace.
+- Provide API readout for group summary, delivery artifacts, network
+  observations, convergence runs, state deltas, and evidence refs.
+- Add tests for V1/V2 parser behavior and V2 projection building.
 
 ### P1
 
-- Redesign the group workspace around Messages, Convergence, State, and Evidence.
-- Add convergence-run and branch-candidate projections.
-- Add state-delta projections with origin commit links.
-- Add message-flow matrix with observed versus inferred-missing states.
-- Add recipient-expectation projection tables so delivery gaps can be computed
-  quickly.
+- Redesign the group workspace around Overview, Delivery, Network, Convergence,
+  State, Evidence, and Exports.
+- Add Delivery matrix with observed versus inferred-missing states.
+- Add Network view with transport receipts, relay acknowledgements, publish
+  failures, and wire ids.
+- Add Convergence run view with branch candidates, scores, and decisive rules.
+- Add State view with state-delta history and origin commit links.
 - Add UI and API handling for full data auditing, including field-level
   authorization, warnings, exports, and mixed-mode comparisons.
 - Add downloadable group forensic JSON exports derived from the engine-scoped
@@ -441,24 +458,28 @@ Phase 0: Alignment
 - Turn P0 items into issues.
 - Decide which Dark Matter schema gaps are required before UI redesign.
 
-Phase 1: Current Schema Support
+Phase 1: Greenfield Storage And Ingest
 
-- Add normalized fields and migrations for the latest audit events.
-- Add audit data-mode normalization and display for current and future rows.
-- Update parser tests and fixtures.
-- Fix system-action counting.
-- Extend agent export with the new fields.
+- Drop/reset the current Goggles database in development and test environments.
+- Replace incremental migration concerns with clean migrations for raw evidence
+  and projection tables.
+- Accept V1 and V2 raw rows, preserving raw evidence in both cases.
+- Store schema version, audit data mode, source metadata, engine/account/group
+  refs, and event type in the raw evidence layer.
+- Add parser tests and fixtures for V1 and V2.
 
 Phase 2: API and Projections
 
-- Add derived message, state, and convergence projections.
+- Add Delivery, Network, Convergence, and State projection builders.
 - Add read APIs with stable schemas and evidence refs.
-- Keep raw event endpoints as a fallback.
+- Add a rebuild command that can drop and recreate derived projections from raw
+  evidence.
 
 Phase 3: UI Redesign
 
-- Build the new group workspace tabs.
-- Prioritize message matrix, convergence runs, and state deltas.
+- Remove the all-events timeline tab.
+- Build Overview, Delivery, Network, Convergence, State, Evidence, and Exports
+  tabs.
 - Keep raw evidence drilldowns available from every derived object.
 
 Phase 4: Producer Gaps
@@ -485,6 +506,11 @@ Phase 4: Producer Gaps
 - Goggles should build relational derived projection tables from raw audit
   events and optimize them for fast investigation workflows. Cached or
   materialized JSON responses can be added later where they help performance.
+- Goggles does not need to migrate or preserve current local database contents.
+  The redesign can start with a database reset and clean migrations.
+- The all-events timeline should be removed as a primary UI surface. The new
+  group workspace should use smaller tabs for Delivery, Network, Convergence,
+  State, Evidence, and Exports.
 - Clients should provide app version, platform, upload trigger, stable device id,
   human-readable device name where available, and the logged-in account public
   key or npub.
