@@ -137,6 +137,14 @@ active recorder session so the audit file has an explicit mode boundary. Goggles
 should make mixed-mode evidence obvious when comparing engines, because one
 engine may have plaintext evidence while another only has digests.
 
+Full data auditing must not be enabled unless the deployment has an explicit
+retention, deletion, and access-control policy in place. For the current
+internal-testing deployment, that policy is: retain uploaded audit evidence until
+an authenticated operator runs the documented audit-data purge command, allow
+read access only to authenticated internal Goggles users, and allow uploads to be
+paused during cutovers or incidents. Broader deployments must define stricter
+object-level access rules before full-data capture is enabled.
+
 ## Users
 
 - Incident investigator: needs to compare multiple devices and identify where a
@@ -276,9 +284,13 @@ Recommended derived objects:
 - `BranchCandidate`: candidate branch shape, eligibility, scoring, and outcome.
 - `GroupStateDelta`: authenticated durable group-state change.
 - `EpochStateTransition`: engine epoch-state state-machine transition.
-- `EvidenceRef`: raw file id, line number, line hash, raw kind type, and raw JSON.
+- `EvidenceRef`: raw file id, line number, line hash, raw kind type, and an API
+  path for explicit evidence retrieval. It must not embed raw JSON or raw JSONL
+  bodies in every derived object.
 
-Every derived object must carry evidence references.
+Every derived object must carry evidence references. Raw event JSON and raw line
+content should be available only through a dedicated evidence retrieval flow with
+explicit authorization and auditability.
 
 ## Current Goggles Changes Needed
 
@@ -307,6 +319,8 @@ additional Dark Matter events for complete explainability.
 
 A first draft of the proposed V2 event-line schema is in
 [`docs/schemas/audit-log-event.v2.schema.json`](schemas/audit-log-event.v2.schema.json).
+The Goggles internal read API contract is documented in
+[`docs/api-v1.md`](api-v1.md).
 
 Message and transport gaps:
 
@@ -373,6 +387,7 @@ Initial endpoints:
 - `GET /api/v1/groups/{group_slug}/`
 - `GET /api/v1/groups/{group_slug}/delivery/`
 - `GET /api/v1/groups/{group_slug}/delivery/{artifact_id}/`
+- `GET /api/v1/messages/{message_id}/`
 - `GET /api/v1/groups/{group_slug}/network/`
 - `GET /api/v1/groups/{group_slug}/convergence-runs/`
 - `GET /api/v1/groups/{group_slug}/convergence-runs/{run_id}/`
@@ -400,6 +415,17 @@ API behavior:
 - Require elevated authorization for endpoints or fields that expose full data
   auditing content, including decrypted message content, full author public keys,
   and transport wire identifiers.
+- Enforce object-level authorization before returning group, account, engine,
+  message, convergence-run, report, or evidence data. The first internal
+  deployment may map all authenticated Goggles users to one shared tenant, but
+  every endpoint should still pass through a scope check so future tenant,
+  account, group, and engine boundaries are explicit.
+- Avoid cross-scope enumeration. Unauthorized and unknown resources should use
+  the same not-found style behavior unless an administrative endpoint
+  intentionally exposes existence metadata.
+- Default baseline responses to least-privilege summaries. Decrypted message
+  content, full author identifiers, transport wire identifiers, and raw evidence
+  bodies should require the explicit full-data/evidence authorization path.
 
 ## Functional Requirements
 
@@ -517,11 +543,26 @@ Phase 4: Producer Gaps
 - Switching into or out of full data auditing should restart or reopen the
   active recorder session so audit files have an explicit mode boundary.
 - During the internal-testing phase, Goggles should retain uploaded audit files,
-  including full data auditing files. Access is limited to authenticated internal
-  Goggles users. Deletion tools can be added later in the Goggles app.
+  including full data auditing files, until an authenticated operator explicitly
+  deletes forensic data with the deployment purge command. Access is limited to
+  authenticated internal Goggles users, and audit uploads can be paused globally
+  during cutovers or incidents.
 - The read API should be a stable internal API. It does not need a public
   availability guarantee, but it should be versioned, documented, and reliable
   enough for automation and analysis agents.
+- V2 `msg_id`, commit ids, and origin commit ids are canonical Marmot message
+  artifact ids. For MLS content-bearing artifacts, they are 64-hex SHA-256
+  digests of the MLS content bytes. Transport event ids, Nostr ids, gift-wrap
+  ids, and welcome envelope ids must be recorded in explicit transport fields
+  instead of overloading `msg_id`.
+- Welcome transport identifiers must use explicit field names such as
+  `welcome_nostr_event_id`, `welcome_rumor_event_id`, and
+  `welcome_key_package_tag` so investigators know which layer produced the id.
+- Membership removals must not be inferred from `change_kind` alone.
+  `member_removed` with an admin actor represents an admin removal, while
+  `member_removed` with `membership_change_source = "convergence"` and no actor
+  represents a convergence-resolved departure and must not be rendered as an
+  admin action.
 
 ## Remaining Open Questions
 
@@ -530,8 +571,8 @@ Phase 4: Producer Gaps
   message contents?
 - Which derived projection tables and indexes are required for the first fast
   Goggles implementation?
-- What should the eventual deletion UI and retention policy look like after the
-  internal-testing phase?
+- What operator-facing deletion UI should complement the deployment purge
+  command after the internal-testing phase?
 
 ## Risks
 
