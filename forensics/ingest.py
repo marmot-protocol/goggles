@@ -759,8 +759,13 @@ def normalize_context(
             normalized["context_human_action"] = human_action
             copy_human_action_fields(human_action, normalized, errors)
     for field in ("transport", "engine", "group", "convergence", "source"):
-        if field in context and context[field] is not None:
-            normalized[f"context_{field}"] = context[field]
+        value = context.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"context.{field} must be an object when present")
+            continue
+        normalized[f"context_{field}"] = value
 
 
 def create_events(

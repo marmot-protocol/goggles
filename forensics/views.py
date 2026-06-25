@@ -220,6 +220,7 @@ def group_summary_context(group: AuditGroup) -> dict:
     delivery_count = DeliveryArtifact.objects.filter(group=group).count()
     network_count = NetworkObservation.objects.filter(group=group).count()
     convergence_count = ConvergenceRun.objects.filter(group=group).count()
+    raw_message_count = event_stats["message_count"] or 0
     state_count = (
         StateDelta.objects.filter(group=group).count()
         + EpochStateTransition.objects.filter(group=group).count()
@@ -231,7 +232,9 @@ def group_summary_context(group: AuditGroup) -> dict:
             "invalid_event_count": invalid_event_count,
             "engine_count": engine_count,
             "group_count": event_stats["group_count"],
-            "message_count": delivery_count or event_stats["message_count"],
+            "message_count": raw_message_count,
+            "raw_message_count": raw_message_count,
+            "delivery_count": delivery_count,
             "network_count": network_count,
             "convergence_count": convergence_count,
             "state_count": state_count,
@@ -538,6 +541,7 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
             .prefetch_related("candidates", "rule_evaluations", "evidence_events")
             .order_by("started_at_ms", "engine_id", "run_id")
         )
+        attach_decisive_rules(runs)
         return {
             "group": group,
             "runs": runs,
@@ -627,6 +631,11 @@ def investigation_group_rows(queryset, *, subject_filter: Q) -> list[AuditGroup]
 def limited_tab_events(queryset, limit: int = GROUP_DETAIL_TAB_EVENT_LIMIT):
     rows = list(queryset[: limit + 1])
     return rows[:limit], len(rows) > limit
+
+
+def attach_decisive_rules(runs: list[ConvergenceRun]) -> None:
+    for run in runs:
+        run.decisive_rules = [rule for rule in run.rule_evaluations.all() if rule.decisive]
 
 
 def recent_evidence_rows(group: AuditGroup) -> list[dict]:

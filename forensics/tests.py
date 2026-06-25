@@ -2023,6 +2023,32 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(event.msg_id, "")
         self.assertEqual(event.raw_event["kind"]["msg_id"], "abcd")
 
+    def test_context_subobjects_must_be_objects_when_present(self):
+        raw_token, _token = UploadToken.issue("v2 strict context")
+        body = jsonl(
+            audit_event_v2(
+                0,
+                context={"source": "alice laptop", "convergence": ["run-1"]},
+                kind={"type": "recorder_started", "recorder": "darkmatter"},
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.json()["error"]
+        self.assertIn("context.source must be an object when present", error)
+        self.assertIn("context.convergence must be an object when present", error)
+        event = AuditEvent.objects.get()
+        self.assertEqual(event.context_source, {})
+        self.assertEqual(event.context_convergence, {})
+        self.assertEqual(event.raw_context["source"], "alice laptop")
+
     def test_v2_state_delta_preserves_membership_change_source(self):
         raw_token, _token = UploadToken.issue("v2 membership source")
         body = jsonl(
@@ -2065,6 +2091,34 @@ class AuditLogIngestionTests(TestCase):
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
         )
         self.assertContains(state_tab_response, "convergence")
+
+    def test_publish_failure_projects_scalar_relay_url(self):
+        raw_token, _token = UploadToken.issue("v2 relay scalar")
+        body = jsonl(
+            audit_event_v2(
+                0,
+                kind={
+                    "type": "publish_failure",
+                    "msg_id": MSG_ID,
+                    "artifact_kind": "application_message",
+                    "target_kind": "event",
+                    "stage": "publish",
+                    "reason": "timeout",
+                    "relay_url": "wss://relay.scalar.example",
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        observation = NetworkObservation.objects.get(phase="publish_failure")
+        self.assertEqual(observation.relay_url, "wss://relay.scalar.example")
 
     def test_api_message_detail_returns_matches_across_groups(self):
         raw_token, _token = UploadToken.issue("message lookup client")
@@ -4635,7 +4689,8 @@ class DashboardTests(TestCase):
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
         )
         self.assertContains(state_response, "Group state deltas")
-        self.assertContains(state_response, "Launch room")
+        self.assertContains(state_response, "text value")
+        self.assertNotContains(state_response, "Launch room")
         self.assertContains(state_response, "Epoch state transitions")
 
         evidence_response = self.client.get(
@@ -6114,6 +6169,9 @@ class GroupListAnnotationTests(TestCase):
         shell = group_detail_shell_context(group)
         self.assertEqual(shell["summary"]["engine_count"], content_engine_count)
         self.assertEqual(shell["summary"]["message_count"], content_message_count)
+        self.assertEqual(
+            shell["summary"]["delivery_count"], DeliveryArtifact.objects.filter(group=group).count()
+        )
         self.assertEqual(shell["summary"]["event_count"], len(content_events))
         # The header engine-preview column count cannot exceed the headline
         # engine_count (the timeline renders content_engine_count columns).
@@ -6319,6 +6377,44 @@ class GroupDetailTimelineViewTests(TestCase):
             )
         self.assertContains(response, "Export JSON")
 
+    def test_group_detail_labels_raw_message_ids_separately_from_delivery_artifacts(self):
+        group = AuditGroup.objects.create(
+            name="Raw only group",
+            slug="raw-only-group",
+            group_ref=GROUP_REF,
+        )
+        audit_file = AuditFile.objects.create(
+            file_sha256="d" * 64,
+            byte_size=128,
+            raw_text="{}\n",
+            validation_status=AuditFile.STATUS_VALID,
+            source_name="raw-only.jsonl",
+            total_line_count=1,
+            valid_event_count=1,
+        )
+        audit_file.groups.add(group)
+        AuditEvent.objects.create(
+            audit_file=audit_file,
+            group=group,
+            line_number=1,
+            line_hash="d" * 64,
+            raw_line="{}",
+            parse_status=AuditEvent.STATUS_VALID,
+            event_type="ingest_entry",
+            msg_id=MSG_ID,
+            engine_id=ENGINE_ALICE,
+            group_ref=GROUP_REF,
+            wall_time_ms=1_700_000_000_001,
+        )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
+
+        self.assertContains(response, "0 delivery artifacts")
+        self.assertContains(response, "1 raw message id")
+        self.assertNotContains(response, "1 message artifact")
+
     def test_convergence_tab_renders_projected_runs(self):
         group = AuditGroup.objects.create(
             name="Projected convergence group",
@@ -6345,6 +6441,26 @@ class GroupDetailTimelineViewTests(TestCase):
             decisive=True,
             selected_branch_id="branch-a",
         )
+        non_decisive_run = ConvergenceRun.objects.create(
+            group=group,
+            run_id="run-no-decisive",
+            engine_id=ENGINE_BOB,
+            phase="selected",
+            selected_branch_id="branch-b",
+            started_at_ms=1_700_000_000_002,
+        )
+        ConvergenceCandidate.objects.create(
+            run=non_decisive_run,
+            branch_id="branch-b",
+            fork_epoch=8,
+            tip_epoch=9,
+        )
+        ConvergenceRuleEvaluation.objects.create(
+            run=non_decisive_run,
+            rule_name="non_decisive_weight",
+            decisive=False,
+            selected_branch_id="branch-b",
+        )
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
@@ -6356,6 +6472,11 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertContains(response, "run-paged")
         self.assertContains(response, "branch-a")
         self.assertContains(response, "highest_weight")
+        self.assertContains(response, "run-no-decisive")
+        self.assertContains(response, "non_decisive_weight")
+        runs_by_id = {run.run_id: run for run in response.context["runs"]}
+        self.assertEqual(runs_by_id["run-no-decisive"].decisive_rules, [])
+        self.assertContains(response, '<span class="is-muted">–</span>', html=True)
 
     def test_group_detail_shows_engine_preview_overflow_count(self):
         group = AuditGroup.objects.create(

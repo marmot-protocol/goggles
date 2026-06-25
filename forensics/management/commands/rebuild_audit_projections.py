@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand, CommandError, CommandParser
+from django.db import transaction
 
 from forensics.models import (
     AuditEvent,
@@ -14,7 +15,7 @@ from forensics.models import (
     RecipientExpectation,
     StateDelta,
 )
-from forensics.projections import rebuild_group_projections
+from forensics.projections import AUDIT_SCHEMA_VERSION_V2, rebuild_group_projections
 
 PROJECTION_MODELS = (
     DeliveryArtifact,
@@ -52,7 +53,8 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         groups = self.selected_groups(options["groups"], options["audit_file_ids"])
         for group in groups:
-            rebuild_group_projections(group)
+            with transaction.atomic():
+                rebuild_group_projections(group)
         after_counts = projection_counts()
 
         self.stdout.write(
@@ -118,7 +120,7 @@ def groups_with_v2_evidence() -> list[AuditGroup]:
     group_ids = (
         AuditEvent.objects.filter(
             parse_status=AuditEvent.STATUS_VALID,
-            schema_version="marmot-forensics-audit/v2",
+            schema_version=AUDIT_SCHEMA_VERSION_V2,
             group__isnull=False,
         )
         .values_list("group_id", flat=True)

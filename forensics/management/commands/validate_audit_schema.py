@@ -30,21 +30,22 @@ class Command(BaseCommand):
             path = Path(raw_path)
             if not path.exists():
                 raise CommandError(f"Audit log path does not exist: {path}")
-            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if not line.strip():
-                    continue
-                event_count += 1
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    error_count += 1
-                    self.stderr.write(f"{path}:{line_number}: invalid JSON: {exc.msg}")
-                    continue
-                errors = sorted(validator.iter_errors(event), key=lambda error: error.path)
-                for error in errors:
-                    for pointer, message in safe_validation_errors(error):
+            with path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    event_count += 1
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError as exc:
                         error_count += 1
-                        self.stderr.write(f"{path}:{line_number}:{pointer}: {message}")
+                        self.stderr.write(f"{path}:{line_number}: invalid JSON: {exc.msg}")
+                        continue
+                    errors = sorted(validator.iter_errors(event), key=lambda error: error.path)
+                    for error in errors:
+                        for pointer, message in safe_validation_errors(error):
+                            error_count += 1
+                            self.stderr.write(f"{path}:{line_number}:{pointer}: {message}")
 
         if error_count:
             raise CommandError(

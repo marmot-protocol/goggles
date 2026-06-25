@@ -73,6 +73,7 @@ def rebuild_file_projections(audit_file: AuditFile) -> None:
 
 @transaction.atomic
 def rebuild_group_projections(group: AuditGroup) -> None:
+    group = AuditGroup.objects.select_for_update().get(pk=group.pk)
     clear_group_projections(group)
     events = (
         AuditEvent.objects.select_related("audit_file")
@@ -331,6 +332,9 @@ def relay_url_for_event(
 ) -> str:
     if wire.get("relay_url"):
         return str(wire["relay_url"])
+    relay_url = kind.get("relay_url")
+    if isinstance(relay_url, str) and relay_url:
+        return relay_url
     relays = kind.get("relay_urls") or event.relay_urls or event.accepted_relay_urls or []
     if relays and isinstance(relays, list) and isinstance(relays[0], str):
         return relays[0]

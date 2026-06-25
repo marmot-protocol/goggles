@@ -42,10 +42,8 @@
                 {% endfor %}
               </td>
               <td class="is-wrap">
-                {% for rule in run.rule_evaluations.all %}
-                  {% if rule.decisive %}
-                    <span class="badge badge--accent">{{ rule.rule_name }}</span>
-                  {% endif %}
+                {% for rule in run.decisive_rules %}
+                  <span class="badge badge--accent">{{ rule.rule_name }}</span>
                 {% empty %}
                   <span class="is-muted">–</span>
                 {% endfor %}

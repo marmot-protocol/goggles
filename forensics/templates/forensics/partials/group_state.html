@@ -30,14 +30,36 @@
               <td class="is-mono">{{ delta.epoch|default_if_none:"–" }}</td>
               <td>{{ delta.change_kind }}</td>
               <td>{{ delta.membership_change_source|default:"–" }}</td>
-              <td class="is-mono is-muted is-wrap">{% firstof delta.actor_member_ref delta.actor_pubkey_hex "–" %}</td>
-              <td class="is-mono is-muted is-wrap">{% firstof delta.subject_member_ref delta.subject_pubkey_hex "–" %}</td>
+              <td class="is-mono is-muted is-wrap">
+                {% if delta.actor_member_ref %}
+                  member {{ delta.actor_member_ref|truncatechars:9 }}
+                {% elif delta.actor_pubkey_hex %}
+                  pubkey {{ delta.actor_pubkey_hex|truncatechars:9 }}
+                {% else %}
+                  –
+                {% endif %}
+              </td>
+              <td class="is-mono is-muted is-wrap">
+                {% if delta.subject_member_ref %}
+                  member {{ delta.subject_member_ref|truncatechars:9 }}
+                {% elif delta.subject_pubkey_hex %}
+                  pubkey {{ delta.subject_pubkey_hex|truncatechars:9 }}
+                {% else %}
+                  –
+                {% endif %}
+              </td>
               <td class="is-wrap">{% for field in delta.fields %}<span class="badge">{{ field }}</span>{% empty %}<span class="is-muted">–</span>{% endfor %}</td>
               <td class="is-mono is-muted is-wrap">
                 {% if delta.audit_data_mode == "full_data" %}
                   <span class="badge badge--warning">full data</span>
                 {% endif %}
-                {% firstof delta.value.text delta.value.digest "–" %}
+                {% if delta.value.text %}
+                  <span class="badge">text value</span>
+                {% elif delta.value.digest %}
+                  digest {{ delta.value.digest|truncatechars:13 }}
+                {% else %}
+                  –
+                {% endif %}
               </td>
               <td class="is-wrap">
                 {% if delta.origin_commit_id %}

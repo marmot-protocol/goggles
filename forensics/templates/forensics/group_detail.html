@@ -44,7 +44,10 @@
       {% if group.notes %}<p class="tl-notes">{{ group.notes }}</p>{% endif %}
     </div>
     <div class="tl-header__badges">
-      <span class="badge">{{ summary.message_count }} message artifact{{ summary.message_count|pluralize }}</span>
+      <span class="badge">{{ summary.delivery_count }} delivery artifact{{ summary.delivery_count|pluralize }}</span>
+      {% if summary.raw_message_count %}
+        <span class="badge">{{ summary.raw_message_count }} raw message id{{ summary.raw_message_count|pluralize }}</span>
+      {% endif %}
       <span class="badge">{{ summary.network_count }} network observation{{ summary.network_count|pluralize }}</span>
       <span class="badge">{{ summary.convergence_count }} convergence run{{ summary.convergence_count|pluralize }}</span>
       {% if summary.invalid_event_count %}
