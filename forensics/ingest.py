@@ -17,10 +17,15 @@ from django.utils import timezone
 from . import normalized_fields as normalized_field_config
 from .analysis import divergent_counts_for_group_ids
 from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
+from .projections import rebuild_file_projections
 
 logger = logging.getLogger(__name__)
 
-AUDIT_SCHEMA_VERSION = "marmot-forensics-audit/v1"
+AUDIT_SCHEMA_VERSION_V1 = "marmot-forensics-audit/v1"
+AUDIT_SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
+SUPPORTED_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V1, AUDIT_SCHEMA_VERSION_V2}
+DEFAULT_AUDIT_DATA_MODE = "obfuscated_sensitive_data"
+AUDIT_DATA_MODES = {DEFAULT_AUDIT_DATA_MODE, "full_data"}
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 # Upper bound for hex message identifiers (``msg_id``, ``outbound_msg_id``,
@@ -148,8 +153,13 @@ def ingest_audit_log_bytes(
     source_name: str = "",
     source_account_label: str = "",
     source_device_label: str = "",
+    source_device_id: str = "",
+    source_device_name: str = "",
     source_platform: str = "",
     source_app_version: str = "",
+    source_upload_trigger: str = "",
+    source_account_pubkey_hex: str = "",
+    source_account_npub: str = "",
     content_type: str = "",
 ) -> IngestionResult:
     try:
@@ -166,8 +176,13 @@ def ingest_audit_log_bytes(
             source_name=source_name,
             source_account_label=source_account_label,
             source_device_label=source_device_label,
+            source_device_id=source_device_id,
+            source_device_name=source_device_name,
             source_platform=source_platform,
             source_app_version=source_app_version,
+            source_upload_trigger=source_upload_trigger,
+            source_account_pubkey_hex=source_account_pubkey_hex,
+            source_account_npub=source_account_npub,
             content_type=content_type,
             dump_bytes=dump_bytes,
             raw_text=raw_text,
@@ -200,8 +215,13 @@ def ingest_audit_log_bytes(
                 source_name=source_name[:255],
                 source_account_label=source_account_label[:255],
                 source_device_label=source_device_label[:255],
+                source_device_id=source_device_id[:255],
+                source_device_name=source_device_name[:255],
                 source_platform=source_platform[:120],
                 source_app_version=source_app_version[:120],
+                source_upload_trigger=source_upload_trigger[:160],
+                source_account_pubkey_hex=source_account_pubkey_hex[:64],
+                source_account_npub=source_account_npub[:120],
                 content_type=content_type[:120],
                 file_sha256=file_sha256,
                 byte_size=len(dump_bytes),
@@ -258,8 +278,13 @@ def ingest_audit_log_bytes(
             source_name=source_name,
             source_account_label=source_account_label,
             source_device_label=source_device_label,
+            source_device_id=source_device_id,
+            source_device_name=source_device_name,
             source_platform=source_platform,
             source_app_version=source_app_version,
+            source_upload_trigger=source_upload_trigger,
+            source_account_pubkey_hex=source_account_pubkey_hex,
+            source_account_npub=source_account_npub,
             content_type=content_type,
             dump_bytes=dump_bytes,
             raw_text=raw_text,
@@ -278,8 +303,13 @@ def save_invalid_upload(
     source_name: str,
     source_account_label: str,
     source_device_label: str,
+    source_device_id: str,
+    source_device_name: str,
     source_platform: str,
     source_app_version: str,
+    source_upload_trigger: str,
+    source_account_pubkey_hex: str,
+    source_account_npub: str,
     content_type: str,
     dump_bytes: bytes,
     raw_text: str,
@@ -298,8 +328,13 @@ def save_invalid_upload(
                 source_name=source_name[:255],
                 source_account_label=source_account_label[:255],
                 source_device_label=source_device_label[:255],
+                source_device_id=source_device_id[:255],
+                source_device_name=source_device_name[:255],
                 source_platform=source_platform[:120],
                 source_app_version=source_app_version[:120],
+                source_upload_trigger=source_upload_trigger[:160],
+                source_account_pubkey_hex=source_account_pubkey_hex[:64],
+                source_account_npub=source_account_npub[:120],
                 content_type=content_type[:120],
                 file_sha256=file_sha256,
                 byte_size=len(dump_bytes),
@@ -373,12 +408,19 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
 
 def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
+    schema_version = bounded_str_or_empty(
+        data.get("schema_version"),
+        "schema_version",
+        errors,
+    )
     normalized: dict[str, Any] = {
-        "schema_version": bounded_str_or_empty(
-            data.get("schema_version"),
-            "schema_version",
+        "schema_version": schema_version,
+        "recorder_session_id": bounded_str_or_empty(
+            data.get("recorder_session_id"),
+            "recorder_session_id",
             errors,
         ),
+        "audit_data_mode": audit_data_mode_for_event(data, schema_version, errors),
         "seq": value_if_int(data.get("seq")),
         "wall_time_ms": value_if_int(data.get("wall_time_ms")),
         "account_ref": (
@@ -390,10 +432,11 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         ),
     }
 
-    if normalized["schema_version"] != AUDIT_SCHEMA_VERSION:
+    if normalized["schema_version"] not in SUPPORTED_AUDIT_SCHEMA_VERSIONS:
         errors.append(
             "unsupported schema_version "
-            f"{data.get('schema_version')!r}; expected {AUDIT_SCHEMA_VERSION}"
+            f"{data.get('schema_version')!r}; expected one of "
+            f"{', '.join(sorted(SUPPORTED_AUDIT_SCHEMA_VERSIONS))}"
         )
     if normalized["seq"] is None:
         errors.append("seq must be a non-negative integer")
@@ -419,7 +462,12 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         errors.append("account_ref must be 32 hex characters when present")
     elif normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
         errors.append("account_ref must be 32 hex characters when present")
-    if not is_hex(normalized["engine_id"], exact_len=32):
+    if normalized["schema_version"] == AUDIT_SCHEMA_VERSION_V2:
+        if not normalized["engine_id"]:
+            errors.append("engine_id must be a non-empty string")
+        elif string_exceeds_model_limit("engine_id", normalized["engine_id"], errors):
+            normalized["engine_id"] = ""
+    elif not is_hex(normalized["engine_id"], exact_len=32):
         errors.append("engine_id must be 32 hex characters")
     if present_but_not_str(data, "group_ref"):
         errors.append(
@@ -462,16 +510,58 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
 
     variant_errors = normalize_kind(event_type, kind, normalized)
     errors.extend(variant_errors)
-    if not normalized.get("human_action_action"):
+    if normalized["schema_version"] == AUDIT_SCHEMA_VERSION_V1 and not normalized.get(
+        "human_action_action"
+    ):
         errors.append(
             "new audit rows must include kind.type 'human_action' or context.human_action.action"
         )
     return normalized, errors
 
 
+def audit_data_mode_for_event(
+    data: dict[str, Any],
+    schema_version: str,
+    errors: list[str],
+) -> str:
+    if schema_version == AUDIT_SCHEMA_VERSION_V1:
+        return DEFAULT_AUDIT_DATA_MODE
+
+    value = data.get("audit_data_mode")
+    if not isinstance(value, str):
+        errors.append("audit_data_mode must be present and be a string")
+        return ""
+    if value not in AUDIT_DATA_MODES:
+        errors.append("audit_data_mode must be one of " + ", ".join(sorted(AUDIT_DATA_MODES)))
+        return ""
+    return value
+
+
 def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     match event_type:
+        case "recorder_started":
+            copy_optional_str(kind, normalized, errors, "recorder", "detail")
+        case "audit_data_mode_changed":
+            copy_optional_str(kind, normalized, errors, "new_mode", "outcome")
+            copy_optional_str(kind, normalized, errors, "reason")
+        case "source_context":
+            source = kind.get("source")
+            if isinstance(source, dict):
+                normalized["context_source"] = source
+        case "engine_context":
+            context = kind.get("context")
+            if isinstance(context, dict):
+                normalized["context_engine"] = context
+        case "group_context":
+            context = kind.get("context")
+            if isinstance(context, dict):
+                normalized["context_group"] = context
+            copy_optional_str(kind, normalized, errors, "reason")
+        case "transport_received":
+            copy_optional_msg_id(kind, normalized, errors, "msg_id")
+            copy_optional_int(kind, normalized, errors, "payload_len")
+            copy_optional_digest(kind, normalized, errors, "payload_digest")
         case "ingest_entry":
             copy_msg_id(kind, normalized, errors)
             copy_str(kind, normalized, errors, "envelope_kind")
@@ -482,19 +572,48 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
             copy_str(kind, normalized, errors, "outcome_kind")
             copy_optional_str(kind, normalized, errors, "stale_reason")
             copy_optional_int(kind, normalized, errors, "epoch")
+        case "ingest_error":
+            copy_msg_id(kind, normalized, errors)
+            copy_str(kind, normalized, errors, "error_kind", "outcome_kind")
+            copy_optional_str(kind, normalized, errors, "detail")
+        case "message_content_decoded":
+            copy_msg_id(kind, normalized, errors)
+            copy_optional_str(kind, normalized, errors, "artifact_kind", "target_kind")
+        case "recipient_expectation":
+            copy_msg_id(kind, normalized, errors)
+            expectation = kind.get("expectation")
+            if isinstance(expectation, dict):
+                copy_optional_str(expectation, normalized, errors, "artifact_kind", "target_kind")
         case "send_entry":
             copy_str(kind, normalized, errors, "intent_kind")
         case "send_outcome":
             copy_str(kind, normalized, errors, "intent_kind")
             copy_str(kind, normalized, errors, "result_kind")
             copy_optional_msg_id(kind, normalized, errors, "outbound_msg_id")
-            welcome_ids = kind.get("outbound_welcome_msg_ids", [])
-            if not isinstance(welcome_ids, list) or any(
-                not is_hex(item, even=True) for item in welcome_ids
-            ):
-                errors.append("outbound_welcome_msg_ids must be a list of hex strings")
-            else:
-                normalized["outbound_welcome_msg_ids"] = welcome_ids
+            copy_outbound_messages(kind, normalized, errors)
+            if "outbound_welcome_msg_ids" in kind:
+                welcome_ids = kind.get("outbound_welcome_msg_ids", [])
+                if not isinstance(welcome_ids, list) or any(
+                    not is_valid_message_id(item, normalized) for item in welcome_ids
+                ):
+                    errors.append(
+                        "outbound_welcome_msg_ids must be a list of "
+                        f"{message_id_requirement_label(normalized)}"
+                    )
+                else:
+                    normalized["outbound_welcome_msg_ids"] = welcome_ids
+        case "send_error":
+            copy_str(kind, normalized, errors, "intent_kind")
+            copy_str(kind, normalized, errors, "error_kind", "outcome_kind")
+            copy_optional_str(kind, normalized, errors, "detail")
+        case "create_group_entry":
+            copy_optional_int(kind, normalized, errors, "member_count", "human_action_target_count")
+        case "create_group_outcome":
+            copy_str(kind, normalized, errors, "result_kind")
+            copy_outbound_messages(kind, normalized, errors)
+        case "create_group_error":
+            copy_str(kind, normalized, errors, "error_kind", "outcome_kind")
+            copy_optional_str(kind, normalized, errors, "detail")
         case "human_action":
             copy_human_action_fields(kind, normalized, errors)
         case "publish_attempt":
@@ -517,13 +636,35 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
                     normalized["met_required_acks"] = met_required_acks
         case "publish_failure":
             copy_publish_fields(kind, normalized, errors)
+            copy_optional_str(kind, normalized, errors, "stage", "outcome_kind")
             copy_optional_str(kind, normalized, errors, "reason")
             copy_optional_str(kind, normalized, errors, "detail")
             copy_optional_str_list(kind, normalized, errors, "relay_urls")
+        case "epoch_state_changed":
+            copy_optional_str(kind, normalized, errors, "previous_state", "outcome")
+            copy_str(kind, normalized, errors, "new_state")
+            copy_int(kind, normalized, errors, "epoch")
+            copy_str(kind, normalized, errors, "reason")
+            copy_optional_int(kind, normalized, errors, "pending_ref", "pending_epoch")
+            copy_optional_str(kind, normalized, errors, "pending_kind")
+        case "group_state_changed":
+            copy_int(kind, normalized, errors, "epoch")
+            copy_str(kind, normalized, errors, "change_kind", "outcome_kind")
+            copy_optional_msg_id(kind, normalized, errors, "origin_commit_id", "outbound_msg_id")
+            value = kind.get("value")
+            if isinstance(value, dict):
+                digest = value.get("digest")
+                if digest is not None:
+                    if is_hex(digest, exact_len=64):
+                        normalized["payload_digest"] = digest
+                    else:
+                        errors.append("value.digest must be 64 hex characters when present")
+                copy_optional_int(value, normalized, errors, "len", "payload_len")
         case "epoch_confirmed":
             copy_int(kind, normalized, errors, "from_epoch")
             copy_int(kind, normalized, errors, "to_epoch")
             copy_str(kind, normalized, errors, "pending_kind")
+            copy_optional_msg_id(kind, normalized, errors, "origin_commit_id", "outbound_msg_id")
         case "epoch_rolled_back":
             copy_int(kind, normalized, errors, "pending_epoch")
             copy_int(kind, normalized, errors, "restored_epoch")
@@ -540,14 +681,28 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
             if normalized.get("winner") not in {"candidate", "incumbent", "missing_snapshot"}:
                 errors.append("winner must be candidate, incumbent, or missing_snapshot")
             copy_optional_msg_id(kind, normalized, errors, "invalidated_msg_id")
+        case "convergence_run_state":
+            copy_str(kind, normalized, errors, "phase", "outcome")
+            copy_optional_int(kind, normalized, errors, "current_tip_epoch")
+            copy_optional_str(kind, normalized, errors, "reason")
+            copy_optional_str(kind, normalized, errors, "error_kind", "outcome_kind")
         case "convergence_decision":
             copy_int(kind, normalized, errors, "current_tip_epoch")
-            copy_int(kind, normalized, errors, "candidate_count")
-            copy_int(kind, normalized, errors, "eligible_count")
             copy_int(kind, normalized, errors, "max_rewind_commits")
             copy_optional_str(kind, normalized, errors, "selected_branch_id")
             copy_optional_int(kind, normalized, errors, "selected_fork_epoch")
             copy_optional_int(kind, normalized, errors, "selected_tip_epoch")
+            candidates = kind.get("candidates")
+            if isinstance(candidates, list):
+                normalized["candidate_count"] = len(candidates)
+                normalized["eligible_count"] = sum(
+                    1
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and candidate.get("eligible") is True
+                )
+            else:
+                copy_int(kind, normalized, errors, "candidate_count")
+                copy_int(kind, normalized, errors, "eligible_count")
         case "peeler_outcome":
             copy_msg_id(kind, normalized, errors)
             copy_str(kind, normalized, errors, "outcome")
@@ -603,7 +758,7 @@ def normalize_context(
         else:
             normalized["context_human_action"] = human_action
             copy_human_action_fields(human_action, normalized, errors)
-    for field in ("transport", "engine", "group"):
+    for field in ("transport", "engine", "group", "convergence", "source"):
         if field in context and context[field] is not None:
             normalized[f"context_{field}"] = context[field]
 
@@ -649,6 +804,7 @@ def create_events(
     # AuditEvent row was stored for it (marmot-protocol/goggles#37).
     if group_ids:
         audit_file.groups.add(*group_ids)
+    rebuild_file_projections(audit_file)
     return duplicate_count, group_ids
 
 
@@ -877,6 +1033,8 @@ def event_values(
                 "raw_kind": parsed.normalized.get("raw_kind") or {},
                 "raw_context": parsed.normalized.get("raw_context") or {},
                 "schema_version": parsed.normalized.get("schema_version") or "",
+                "recorder_session_id": parsed.normalized.get("recorder_session_id") or "",
+                "audit_data_mode": parsed.normalized.get("audit_data_mode") or "",
                 "seq": parsed.normalized.get("seq"),
                 "wall_time_ms": parsed.normalized.get("wall_time_ms"),
                 "account_ref": parsed.normalized.get("account_ref") or "",
@@ -930,6 +1088,13 @@ def file_metadata(parsed_lines: list[ParsedLine]) -> dict[str, Any]:
             if line.normalized.get("schema_version")
         }
     )
+    audit_data_modes = sorted(
+        {
+            line.normalized.get("audit_data_mode")
+            for line in valid_lines
+            if line.normalized.get("audit_data_mode")
+        }
+    )
     return {
         "total_line_count": len(parsed_lines),
         "valid_event_count": len(valid_lines),
@@ -944,6 +1109,7 @@ def file_metadata(parsed_lines: list[ParsedLine]) -> dict[str, Any]:
         "engine_ids": engine_ids,
         "group_refs": group_refs,
         "schema_versions": schema_versions,
+        "audit_data_modes": audit_data_modes,
     }
 
 
@@ -1024,6 +1190,47 @@ def copy_publish_fields(
             normalized["relay_urls"] = [relay_url]
 
 
+def copy_outbound_messages(
+    kind: dict[str, Any],
+    normalized: dict[str, Any],
+    errors: list[str],
+) -> None:
+    messages = kind.get("outbound_messages")
+    if messages is None:
+        return
+    if not isinstance(messages, list):
+        errors.append("outbound_messages must be a list when present")
+        return
+
+    outbound_msg_id = ""
+    welcome_ids = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            errors.append(f"outbound_messages[{index}] must be an object")
+            continue
+        msg_id = message.get("msg_id")
+        if not is_valid_message_id(msg_id, normalized):
+            errors.append(
+                f"outbound_messages[{index}].msg_id must be "
+                f"{message_id_requirement_label(normalized)}"
+            )
+            continue
+        if len(msg_id) > MSG_ID_MAX_LENGTH:
+            errors.append(
+                f"outbound_messages[{index}].msg_id must be at most {MSG_ID_MAX_LENGTH} characters"
+            )
+            continue
+        if message.get("artifact_kind") == "welcome":
+            welcome_ids.append(msg_id)
+        elif not outbound_msg_id:
+            outbound_msg_id = msg_id
+
+    if outbound_msg_id and not normalized.get("outbound_msg_id"):
+        normalized["outbound_msg_id"] = outbound_msg_id
+    if welcome_ids:
+        normalized["outbound_welcome_msg_ids"] = welcome_ids
+
+
 def copy_context_str(
     source: dict[str, Any],
     normalized: dict[str, Any],
@@ -1100,8 +1307,13 @@ def copy_optional_msg_id_list(
     value = source.get(source_field)
     if value is None:
         return
-    if not isinstance(value, list) or any(not is_hex(item, even=True) for item in value):
-        errors.append(f"human_action.{source_field} must be a list of hex strings")
+    if not isinstance(value, list) or any(
+        not is_valid_message_id(item, normalized) for item in value
+    ):
+        errors.append(
+            f"human_action.{source_field} must be a list of "
+            f"{message_id_requirement_label(normalized)}"
+        )
         return
     normalized[dest_field] = value
 
@@ -1115,8 +1327,9 @@ def copy_optional_msg_id(
     normalized: dict[str, Any],
     errors: list[str],
     field: str,
+    dest_field: str | None = None,
 ) -> None:
-    copy_msg_field(kind, normalized, errors, field, required=False)
+    copy_msg_field(kind, normalized, errors, field, required=False, dest_field=dest_field)
 
 
 def copy_msg_field(
@@ -1126,14 +1339,15 @@ def copy_msg_field(
     field: str,
     *,
     required: bool,
+    dest_field: str | None = None,
 ) -> None:
     value = kind.get(field)
     if value is None:
         if required:
             errors.append(f"{field} is required")
         return
-    if not is_hex(value, even=True):
-        errors.append(f"{field} must be even-length hex")
+    if not is_valid_message_id(value, normalized):
+        errors.append(f"{field} must be {message_id_requirement_label(normalized)}")
         return
     if len(value) > MSG_ID_MAX_LENGTH:
         # Quarantine but do NOT store the oversized value. ``msg_id`` is carried
@@ -1147,7 +1361,19 @@ def copy_msg_field(
         # (#14 / #55). Regression: marmot-protocol/goggles#56.
         errors.append(f"{field} must be at most {MSG_ID_MAX_LENGTH} characters")
         return
-    normalized[field] = value
+    normalized[dest_field or field] = value
+
+
+def is_valid_message_id(value: Any, normalized: dict[str, Any]) -> bool:
+    if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V2:
+        return is_hex(value, exact_len=64)
+    return is_hex(value, even=True)
+
+
+def message_id_requirement_label(normalized: dict[str, Any]) -> str:
+    if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V2:
+        return "64 hex characters"
+    return "even-length hex"
 
 
 def copy_digest(
@@ -1183,15 +1409,16 @@ def copy_str(
     normalized: dict[str, Any],
     errors: list[str],
     field: str,
+    dest_field: str | None = None,
 ) -> None:
     raw_value = kind.get(field)
     value = value_if_str(raw_value)
     if not value:
         errors.append(f"{field} must be a non-empty string")
         return
-    if string_exceeds_model_limit(field, value, errors):
+    if string_exceeds_model_limit(dest_field or field, value, errors):
         return
-    normalized[field] = value
+    normalized[dest_field or field] = value
 
 
 def copy_optional_str(
@@ -1199,6 +1426,7 @@ def copy_optional_str(
     normalized: dict[str, Any],
     errors: list[str],
     field: str,
+    dest_field: str | None = None,
 ) -> None:
     value = kind.get(field)
     if value is None:
@@ -1206,9 +1434,9 @@ def copy_optional_str(
     if not isinstance(value, str):
         errors.append(f"{field} must be a string when present")
         return
-    if string_exceeds_model_limit(field, value, errors):
+    if string_exceeds_model_limit(dest_field or field, value, errors):
         return
-    normalized[field] = value
+    normalized[dest_field or field] = value
 
 
 def copy_int(

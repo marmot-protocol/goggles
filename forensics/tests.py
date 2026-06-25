@@ -5,6 +5,7 @@ import os
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
@@ -37,7 +38,21 @@ from .ingest import (
     group_ref_max_length,
     ingest_audit_log_bytes,
 )
-from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
+from .models import (
+    AnalysisRun,
+    AuditEvent,
+    AuditFile,
+    AuditGroup,
+    ConvergenceCandidate,
+    ConvergenceRuleEvaluation,
+    ConvergenceRun,
+    DeliveryArtifact,
+    DeliveryObservation,
+    EpochStateTransition,
+    NetworkObservation,
+    StateDelta,
+    UploadToken,
+)
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     GROUP_DETAIL_TAB_EVENT_LIMIT,
@@ -48,10 +63,12 @@ from .views import (
     group_detail_shell_context,
     group_epoch_count,
     groups_for_audit_file,
+    saved_report_projection_summary,
     valid_group_event_queryset,
 )
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
+SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
 ENGINE_ALICE = "0123456789abcdef0123456789abcdef"
 ENGINE_BOB = "abcdef0123456789abcdef0123456789"
 ACCOUNT_ALICE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -101,6 +118,31 @@ def audit_event(
     }
 
 
+def audit_event_v2(
+    seq,
+    engine_id=ENGINE_ALICE,
+    group_ref=GROUP_REF,
+    account_ref=ACCOUNT_ALICE,
+    kind=None,
+    wall_time_ms=None,
+    context=None,
+    audit_data_mode="obfuscated_sensitive_data",
+    recorder_session_id="session-a",
+):
+    return {
+        "schema_version": SCHEMA_VERSION_V2,
+        "seq": seq,
+        "wall_time_ms": wall_time_ms or 1_700_000_000_000 + seq,
+        "recorder_session_id": recorder_session_id,
+        "audit_data_mode": audit_data_mode,
+        "account_ref": account_ref,
+        "engine_id": engine_id,
+        "group_ref": group_ref,
+        "context": context if context is not None else {"operation_id": f"op-v2-{seq}"},
+        "kind": kind or {"type": "recorder_started", "recorder": "darkmatter"},
+    }
+
+
 def jsonl(*events):
     return "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n"
 
@@ -108,11 +150,13 @@ def jsonl(*events):
 NORMALIZED_EVENT_BASE_FIELDS = frozenset(
     {
         "account_ref",
+        "audit_data_mode",
         "engine_id",
         "event_type",
         "group_ref",
         "raw_context",
         "raw_kind",
+        "recorder_session_id",
         "schema_version",
         "seq",
         "wall_time_ms",
@@ -440,6 +484,39 @@ class NormalizedFieldConfigurationTests(SimpleTestCase):
                 produced_fields.update(set(normalized) - NORMALIZED_EVENT_BASE_FIELDS)
 
         self.assertEqual(sorted(produced_fields - persisted_fields), [])
+
+
+class SavedReportProjectionSummaryTests(SimpleTestCase):
+    def test_summary_includes_nested_action_counts_and_pagination_flags(self):
+        summary = saved_report_projection_summary(
+            {
+                "projection": {
+                    "delivery_artifacts": [{"artifact_id": MSG_ID}],
+                    "action_attribution": {
+                        "user_actions": [{"action": "send_message"}],
+                        "system_attribution": [{"action": "background_sync"}],
+                        "other_attribution": [],
+                    },
+                    "pagination": {
+                        "delivery_artifacts": {"has_more": True, "next_offset": 500},
+                        "action_attribution": {
+                            "user_actions": {"has_more": False, "next_offset": None},
+                            "system_attribution": {"has_more": True, "next_offset": 500},
+                            "other_attribution": {"has_more": False, "next_offset": None},
+                        },
+                    },
+                }
+            }
+        )
+
+        rows = {row["label"]: row for row in summary}
+        self.assertEqual(rows["Delivery artifacts"]["count"], 1)
+        self.assertTrue(rows["Delivery artifacts"]["has_more"])
+        self.assertEqual(rows["Delivery artifacts"]["next_offset"], 500)
+        self.assertEqual(rows["User actions"]["count"], 1)
+        self.assertFalse(rows["User actions"]["has_more"])
+        self.assertEqual(rows["System attribution"]["count"], 1)
+        self.assertTrue(rows["System attribution"]["has_more"])
 
 
 class AuditEventIndexTests(TestCase):
@@ -1068,6 +1145,1079 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(audit_file.source_device_label, "Alice iPhone")
         self.assertEqual(audit_file.source_platform, "ios")
         self.assertEqual(audit_file.source_app_version, "2026.6.8")
+
+    def test_v2_upload_builds_audit_projections(self):
+        raw_token, _token = UploadToken.issue("v2 test client")
+        body = jsonl(
+            audit_event_v2(
+                0,
+                kind={
+                    "type": "transport_received",
+                    "msg_id": MSG_ID,
+                    "transport": {
+                        "transport": "nostr",
+                        "delivery_plane": "relay",
+                        "relay_url": "wss://relay.example",
+                        "nostr_event_id": DIGEST_A,
+                        "nostr_kind": 445,
+                        "welcome_nostr_event_id": DIGEST_B,
+                        "welcome_rumor_event_id": DIGEST_A,
+                        "welcome_key_package_tag": "kp:alice:1",
+                    },
+                    "payload_len": 42,
+                    "payload_digest": DIGEST_A,
+                },
+            ),
+            audit_event_v2(
+                1,
+                audit_data_mode="full_data",
+                kind={
+                    "type": "message_content_decoded",
+                    "msg_id": MSG_ID,
+                    "artifact_kind": "application_message",
+                    "author": {
+                        "member_ref": ACCOUNT_ALICE,
+                        "account_pubkey_hex": "aa" * 32,
+                    },
+                    "decoded_payload": {
+                        "content_type": "text/plain",
+                        "text": "hello from Alice",
+                    },
+                    "decoded_app_event": {
+                        "format": "nostr",
+                        "kind": 445,
+                        "content": "hello from Alice",
+                        "pubkey_hex": "aa" * 32,
+                    },
+                },
+            ),
+            audit_event_v2(
+                2,
+                kind={
+                    "type": "recipient_expectation",
+                    "msg_id": MSG_ID,
+                    "expectation": {
+                        "artifact_kind": "application_message",
+                        "recipient_scope": "all_other_current_group_members",
+                        "membership_epoch": 7,
+                        "expected_member_refs": [ACCOUNT_BOB],
+                        "expected_pubkeys_hex": ["cc" * 32],
+                        "expected_count": 2,
+                    },
+                },
+            ),
+            audit_event_v2(
+                3,
+                context={
+                    "operation_id": "op-local-send",
+                    "human_action": {
+                        "action": "send_message",
+                        "origin": "local_user",
+                        "phase": "requested",
+                        "message_ids": [OTHER_MSG_ID],
+                    },
+                },
+                kind={
+                    "type": "send_outcome",
+                    "intent_kind": "send_message",
+                    "result_kind": "published",
+                    "outbound_messages": [
+                        {
+                            "msg_id": OTHER_MSG_ID,
+                            "artifact_kind": "application_message",
+                            "recipient_expectation": {
+                                "artifact_kind": "application_message",
+                                "recipient_scope": "all_other_current_group_members",
+                                "expected_count": 1,
+                            },
+                        }
+                    ],
+                },
+            ),
+            audit_event_v2(
+                4,
+                context={"convergence": {"run_id": "run-1", "phase": "evaluating"}},
+                kind={
+                    "type": "convergence_run_state",
+                    "phase": "evaluating",
+                    "current_tip_epoch": 7,
+                },
+            ),
+            audit_event_v2(
+                5,
+                context={"convergence": {"run_id": "run-1", "phase": "selected"}},
+                kind={
+                    "type": "convergence_decision",
+                    "current_tip_epoch": 7,
+                    "max_rewind_commits": 5,
+                    "selected_branch_id": "branch-a",
+                    "selected_fork_epoch": 6,
+                    "selected_tip_epoch": 8,
+                    "candidates": [
+                        {
+                            "branch_id": "branch-a",
+                            "fork_epoch": 6,
+                            "tip_epoch": 8,
+                            "eligible": True,
+                            "commit_ids": [MSG_ID],
+                            "score": {
+                                "valid_commit_depth": 2,
+                                "effective_commit_depth": 2,
+                                "witness_quorum_met": True,
+                                "app_witness_score": 9,
+                                "tip_priority": "app_witness",
+                            },
+                        },
+                        {
+                            "branch_id": "branch-b",
+                            "fork_epoch": 6,
+                            "tip_epoch": 7,
+                            "eligible": False,
+                            "rejection_reasons": ["lower_weight"],
+                            "score": {
+                                "valid_commit_depth": 1,
+                                "effective_commit_depth": 1,
+                                "witness_quorum_met": False,
+                                "app_witness_score": 2,
+                                "tip_priority": "stale",
+                            },
+                        },
+                    ],
+                    "rule_trace": [
+                        {
+                            "rule_name": "highest_weight",
+                            "scope": "candidate_pair",
+                            "candidate_branch_id": "branch-a",
+                            "other_candidate_branch_id": "branch-b",
+                            "inputs": {"branch_a_weight": 9, "branch_b_weight": 2},
+                            "result": {"winner": "branch-a"},
+                            "decisive": True,
+                            "selected_branch_id": "branch-a",
+                        }
+                    ],
+                },
+            ),
+            audit_event_v2(
+                6,
+                audit_data_mode="full_data",
+                kind={
+                    "type": "group_state_changed",
+                    "epoch": 8,
+                    "change_kind": "group_renamed",
+                    "actor_member_ref": ACCOUNT_ALICE,
+                    "origin_commit_id": MSG_ID,
+                    "fields": ["name"],
+                    "value": {"digest": DIGEST_B, "text": "Launch room"},
+                },
+            ),
+            audit_event_v2(
+                7,
+                kind={
+                    "type": "epoch_state_changed",
+                    "previous_state": "pending",
+                    "new_state": "committed",
+                    "epoch": 8,
+                    "reason": "winning_commit_applied",
+                    "pending_ref": 8,
+                    "pending_kind": "commit",
+                },
+            ),
+            audit_event_v2(
+                8,
+                kind={
+                    "type": "publish_failure",
+                    "msg_id": MSG_ID,
+                    "target_kind": "application_message",
+                    "required_acks": 2,
+                    "relay_url": "wss://relay.example",
+                    "stage": "relay_publish",
+                    "reason": "relay_error",
+                },
+            ),
+            audit_event_v2(
+                9,
+                audit_data_mode="full_data",
+                recorder_session_id="session-a-full",
+                kind={
+                    "type": "audit_data_mode_changed",
+                    "previous_mode": "obfuscated_sensitive_data",
+                    "new_mode": "full_data",
+                    "reason": "forensic_capture_enabled",
+                    "recorder_restarted": True,
+                },
+            ),
+            audit_event_v2(
+                10,
+                context={
+                    "operation_id": "op-system-recorder",
+                    "human_action": {
+                        "action": "background_sync",
+                        "origin": "system",
+                        "phase": "observed",
+                    },
+                },
+                kind={
+                    "type": "recorder_health",
+                    "serialization_failures": 0,
+                    "write_failures": 0,
+                    "flush_failures": 0,
+                },
+            ),
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            HTTP_X_GOGGLES_DEVICE_ID="device-1",
+            HTTP_X_GOGGLES_DEVICE_NAME="Alice MacBook",
+            HTTP_X_GOGGLES_ACCOUNT_PUBKEY_HEX="aa" * 32,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["schema_versions"], [SCHEMA_VERSION_V2])
+        self.assertEqual(
+            response.json()["audit_data_modes"],
+            ["full_data", "obfuscated_sensitive_data"],
+        )
+        self.assertEqual(response.json()["source"]["device_id"], "device-1")
+
+        bob_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=jsonl(
+                audit_event_v2(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    recorder_session_id="session-b",
+                    context={"source": {"account_label": "Bob", "device_name": "Bob laptop"}},
+                    kind={"type": "recorder_started", "recorder": "darkmatter"},
+                )
+            ),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        self.assertEqual(bob_response.status_code, 201)
+
+        audit_file = AuditFile.objects.get(source_device_id="device-1")
+        self.assertEqual(audit_file.source_device_name, "Alice MacBook")
+        self.assertEqual(audit_file.source_account_pubkey_hex, "aa" * 32)
+
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        artifact = DeliveryArtifact.objects.get(group=group, artifact_id=MSG_ID)
+        self.assertEqual(artifact.artifact_kind, "application_message")
+        self.assertEqual(artifact.decoded_payload["text"], "hello from Alice")
+        self.assertEqual(artifact.recipient_expectations.get().expected_count, 2)
+        self.assertEqual(DeliveryArtifact.objects.filter(group=group).count(), 2)
+        self.assertEqual(
+            NetworkObservation.objects.get(group=group, phase="transport_received").relay_url,
+            "wss://relay.example",
+        )
+        run = ConvergenceRun.objects.get(group=group, run_id="run-1")
+        self.assertEqual(run.selected_branch_id, "branch-a")
+        self.assertEqual(ConvergenceCandidate.objects.filter(run=run).count(), 2)
+        self.assertEqual(ConvergenceRuleEvaluation.objects.get(run=run).rule_name, "highest_weight")
+        self.assertEqual(StateDelta.objects.get(group=group).value["text"], "Launch room")
+        self.assertEqual(EpochStateTransition.objects.get(group=group).new_state, "committed")
+
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        api_response = self.client.get(
+            reverse("api-group-projections", kwargs={"slug": group.slug}),
+            {"engine_id": ENGINE_ALICE},
+        )
+
+        self.assertEqual(api_response.status_code, 200)
+        payload = api_response.json()
+        self.assertEqual(payload["schema_version"], "goggles-audit-projections/v1")
+        self.assertEqual(payload["filters"]["engine_id"], ENGINE_ALICE)
+        self.assertEqual(payload["pagination"]["delivery_artifacts"]["limit"], 500)
+        self.assertEqual(
+            payload["delivery_artifacts"][0]["decoded_payload"]["text"], "hello from Alice"
+        )
+        self.assertIn(
+            "decoded_payload",
+            payload["delivery_artifacts"][0]["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertEqual(payload["network_observations"][0]["relay_url"], "wss://relay.example")
+        self.assertEqual(
+            payload["network_observations"][0]["welcome_nostr_event_id"],
+            DIGEST_B,
+        )
+        self.assertEqual(
+            payload["network_observations"][0]["welcome_rumor_event_id"],
+            DIGEST_A,
+        )
+        self.assertEqual(
+            payload["network_observations"][0]["welcome_key_package_tag"],
+            "kp:alice:1",
+        )
+        self.assertIn(
+            "nostr_event_id",
+            payload["network_observations"][0]["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertIn(
+            "welcome_nostr_event_id",
+            payload["network_observations"][0]["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertEqual(payload["convergence_runs"][0]["selected_branch_id"], "branch-a")
+        self.assertEqual(payload["state_deltas"][0]["value"]["text"], "Launch room")
+        mode_change = payload["audit_data_mode_changes"][0]
+        self.assertEqual(mode_change["previous_mode"], "obfuscated_sensitive_data")
+        self.assertEqual(mode_change["new_mode"], "full_data")
+        self.assertEqual(mode_change["reason"], "forensic_capture_enabled")
+        self.assertTrue(mode_change["recorder_restarted"])
+        self.assertEqual(mode_change["severity"], "warning")
+        self.assertTrue(mode_change["evidence_ref"])
+        self.assertEqual(
+            payload["action_attribution"]["user_actions"][0]["action"],
+            "send_message",
+        )
+        self.assertEqual(
+            payload["pagination"]["action_attribution"]["user_actions"]["returned"],
+            1,
+        )
+
+        group_response = self.client.get(reverse("api-group-detail", kwargs={"slug": group.slug}))
+        self.assertEqual(group_response.status_code, 200)
+        self.assertTrue(group_response.json()["classification"]["contains_full_data"])
+
+        group_list_response = self.client.get(reverse("api-group-list"))
+        self.assertEqual(group_list_response.status_code, 200)
+        self.assertEqual(group_list_response.json()["groups"][0]["slug"], group.slug)
+
+        delivery_page_response = self.client.get(
+            reverse("api-group-delivery", kwargs={"slug": group.slug}),
+            {"limit": "1", "offset": "0"},
+        )
+        self.assertEqual(delivery_page_response.status_code, 200)
+        self.assertEqual(delivery_page_response.json()["pagination"]["returned"], 1)
+        self.assertTrue(delivery_page_response.json()["pagination"]["has_more"])
+        self.assertEqual(delivery_page_response.json()["pagination"]["next_offset"], 1)
+
+        delivery_all_response = self.client.get(
+            reverse("api-group-delivery", kwargs={"slug": group.slug})
+        )
+        self.assertEqual(delivery_all_response.status_code, 200)
+        delivery_by_id = {
+            artifact["artifact_id"]: artifact
+            for artifact in delivery_all_response.json()["delivery_artifacts"]
+        }
+        send_count_row = next(
+            row
+            for row in delivery_by_id[OTHER_MSG_ID]["recipient_matrix"]
+            if row["recipient_type"] == "count_only"
+        )
+        self.assertEqual(send_count_row["status"], "missing_count_inferred")
+        self.assertEqual(send_count_row["expected_count"], 1)
+        self.assertEqual(send_count_row["observed_count"], 0)
+        self.assertEqual(send_count_row["missing_count"], 1)
+        self.assertEqual(send_count_row["excluded_observation_count"], 1)
+        self.assertEqual(delivery_by_id[OTHER_MSG_ID]["severity"], "warning")
+
+        delivery_warning_response = self.client.get(
+            reverse("api-group-delivery", kwargs={"slug": group.slug}),
+            {"severity": "warning"},
+        )
+        self.assertEqual(delivery_warning_response.status_code, 200)
+        warning_artifacts = delivery_warning_response.json()["delivery_artifacts"]
+        self.assertCountEqual(
+            [artifact["artifact_id"] for artifact in warning_artifacts],
+            [MSG_ID, OTHER_MSG_ID],
+        )
+        self.assertTrue(all(artifact["severity"] == "warning" for artifact in warning_artifacts))
+
+        delivery_response = self.client.get(
+            reverse("api-group-delivery", kwargs={"slug": group.slug}),
+            {"audit_data_mode": "full_data"},
+        )
+        self.assertEqual(delivery_response.status_code, 200)
+        delivery_payload = delivery_response.json()
+        self.assertEqual(len(delivery_payload["delivery_artifacts"]), 1)
+        delivery_artifact = delivery_payload["delivery_artifacts"][0]
+        self.assertEqual(delivery_artifact["artifact_id"], MSG_ID)
+        self.assertTrue(delivery_artifact["evidence_refs"])
+        self.assertTrue(delivery_artifact["engine_observations"][0]["evidence_refs"])
+        self.assertTrue(delivery_artifact["recipient_expectations"][0]["evidence_ref"])
+        self.assertTrue(delivery_artifact["sensitivity"]["contains_full_data"])
+        self.assertEqual(
+            delivery_artifact["sensitivity"]["authorization"]["required"],
+            "authenticated_internal_user",
+        )
+        self.assertIn(
+            "decoded_app_event",
+            delivery_artifact["sensitivity"]["sensitive_field_paths"],
+        )
+        observation_states = {
+            state["state"]: state for state in delivery_artifact["engine_observations"][0]["states"]
+        }
+        self.assertTrue(observation_states["transport_received"]["evidence_ref"])
+        self.assertTrue(observation_states["decoded"]["evidence_ref"])
+        self.assertTrue(observation_states["publish:failed"]["evidence_ref"])
+        matrix = {
+            (row["recipient_type"], row["recipient_id"]): row
+            for row in delivery_artifact["recipient_matrix"]
+        }
+        self.assertEqual(matrix[("member_ref", ACCOUNT_BOB)]["status"], "missing_inferred")
+        self.assertEqual(
+            matrix[("pubkey_hex", "cc" * 32)]["status"],
+            "unobserved_no_uploaded_engine",
+        )
+        self.assertTrue(
+            any(
+                row["status"] == "observed_not_expected"
+                for row in delivery_artifact["recipient_matrix"]
+            )
+        )
+
+        delivery_detail_response = self.client.get(
+            reverse(
+                "api-group-delivery-artifact",
+                kwargs={"slug": group.slug, "artifact_id": MSG_ID},
+            )
+        )
+        self.assertEqual(delivery_detail_response.status_code, 200)
+        self.assertEqual(
+            delivery_detail_response.json()["delivery_artifact"]["decoded_payload"]["text"],
+            "hello from Alice",
+        )
+        delivery_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
+        )
+        message_trace_url = reverse("api-message-detail", kwargs={"message_id": MSG_ID})
+        other_message_trace_url = reverse(
+            "api-message-detail",
+            kwargs={"message_id": OTHER_MSG_ID},
+        )
+        self.assertContains(delivery_tab_response, "missing inferred")
+        self.assertContains(delivery_tab_response, "missing count inferred")
+        self.assertContains(delivery_tab_response, "0/1 observed")
+        self.assertContains(delivery_tab_response, "no uploaded engine")
+        self.assertContains(delivery_tab_response, "delivery gap inferred")
+        self.assertContains(delivery_tab_response, "Engine delivery matrix")
+        self.assertContains(delivery_tab_response, "Alice MacBook")
+        self.assertContains(delivery_tab_response, "Bob laptop")
+        self.assertContains(delivery_tab_response, "decrypted content")
+        self.assertContains(delivery_tab_response, message_trace_url)
+        self.assertContains(delivery_tab_response, "/api/v1/events/")
+        self.assertContains(delivery_tab_response, "Engine state trail")
+        self.assertContains(delivery_tab_response, "publish:failed")
+
+        network_response = self.client.get(
+            reverse("api-group-network", kwargs={"slug": group.slug}),
+            {"message_id": MSG_ID},
+        )
+        self.assertEqual(network_response.status_code, 200)
+        self.assertEqual(network_response.json()["network_observations"][0]["message_id"], MSG_ID)
+        self.assertTrue(network_response.json()["network_observations"][0]["evidence_ref"])
+
+        network_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
+        )
+        self.assertContains(network_tab_response, message_trace_url)
+        self.assertContains(network_tab_response, "/api/v1/events/")
+
+        network_error_response = self.client.get(
+            reverse("api-group-network", kwargs={"slug": group.slug}),
+            {"severity": "error"},
+        )
+        self.assertEqual(network_error_response.status_code, 200)
+        error_network = network_error_response.json()["network_observations"]
+        self.assertEqual(len(error_network), 1)
+        self.assertEqual(error_network[0]["phase"], "publish_failure")
+        self.assertEqual(error_network[0]["severity"], "error")
+
+        convergence_response = self.client.get(
+            reverse("api-group-convergence-runs", kwargs={"slug": group.slug})
+        )
+        self.assertEqual(convergence_response.status_code, 200)
+        self.assertEqual(
+            convergence_response.json()["convergence_runs"][0]["rule_evaluations"][0]["rule_name"],
+            "highest_weight",
+        )
+        convergence_payload = convergence_response.json()["convergence_runs"][0]
+        candidate_scores = {
+            candidate["branch_id"]: candidate["score"]
+            for candidate in convergence_payload["candidates"]
+        }
+        self.assertEqual(candidate_scores["branch-a"]["app_witness_score"], 9)
+        self.assertTrue(convergence_payload["evidence_refs"])
+        self.assertTrue(convergence_payload["candidates"][0]["evidence_refs"])
+        self.assertTrue(convergence_payload["rule_evaluations"][0]["evidence_refs"])
+
+        convergence_message_response = self.client.get(
+            reverse("api-group-convergence-runs", kwargs={"slug": group.slug}),
+            {"message_id": MSG_ID},
+        )
+        self.assertEqual(convergence_message_response.status_code, 200)
+        self.assertEqual(
+            convergence_message_response.json()["convergence_runs"][0]["run_id"],
+            "run-1",
+        )
+
+        convergence_epoch_response = self.client.get(
+            reverse("api-group-convergence-runs", kwargs={"slug": group.slug}),
+            {"epoch": "6"},
+        )
+        self.assertEqual(convergence_epoch_response.status_code, 200)
+        self.assertEqual(
+            convergence_epoch_response.json()["convergence_runs"][0]["selected_branch_id"],
+            "branch-a",
+        )
+
+        convergence_miss_response = self.client.get(
+            reverse("api-group-convergence-runs", kwargs={"slug": group.slug}),
+            {"message_id": OTHER_MSG_ID},
+        )
+        self.assertEqual(convergence_miss_response.status_code, 200)
+        self.assertEqual(convergence_miss_response.json()["convergence_runs"], [])
+
+        convergence_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
+        )
+        self.assertContains(convergence_tab_response, "branch-graph")
+        self.assertContains(convergence_tab_response, "selected")
+        self.assertContains(convergence_tab_response, "rejected")
+        self.assertContains(convergence_tab_response, message_trace_url)
+        self.assertContains(convergence_tab_response, "/api/v1/events/")
+        self.assertContains(convergence_tab_response, "Candidate scoring")
+        self.assertContains(convergence_tab_response, "app witness 9")
+        self.assertContains(convergence_tab_response, "Rule trace")
+        self.assertContains(convergence_tab_response, "branch_a_weight 9")
+        self.assertContains(convergence_tab_response, "winner branch-a")
+
+        convergence_detail_response = self.client.get(
+            reverse(
+                "api-group-convergence-run",
+                kwargs={"slug": group.slug, "run_id": "run-1"},
+            )
+        )
+        self.assertEqual(convergence_detail_response.status_code, 200)
+        self.assertEqual(
+            convergence_detail_response.json()["convergence_run"]["selected_branch_id"],
+            "branch-a",
+        )
+
+        state_response = self.client.get(
+            reverse("api-group-state", kwargs={"slug": group.slug}),
+            {"epoch": "8"},
+        )
+        self.assertEqual(state_response.status_code, 200)
+        state_payload = state_response.json()
+        self.assertEqual(state_payload["state_deltas"][0]["change_kind"], "group_renamed")
+        self.assertTrue(state_payload["state_deltas"][0]["evidence_ref"])
+        self.assertTrue(state_payload["state_deltas"][0]["sensitivity"]["contains_full_data"])
+        self.assertIn(
+            "value.text",
+            state_payload["state_deltas"][0]["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertTrue(state_payload["epoch_state_transitions"][0]["evidence_ref"])
+
+        state_message_response = self.client.get(
+            reverse("api-group-state", kwargs={"slug": group.slug}),
+            {"message_id": MSG_ID},
+        )
+        self.assertEqual(state_message_response.status_code, 200)
+        self.assertEqual(
+            state_message_response.json()["state_deltas"][0]["origin_commit_id"],
+            MSG_ID,
+        )
+        self.assertEqual(state_message_response.json()["epoch_state_transitions"], [])
+
+        state_other_message_response = self.client.get(
+            reverse("api-group-state", kwargs={"slug": group.slug}),
+            {"message_id": OTHER_MSG_ID},
+        )
+        self.assertEqual(state_other_message_response.status_code, 200)
+        self.assertEqual(state_other_message_response.json()["state_deltas"], [])
+
+        state_bob_response = self.client.get(
+            reverse("api-group-state", kwargs={"slug": group.slug}),
+            {"engine_id": ENGINE_BOB},
+        )
+        self.assertEqual(state_bob_response.status_code, 200)
+        self.assertEqual(state_bob_response.json()["state_deltas"], [])
+
+        state_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
+        )
+        self.assertContains(state_tab_response, "full data")
+        self.assertContains(state_tab_response, message_trace_url)
+        self.assertContains(state_tab_response, "/api/v1/events/")
+
+        projection_download_response = self.client.get(
+            reverse("api-group-projections", kwargs={"slug": group.slug}),
+            {"download": "1"},
+        )
+        self.assertEqual(projection_download_response.status_code, 200)
+        self.assertIn("attachment", projection_download_response["Content-Disposition"])
+
+        agent_export_response = self.client.get(
+            reverse("group-agent-export", kwargs={"slug": group.slug})
+        )
+        self.assertEqual(agent_export_response.status_code, 200)
+        self.assertEqual(
+            agent_export_response.json()["derived_projections"]["delivery_artifacts"][0][
+                "artifact_id"
+            ],
+            MSG_ID,
+        )
+        self.assertEqual(
+            agent_export_response.json()["derived_projections"]["action_attribution"][
+                "user_actions"
+            ][0]["action"],
+            "send_message",
+        )
+
+        exports_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "exports"})
+        )
+        self.assertContains(exports_tab_response, "Download JSON")
+        self.assertContains(exports_tab_response, "Actions")
+        self.assertContains(exports_tab_response, "Full data auditing evidence is present")
+        self.assertContains(exports_tab_response, "Saved reports")
+
+        save_report_response = self.client.post(
+            reverse("create-saved-report", kwargs={"slug": group.slug}),
+            {
+                "title": "Launch room report",
+                "notes": "Alice send path and convergence look correct.",
+            },
+        )
+        saved_report = AnalysisRun.objects.get(group=group)
+        self.assertRedirects(
+            save_report_response,
+            reverse("saved-report-detail", kwargs={"pk": saved_report.pk}),
+        )
+        self.assertEqual(saved_report.created_by.username, "analyst")
+        self.assertEqual(saved_report.title, "Launch room report")
+        self.assertEqual(saved_report.notes, "Alice send path and convergence look correct.")
+        self.assertEqual(
+            saved_report.report_json["projection"]["delivery_artifacts"][0]["artifact_id"],
+            MSG_ID,
+        )
+        self.assertEqual(
+            saved_report.report_json["projection"]["action_attribution"]["system_attribution"][0][
+                "action"
+            ],
+            "background_sync",
+        )
+
+        saved_report_response = self.client.get(
+            reverse("saved-report-detail", kwargs={"pk": saved_report.pk})
+        )
+        self.assertContains(saved_report_response, "Launch room report")
+        self.assertContains(saved_report_response, "Alice send path")
+        self.assertContains(saved_report_response, "Audit mode changes")
+        self.assertContains(saved_report_response, "User actions")
+        self.assertContains(saved_report_response, "System attribution")
+
+        saved_report_json_response = self.client.get(
+            reverse("saved-report-json", kwargs={"pk": saved_report.pk})
+        )
+        self.assertEqual(saved_report_json_response.status_code, 200)
+        self.assertEqual(
+            saved_report_json_response.json()["schema_version"],
+            "goggles-saved-investigation/v1",
+        )
+
+        engines_response = self.client.get(
+            reverse("api-group-engines", kwargs={"slug": group.slug})
+        )
+        self.assertEqual(engines_response.status_code, 200)
+        engines_by_id = {
+            engine["engine_id"]: engine for engine in engines_response.json()["engines"]
+        }
+        self.assertEqual(engines_response.json()["engines"][0]["engine_id"], ENGINE_ALICE)
+        self.assertEqual(
+            engines_by_id[ENGINE_ALICE]["source_metadata"]["device_ids"],
+            ["device-1"],
+        )
+        self.assertEqual(
+            engines_by_id[ENGINE_ALICE]["source_metadata"]["device_names"],
+            ["Alice MacBook"],
+        )
+        self.assertEqual(
+            engines_by_id[ENGINE_ALICE]["source_metadata"]["account_pubkeys_hex"],
+            ["aa" * 32],
+        )
+        self.assertIn(
+            "source_metadata.account_pubkeys_hex",
+            engines_by_id[ENGINE_ALICE]["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertEqual(
+            engines_by_id[ENGINE_BOB]["source_metadata"]["account_labels"],
+            ["Bob"],
+        )
+        self.assertEqual(
+            engines_by_id[ENGINE_BOB]["source_metadata"]["device_names"],
+            ["Bob laptop"],
+        )
+
+        actions_response = self.client.get(
+            reverse("api-group-actions", kwargs={"slug": group.slug})
+        )
+        self.assertEqual(actions_response.status_code, 200)
+        actions_payload = actions_response.json()
+        self.assertEqual(actions_payload["schema_version"], "goggles-action-attribution/v1")
+        origin_counts = {
+            row["origin"]: (row["attribution_kind"], row["count"])
+            for row in actions_payload["origin_counts"]
+        }
+        self.assertEqual(origin_counts["local_user"], ("user", 1))
+        self.assertEqual(origin_counts["system"], ("system", 1))
+        user_action = actions_payload["user_actions"][0]
+        self.assertEqual(user_action["attribution_kind"], "user")
+        self.assertEqual(user_action["origin"], "local_user")
+        self.assertEqual(user_action["action"], "send_message")
+        self.assertEqual(user_action["message_ids"], [OTHER_MSG_ID])
+        self.assertEqual(user_action["events"][0]["event_type"], "send_outcome")
+        self.assertTrue(user_action["evidence_refs"])
+        self.assertNotIn("raw_line", user_action["events"][0])
+        system_action = actions_payload["system_attribution"][0]
+        self.assertEqual(system_action["attribution_kind"], "system")
+        self.assertEqual(system_action["origin"], "system")
+        self.assertEqual(system_action["action"], "background_sync")
+        self.assertEqual(system_action["events"][0]["event_type"], "recorder_health")
+
+        system_actions_response = self.client.get(
+            reverse("api-group-actions", kwargs={"slug": group.slug}),
+            {"origin": "system"},
+        )
+        self.assertEqual(system_actions_response.status_code, 200)
+        self.assertEqual(system_actions_response.json()["user_actions"], [])
+        self.assertEqual(
+            system_actions_response.json()["system_attribution"][0]["action"],
+            "background_sync",
+        )
+
+        message_actions_response = self.client.get(
+            reverse("api-group-actions", kwargs={"slug": group.slug}),
+            {"message_id": OTHER_MSG_ID},
+        )
+        self.assertEqual(message_actions_response.status_code, 200)
+        self.assertEqual(
+            message_actions_response.json()["user_actions"][0]["action"], "send_message"
+        )
+        self.assertEqual(message_actions_response.json()["system_attribution"], [])
+
+        system_projection_response = self.client.get(
+            reverse("api-group-projections", kwargs={"slug": group.slug}),
+            {"origin": "system"},
+        )
+        self.assertEqual(system_projection_response.status_code, 200)
+        self.assertEqual(
+            system_projection_response.json()["action_attribution"]["user_actions"],
+            [],
+        )
+        self.assertEqual(
+            system_projection_response.json()["action_attribution"]["system_attribution"][0][
+                "action"
+            ],
+            "background_sync",
+        )
+
+        overview_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "overview"})
+        )
+        self.assertContains(overview_response, "Engines and devices")
+        self.assertContains(overview_response, "Action attribution")
+        self.assertContains(overview_response, "User actions")
+        self.assertContains(overview_response, "System attribution")
+        self.assertContains(overview_response, "Send Message")
+        self.assertContains(overview_response, other_message_trace_url)
+        self.assertContains(overview_response, "Background Sync")
+        self.assertContains(overview_response, "Audit data mode changes")
+        self.assertContains(overview_response, "forensic_capture_enabled")
+        self.assertContains(overview_response, "session-a-full")
+        self.assertContains(overview_response, "Alice MacBook")
+        self.assertContains(overview_response, "device-1")
+        self.assertContains(overview_response, "Bob laptop")
+
+        account_groups_response = self.client.get(
+            reverse("api-account-groups", kwargs={"account_ref": ACCOUNT_ALICE})
+        )
+        self.assertEqual(account_groups_response.status_code, 200)
+        self.assertEqual(account_groups_response.json()["groups"][0]["slug"], group.slug)
+
+        account_investigation_response = self.client.get(
+            reverse("account-investigation", kwargs={"account_ref": ACCOUNT_ALICE})
+        )
+        self.assertEqual(account_investigation_response.status_code, 200)
+        self.assertContains(account_investigation_response, "Cross-group investigation")
+        self.assertContains(account_investigation_response, ACCOUNT_ALICE)
+        self.assertContains(account_investigation_response, "Open JSON")
+
+        engine_groups_response = self.client.get(
+            reverse("api-engine-groups", kwargs={"engine_id": ENGINE_ALICE})
+        )
+        self.assertEqual(engine_groups_response.status_code, 200)
+        self.assertEqual(engine_groups_response.json()["groups"][0]["slug"], group.slug)
+
+        engine_investigation_response = self.client.get(
+            reverse("engine-investigation", kwargs={"engine_id": ENGINE_ALICE})
+        )
+        self.assertEqual(engine_investigation_response.status_code, 200)
+        self.assertContains(engine_investigation_response, ENGINE_ALICE)
+        self.assertContains(engine_investigation_response, "Export")
+
+        evidence_list_response = self.client.get(
+            reverse("api-group-evidence", kwargs={"slug": group.slug}),
+            {"event_type": "audit_data_mode_changed"},
+        )
+        self.assertEqual(evidence_list_response.status_code, 200)
+        evidence_list_payload = evidence_list_response.json()
+        self.assertEqual(evidence_list_payload["schema_version"], "goggles-evidence-list/v1")
+        self.assertEqual(evidence_list_payload["pagination"]["returned"], 1)
+        evidence_row = evidence_list_payload["evidence"][0]
+        self.assertEqual(evidence_row["event_type"], "audit_data_mode_changed")
+        self.assertTrue(evidence_row["evidence_ref"]["line_hash"])
+        self.assertTrue(evidence_row["evidence_ref"]["api_path"])
+        self.assertIn("source_file", evidence_row)
+        self.assertNotIn("raw_line", evidence_row)
+        self.assertNotIn("raw_event", evidence_row)
+
+        evidence_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
+        )
+        self.assertContains(
+            evidence_tab_response, reverse("api-group-evidence", kwargs={"slug": group.slug})
+        )
+        self.assertContains(evidence_tab_response, message_trace_url)
+        self.assertContains(evidence_tab_response, "JSON")
+
+        evidence_response = self.client.get(delivery_artifact["evidence_refs"][0]["api_path"])
+        self.assertEqual(evidence_response.status_code, 200)
+        self.assertEqual(evidence_response.json()["evidence_ref"]["audit_file_id"], audit_file.id)
+        self.assertIn(
+            "raw_line",
+            evidence_response.json()["sensitivity"]["sensitive_field_paths"],
+        )
+        self.assertIn("raw_line", evidence_response.json()["event"])
+
+    def test_v2_message_ids_must_be_canonical_64_hex_ids(self):
+        raw_token, _token = UploadToken.issue("v2 strict message ids")
+        body = jsonl(
+            audit_event_v2(
+                0,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": "abcd",
+                    "new_state": "processed",
+                    "reason": "short_id_regression",
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("msg_id must be 64 hex characters", response.json()["error"])
+        event = AuditEvent.objects.get()
+        self.assertEqual(event.msg_id, "")
+        self.assertEqual(event.raw_event["kind"]["msg_id"], "abcd")
+
+    def test_v2_state_delta_preserves_membership_change_source(self):
+        raw_token, _token = UploadToken.issue("v2 membership source")
+        body = jsonl(
+            audit_event_v2(
+                0,
+                audit_data_mode="full_data",
+                kind={
+                    "type": "group_state_changed",
+                    "epoch": 8,
+                    "change_kind": "member_removed",
+                    "membership_change_source": "convergence",
+                    "subject_member_ref": ACCOUNT_BOB,
+                    "origin_commit_id": MSG_ID,
+                    "fields": ["members"],
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        delta = StateDelta.objects.get(group=group)
+        self.assertEqual(delta.change_kind, "member_removed")
+        self.assertEqual(delta.membership_change_source, "convergence")
+
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        state_response = self.client.get(reverse("api-group-state", kwargs={"slug": group.slug}))
+        self.assertEqual(
+            state_response.json()["state_deltas"][0]["membership_change_source"],
+            "convergence",
+        )
+        state_tab_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
+        )
+        self.assertContains(state_tab_response, "convergence")
+
+    def test_api_message_detail_returns_matches_across_groups(self):
+        raw_token, _token = UploadToken.issue("message lookup client")
+
+        def upload_message_event(seq, group_ref, engine_id, account_ref):
+            response = self.client.post(
+                reverse("api-audit-log-upload"),
+                data=jsonl(
+                    audit_event_v2(
+                        seq,
+                        group_ref=group_ref,
+                        engine_id=engine_id,
+                        account_ref=account_ref,
+                        kind={
+                            "type": "transport_received",
+                            "msg_id": MSG_ID,
+                            "transport": {
+                                "transport": "nostr",
+                                "delivery_plane": "relay",
+                                "relay_url": "wss://relay.example",
+                                "nostr_event_id": DIGEST_A,
+                                "nostr_kind": 445,
+                            },
+                            "payload_len": 42,
+                            "payload_digest": DIGEST_A,
+                        },
+                    )
+                ),
+                content_type="application/x-ndjson",
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            )
+            self.assertEqual(response.status_code, 201)
+
+        upload_message_event(0, GROUP_REF, ENGINE_ALICE, ACCOUNT_ALICE)
+        upload_message_event(0, OTHER_GROUP_REF, ENGINE_BOB, ACCOUNT_BOB)
+        related_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=jsonl(
+                audit_event_v2(
+                    1,
+                    group_ref=GROUP_REF,
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    context={"convergence": {"run_id": "msg-run", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 8,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-msg",
+                        "selected_tip_epoch": 9,
+                        "candidates": [
+                            {
+                                "branch_id": "branch-msg",
+                                "tip_epoch": 9,
+                                "eligible": True,
+                                "commit_ids": [MSG_ID],
+                            }
+                        ],
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    group_ref=GROUP_REF,
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 9,
+                        "change_kind": "member_added",
+                        "origin_commit_id": MSG_ID,
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    group_ref=GROUP_REF,
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    context={"operation_id": "op-message-trace"},
+                    kind={
+                        "type": "human_action",
+                        "action": "send_message",
+                        "origin": "local_user",
+                        "phase": "requested",
+                        "message_ids": [MSG_ID],
+                    },
+                ),
+            ),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        self.assertEqual(related_response.status_code, 201)
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("api-message-detail", kwargs={"message_id": MSG_ID}))
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-message/v1")
+        self.assertEqual(payload["message_id"], MSG_ID)
+        self.assertEqual(payload["filters"]["message_id"], MSG_ID)
+        self.assertEqual(payload["pagination"]["returned"], 2)
+        self.assertEqual(
+            {match["group"]["slug"] for match in payload["matches"]},
+            {GROUP_REF, OTHER_GROUP_REF},
+        )
+        for match in payload["matches"]:
+            artifact = match["delivery_artifact"]
+            self.assertEqual(artifact["artifact_id"], MSG_ID)
+            self.assertTrue(artifact["evidence_refs"])
+            self.assertTrue(artifact["engine_observations"][0]["states"][0]["evidence_ref"])
+            self.assertIn("related", match)
+
+        matches_by_group = {match["group"]["slug"]: match for match in payload["matches"]}
+        group_related = matches_by_group[GROUP_REF]["related"]
+        self.assertEqual(
+            group_related["network_observations"][0]["phase"],
+            "transport_received",
+        )
+        self.assertEqual(group_related["convergence_runs"][0]["run_id"], "msg-run")
+        self.assertEqual(
+            group_related["state_deltas"][0]["origin_commit_id"],
+            MSG_ID,
+        )
+        self.assertEqual(
+            group_related["action_attribution"]["user_actions"][0]["action"],
+            "send_message",
+        )
+        self.assertEqual(
+            group_related["pagination"]["convergence_runs"]["returned"],
+            1,
+        )
+        other_related = matches_by_group[OTHER_GROUP_REF]["related"]
+        self.assertEqual(other_related["network_observations"][0]["phase"], "transport_received")
+        self.assertEqual(other_related["convergence_runs"], [])
+        self.assertEqual(other_related["state_deltas"], [])
+        self.assertEqual(other_related["action_attribution"]["user_actions"], [])
+
+        filtered_response = self.client.get(
+            reverse("api-message-detail", kwargs={"message_id": MSG_ID}),
+            {"engine_id": ENGINE_BOB},
+        )
+
+        self.assertEqual(filtered_response.status_code, 200)
+        filtered_payload = filtered_response.json()
+        self.assertEqual(filtered_payload["pagination"]["returned"], 1)
+        self.assertEqual(filtered_payload["matches"][0]["group"]["slug"], OTHER_GROUP_REF)
+        self.assertEqual(
+            filtered_payload["matches"][0]["delivery_artifact"]["engine_observations"][0][
+                "engine_id"
+            ],
+            ENGINE_BOB,
+        )
 
     def test_invalid_jsonl_returns_400_and_saves_quarantined_upload(self):
         raw_token, _token = UploadToken.issue("ios test client")
@@ -2552,6 +3702,368 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(event.raw_kind["shape"], "new")
 
 
+class RebuildAuditProjectionsCommandTests(TestCase):
+    def test_rebuild_restores_v2_projection_tables_from_raw_evidence(self):
+        result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    kind={
+                        "type": "transport_received",
+                        "msg_id": MSG_ID,
+                        "transport": {
+                            "transport": "nostr",
+                            "delivery_plane": "relay",
+                            "relay_url": "wss://relay.example",
+                            "nostr_event_id": DIGEST_A,
+                            "nostr_kind": 445,
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    1,
+                    audit_data_mode="full_data",
+                    kind={
+                        "type": "message_content_decoded",
+                        "msg_id": MSG_ID,
+                        "artifact_kind": "application_message",
+                        "author": {
+                            "member_ref": ACCOUNT_ALICE,
+                            "account_pubkey_hex": "aa" * 32,
+                        },
+                        "decoded_payload": {"content_type": "text/plain", "text": "hello"},
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    kind={
+                        "type": "recipient_expectation",
+                        "msg_id": MSG_ID,
+                        "expectation": {
+                            "artifact_kind": "application_message",
+                            "recipient_scope": "all_other_current_group_members",
+                            "expected_member_refs": [ACCOUNT_BOB],
+                            "expected_count": 1,
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    context={"convergence": {"run_id": "run-1", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 7,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-a",
+                        "candidates": [
+                            {
+                                "branch_id": "branch-a",
+                                "eligible": True,
+                                "score": {"app_witness_score": 1},
+                            }
+                        ],
+                        "rule_trace": [
+                            {
+                                "rule_name": "highest_weight",
+                                "result": {"winner": "branch-a"},
+                                "decisive": True,
+                            }
+                        ],
+                    },
+                ),
+                audit_event_v2(
+                    4,
+                    context={"convergence": {"run_id": "run-1", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 7,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-a",
+                        "candidates": [
+                            {
+                                "branch_id": "branch-a",
+                                "eligible": True,
+                                "score": {"app_witness_score": 3},
+                            }
+                        ],
+                        "rule_trace": [
+                            {
+                                "rule_name": "highest_weight",
+                                "result": {"winner": "branch-a"},
+                                "decisive": True,
+                            }
+                        ],
+                    },
+                ),
+                audit_event_v2(
+                    5,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 8,
+                        "change_kind": "member_added",
+                        "origin_commit_id": MSG_ID,
+                    },
+                ),
+                audit_event_v2(
+                    6,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 8,
+                        "reason": "winning_commit_applied",
+                    },
+                ),
+            ).encode("utf-8"),
+            source_name="v2-command-test.jsonl",
+        )
+
+        self.assertEqual(result.audit_file.schema_versions, [SCHEMA_VERSION_V2])
+        self.assertEqual(DeliveryArtifact.objects.count(), 1)
+        self.assertEqual(NetworkObservation.objects.count(), 1)
+        self.assertEqual(ConvergenceRun.objects.count(), 1)
+        self.assertEqual(StateDelta.objects.count(), 1)
+        self.assertEqual(EpochStateTransition.objects.count(), 1)
+
+        DeliveryArtifact.objects.all().delete()
+        NetworkObservation.objects.all().delete()
+        ConvergenceRun.objects.all().delete()
+        StateDelta.objects.all().delete()
+        EpochStateTransition.objects.all().delete()
+
+        output = StringIO()
+        call_command(
+            "rebuild_audit_projections",
+            "--audit-file-id",
+            str(result.audit_file.id),
+            stdout=output,
+        )
+
+        artifact = DeliveryArtifact.objects.get()
+        self.assertEqual(artifact.artifact_id, MSG_ID)
+        self.assertEqual(artifact.decoded_payload["text"], "hello")
+        self.assertEqual(artifact.recipient_expectations.count(), 1)
+        self.assertEqual(NetworkObservation.objects.get().relay_url, "wss://relay.example")
+        self.assertEqual(ConvergenceRun.objects.get().selected_branch_id, "branch-a")
+        self.assertEqual(ConvergenceCandidate.objects.get().score["app_witness_score"], 3)
+        self.assertEqual(
+            ConvergenceRuleEvaluation.objects.filter(rule_name="highest_weight").count(),
+            2,
+        )
+        self.assertEqual(StateDelta.objects.get().change_kind, "member_added")
+        self.assertEqual(EpochStateTransition.objects.get().new_state, "committed")
+        self.assertIn("Rebuilt audit projections for 1 group(s)", output.getvalue())
+        self.assertNotIn(GROUP_REF, output.getvalue())
+        self.assertNotIn(ENGINE_ALICE, output.getvalue())
+
+    def test_rebuild_default_ignores_v1_only_groups(self):
+        result = ingest_audit_log_bytes(
+            dump_bytes=representative_audit_log().encode("utf-8"),
+            source_name="v1-command-test.jsonl",
+        )
+
+        self.assertEqual(result.audit_file.schema_versions, [SCHEMA_VERSION])
+        output = StringIO()
+        call_command("rebuild_audit_projections", stdout=output)
+
+        self.assertEqual(DeliveryArtifact.objects.count(), 0)
+        self.assertEqual(NetworkObservation.objects.count(), 0)
+        self.assertEqual(ConvergenceRun.objects.count(), 0)
+        self.assertIn("Rebuilt audit projections for 0 group(s)", output.getvalue())
+
+    def test_convergence_rows_without_stable_run_id_are_grouped_as_inferred_runs(self):
+        result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    wall_time_ms=T0,
+                    kind={
+                        "type": "convergence_run_state",
+                        "phase": "evaluating",
+                        "current_tip_epoch": 7,
+                    },
+                ),
+                audit_event_v2(
+                    1,
+                    wall_time_ms=T0 + 1,
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 7,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-a",
+                        "selected_tip_epoch": 8,
+                        "candidates": [{"branch_id": "branch-a", "eligible": True}],
+                        "rule_trace": [
+                            {
+                                "rule_name": "highest_weight",
+                                "decisive": True,
+                                "selected_branch_id": "branch-a",
+                            }
+                        ],
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    wall_time_ms=T0 + 2,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 8,
+                        "reason": "winning_commit_applied",
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    wall_time_ms=T0 + 3,
+                    kind={
+                        "type": "convergence_run_state",
+                        "phase": "evaluating",
+                        "current_tip_epoch": 8,
+                    },
+                ),
+                audit_event_v2(
+                    4,
+                    wall_time_ms=T0 + 4,
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 8,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-b",
+                        "selected_tip_epoch": 9,
+                        "candidates": [{"branch_id": "branch-b", "eligible": True}],
+                    },
+                ),
+            ).encode("utf-8"),
+            source_name="v2-inferred-convergence.jsonl",
+        )
+
+        self.assertEqual(result.audit_file.schema_versions, [SCHEMA_VERSION_V2])
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        runs = list(ConvergenceRun.objects.filter(group=group).order_by("started_at_ms"))
+
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all(run.inferred for run in runs))
+        first_event = AuditEvent.objects.get(group=group, seq=0)
+        self.assertEqual(runs[0].run_id, f"inferred-{ENGINE_ALICE}-{first_event.id}")
+        self.assertEqual(runs[0].phase, "committed")
+        self.assertEqual(runs[0].selected_branch_id, "branch-a")
+        self.assertEqual(runs[0].started_at_ms, T0)
+        self.assertEqual(runs[0].ended_at_ms, T0 + 2)
+        self.assertEqual(runs[0].evidence_events.count(), 3)
+        self.assertEqual(runs[0].candidates.get().branch_id, "branch-a")
+        self.assertEqual(runs[0].rule_evaluations.get().rule_name, "highest_weight")
+        self.assertEqual(runs[1].phase, "selected")
+        self.assertEqual(runs[1].selected_branch_id, "branch-b")
+        self.assertEqual(runs[1].evidence_events.count(), 2)
+        self.assertEqual(EpochStateTransition.objects.filter(group=group).count(), 1)
+
+
+class ConvergenceRunApiTests(TestCase):
+    def setUp(self):
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        self.group = AuditGroup.objects.create(
+            name="Shared convergence run",
+            slug=GROUP_REF,
+            group_ref=GROUP_REF,
+        )
+
+    def test_convergence_run_detail_requires_engine_when_run_id_is_ambiguous(self):
+        ConvergenceRun.objects.create(
+            group=self.group,
+            run_id="shared-run",
+            engine_id=ENGINE_ALICE,
+            account_ref=ACCOUNT_ALICE,
+            phase="selected",
+            started_at_ms=T0,
+        )
+        ConvergenceRun.objects.create(
+            group=self.group,
+            run_id="shared-run",
+            engine_id=ENGINE_BOB,
+            account_ref=ACCOUNT_BOB,
+            phase="selected",
+            started_at_ms=T0 + 1,
+        )
+
+        ambiguous_response = self.client.get(
+            reverse(
+                "api-group-convergence-run",
+                kwargs={"slug": self.group.slug, "run_id": "shared-run"},
+            )
+        )
+
+        self.assertEqual(ambiguous_response.status_code, 409)
+        ambiguous_payload = ambiguous_response.json()
+        self.assertEqual(
+            ambiguous_payload["schema_version"],
+            "goggles-convergence-run-ambiguous/v1",
+        )
+        self.assertEqual(ambiguous_payload["error"], "multiple_convergence_runs")
+        self.assertEqual(len(ambiguous_payload["matches"]), 2)
+        self.assertEqual(
+            [match["engine_id"] for match in ambiguous_payload["matches"]],
+            [ENGINE_ALICE, ENGINE_BOB],
+        )
+
+        disambiguated_response = self.client.get(
+            reverse(
+                "api-group-convergence-run",
+                kwargs={"slug": self.group.slug, "run_id": "shared-run"},
+            ),
+            {"engine_id": ENGINE_BOB},
+        )
+
+        self.assertEqual(disambiguated_response.status_code, 200)
+        self.assertEqual(
+            disambiguated_response.json()["convergence_run"]["engine_id"],
+            ENGINE_BOB,
+        )
+        self.assertEqual(disambiguated_response.json()["filters"]["engine_id"], ENGINE_BOB)
+
+
+class ValidateAuditSchemaCommandTests(TestCase):
+    def test_validate_audit_schema_accepts_v2_fixture(self):
+        output = StringIO()
+
+        call_command(
+            "validate_audit_schema",
+            "fixtures/sample-audit-log-v2.jsonl",
+            stdout=output,
+        )
+
+        self.assertIn("Schema validation passed for 8 event(s)", output.getvalue())
+
+    def test_validate_audit_schema_reports_line_without_raw_body(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bad.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION_V2,
+                        "seq": 1,
+                        "wall_time_ms": 1,
+                        "audit_data_mode": "full_data",
+                        "engine_id": ENGINE_ALICE,
+                        "kind": {"type": "epoch_state_changed", "new_state": "committed"},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stderr = StringIO()
+
+            with self.assertRaisesMessage(CommandError, "Schema validation failed"):
+                call_command("validate_audit_schema", str(path), stderr=stderr)
+
+        self.assertIn("bad.jsonl:1:kind", stderr.getvalue())
+        self.assertIn("missing required property", stderr.getvalue())
+        self.assertIn("epoch", stderr.getvalue())
+        self.assertNotIn("committed", stderr.getvalue())
+
+
 class HumanActionGroupingTests(TestCase):
     """Regression coverage for goggles#30.
 
@@ -2792,6 +4304,90 @@ class UploadTokenLifecycleTests(TestCase):
         self.assertIsNone(token.expires_at)
         self.assertIn("does not expire", out.getvalue())
 
+    @override_settings(GOGGLES_UPLOADS_ENABLED=False)
+    def test_global_upload_pause_rejects_authenticated_upload_without_ingesting(self):
+        raw_token, token = UploadToken.issue("ios qa")
+
+        response = self._upload(raw_token)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"], "audit log uploads are temporarily disabled")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        token.refresh_from_db()
+        self.assertIsNone(token.last_used_at)
+
+
+class PurgeAuditDataCommandTests(TestCase):
+    def seed_audit_data(self):
+        user = User.objects.create_user(
+            username="analyst",
+            password="correct horse battery staple",
+        )
+        _raw_token, token = UploadToken.issue("ios qa")
+        audit_file = ingest_audit_log_bytes(
+            dump_bytes=representative_audit_log().encode("utf-8"),
+            upload_token=token,
+        ).audit_file
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        artifact = DeliveryArtifact.objects.create(
+            group=group,
+            artifact_id=MSG_ID,
+            artifact_kind="application_message",
+        )
+        DeliveryObservation.objects.create(
+            artifact=artifact,
+            engine_id=ENGINE_ALICE,
+            account_ref=ACCOUNT_ALICE,
+            latest_state="transport_received",
+        )
+        AnalysisRun.objects.create(
+            group=group,
+            created_by=user,
+            title="pre-cutover report",
+            report_json={"schema_version": "test-report/v1"},
+        )
+        return user, token, audit_file, group
+
+    def test_refuses_without_confirmation(self):
+        _user, _token, audit_file, _group = self.seed_audit_data()
+
+        with self.assertRaises(CommandError):
+            call_command("purge_audit_data", stdout=StringIO())
+
+        self.assertEqual(AuditFile.objects.count(), 1)
+        self.assertEqual(AuditEvent.objects.count(), audit_file.valid_event_count)
+        self.assertEqual(AuditGroup.objects.count(), 1)
+        self.assertEqual(AnalysisRun.objects.count(), 1)
+
+    def test_dry_run_does_not_delete_audit_data(self):
+        _user, _token, audit_file, _group = self.seed_audit_data()
+        out = StringIO()
+
+        call_command("purge_audit_data", "--dry-run", stdout=out)
+
+        self.assertIn("Dry run only", out.getvalue())
+        self.assertEqual(AuditFile.objects.count(), 1)
+        self.assertEqual(AuditEvent.objects.count(), audit_file.valid_event_count)
+        self.assertEqual(AuditGroup.objects.count(), 1)
+        self.assertEqual(DeliveryArtifact.objects.count(), 1)
+        self.assertEqual(AnalysisRun.objects.count(), 1)
+
+    def test_confirmed_purge_deletes_audit_data_but_preserves_users_and_tokens(self):
+        user, token, _audit_file, _group = self.seed_audit_data()
+        out = StringIO()
+
+        call_command("purge_audit_data", "--confirm-delete-audit-data", stdout=out)
+
+        self.assertIn("Audit data purge complete", out.getvalue())
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        self.assertEqual(AuditGroup.objects.count(), 0)
+        self.assertEqual(DeliveryArtifact.objects.count(), 0)
+        self.assertEqual(DeliveryObservation.objects.count(), 0)
+        self.assertEqual(AnalysisRun.objects.count(), 0)
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
+
 
 class DashboardTests(TestCase):
     def test_upload_log_list_requires_login(self):
@@ -2910,91 +4506,88 @@ class DashboardTests(TestCase):
             group_ref=GROUP_REF,
         )
         raw_token, _token = UploadToken.issue("qa clients")
-        alice = jsonl(
-            audit_event(
+        body = jsonl(
+            audit_event_v2(
                 0,
-                engine_id=ENGINE_ALICE,
                 kind={
-                    "type": "send_outcome",
-                    "intent_kind": "invite",
-                    "result_kind": "group_evolution",
-                    "outbound_msg_id": MSG_ID,
-                    "outbound_welcome_msg_ids": [OTHER_MSG_ID],
+                    "type": "transport_received",
+                    "msg_id": MSG_ID,
+                    "transport": {
+                        "transport": "nostr",
+                        "relay_url": "wss://relay.example",
+                        "nostr_event_id": DIGEST_A,
+                    },
+                    "payload_len": 512,
+                    "payload_digest": DIGEST_A,
                 },
             ),
-            audit_event(
+            audit_event_v2(
                 1,
-                engine_id=ENGINE_ALICE,
+                audit_data_mode="full_data",
                 kind={
-                    "type": "fork_resolution",
-                    "source_epoch": 6,
-                    "candidate_digest": DIGEST_A,
-                    "incumbent_digest": DIGEST_B,
-                    "winner": "candidate",
-                    "invalidated_msg_id": OTHER_MSG_ID,
+                    "type": "message_content_decoded",
+                    "msg_id": MSG_ID,
+                    "artifact_kind": "application_message",
+                    "author": {"member_ref": ACCOUNT_ALICE},
+                    "decoded_payload": {
+                        "content_type": "text/plain",
+                        "text": "hello from Alice",
+                    },
                 },
             ),
-            audit_event(
+            audit_event_v2(
                 2,
-                engine_id=ENGINE_ALICE,
+                context={"convergence": {"run_id": "run-1", "phase": "selected"}},
                 kind={
                     "type": "convergence_decision",
                     "current_tip_epoch": 6,
-                    "candidate_count": 2,
-                    "eligible_count": 1,
                     "max_rewind_commits": 5,
                     "selected_branch_id": "branch-a",
                     "selected_fork_epoch": 6,
                     "selected_tip_epoch": 7,
+                    "candidates": [
+                        {"branch_id": "branch-a", "fork_epoch": 6, "tip_epoch": 7, "eligible": True}
+                    ],
+                    "rule_trace": [
+                        {
+                            "rule_name": "highest_weight",
+                            "result": {"winner": "branch-a"},
+                            "decisive": True,
+                            "selected_branch_id": "branch-a",
+                        }
+                    ],
                 },
             ),
-        )
-        bob = jsonl(
-            audit_event(
-                0,
-                engine_id=ENGINE_BOB,
+            audit_event_v2(
+                3,
+                audit_data_mode="full_data",
                 kind={
-                    "type": "ingest_entry",
-                    "msg_id": MSG_ID,
-                    "envelope_kind": "group_message",
-                    "payload_len": 512,
-                    "payload_digest": DIGEST_A,
+                    "type": "group_state_changed",
+                    "epoch": 7,
+                    "change_kind": "group_renamed",
+                    "fields": ["name"],
+                    "value": {"digest": DIGEST_B, "text": "Launch room"},
                 },
-                wall_time_ms=1_700_000_000_050,
             ),
-            audit_event(
-                1,
-                engine_id=ENGINE_BOB,
+            audit_event_v2(
+                4,
                 kind={
-                    "type": "peeler_outcome",
-                    "msg_id": MSG_ID,
-                    "outcome": "decrypt_failed",
-                    "fallback_snapshot_used": False,
-                    "detail": "no_matching_epoch",
+                    "type": "epoch_state_changed",
+                    "previous_state": "pending",
+                    "new_state": "committed",
+                    "epoch": 7,
+                    "reason": "winning_commit_applied",
                 },
-                wall_time_ms=1_700_000_000_060,
-            ),
-            audit_event(
-                2,
-                engine_id=ENGINE_BOB,
-                kind={
-                    "type": "message_state_changed",
-                    "msg_id": OTHER_MSG_ID,
-                    "new_state": "epoch_invalidated",
-                    "reason": "fork_loser",
-                },
-                wall_time_ms=1_700_000_000_070,
             ),
         )
 
-        for body in (alice, bob):
-            response = self.client.post(
-                reverse("api-group-audit-log-upload", kwargs={"group_slug": group.slug}),
-                data=body,
-                content_type="application/x-ndjson",
-                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            )
-            self.assertEqual(response.status_code, 201)
+        response = self.client.post(
+            reverse("api-group-audit-log-upload", kwargs={"group_slug": group.slug}),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        self.assertEqual(response.status_code, 201)
 
         response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
         self.assertEqual(response.status_code, 302)
@@ -3004,55 +4597,52 @@ class DashboardTests(TestCase):
         response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
 
         self.assertContains(response, "QA fork group")
-        self.assertContains(response, "Timeline")
-        self.assertContains(response, "Actions")
+        for label in (
+            "Overview",
+            "Delivery",
+            "Network",
+            "Convergence",
+            "State",
+            "Evidence",
+            "Exports",
+        ):
+            self.assertContains(response, label)
+        self.assertNotContains(response, "Timeline")
         self.assertNotContains(response, 'id="timeline-data"')
-        self.assertNotContains(response, "update_group_profile")
         self.assertNotContains(response, MSG_ID)
 
-        timeline_response = self.client.get(reverse("group-timeline", kwargs={"slug": group.slug}))
-        self.assertEqual(timeline_response.status_code, 200)
-        payload = timeline_response.json()
-        self.assertEqual(
-            sorted(payload),
-            [
-                "engines",
-                "epochs",
-                "excluded",
-                "group",
-                "integrity",
-                "items",
-                "pagination",
-                "time",
-                "version",
-            ],
+        delivery_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
         )
-        self.assertEqual(payload["pagination"]["event_count"], 6)
-        self.assertEqual(payload["pagination"]["page"], 1)
-        self.assertFalse(payload["pagination"]["has_next"])
-        engine_ids = {engine["engine_id"] for engine in payload["engines"]}
-        self.assertEqual(engine_ids, {ENGINE_ALICE, ENGINE_BOB})
+        self.assertContains(delivery_response, "Message artifacts")
+        self.assertContains(delivery_response, MSG_ID[:16])
+        self.assertContains(delivery_response, "hello from Alice")
 
-        actions_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "actions"})
+        network_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
         )
-        self.assertContains(actions_response, "update_group_profile")
+        self.assertContains(network_response, "Transport observations")
+        self.assertContains(network_response, "wss://relay.example")
 
-        messages_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        convergence_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
         )
-        self.assertContains(messages_response, "Message trace")
-        self.assertContains(messages_response, MSG_ID[:16])
-        self.assertContains(messages_response, "Missing observations")
-        self.assertContains(messages_response, OTHER_MSG_ID[:16])
+        self.assertContains(convergence_response, "Convergence runs")
+        self.assertContains(convergence_response, "branch-a")
+        self.assertContains(convergence_response, "highest_weight")
 
-        integrity_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "integrity"})
+        state_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
         )
-        self.assertContains(integrity_response, "Fork &amp; convergence")
-        self.assertContains(integrity_response, "candidate")
-        self.assertContains(integrity_response, "Peeler &amp; rejections")
-        self.assertContains(integrity_response, "decrypt_failed")
+        self.assertContains(state_response, "Group state deltas")
+        self.assertContains(state_response, "Launch room")
+        self.assertContains(state_response, "Epoch state transitions")
+
+        evidence_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
+        )
+        self.assertContains(evidence_response, "Audit files")
+        self.assertContains(evidence_response, "Recent evidence rows")
 
     def test_group_detail_tabs_cap_large_group_rows(self):
         tab_limit = GROUP_DETAIL_TAB_EVENT_LIMIT
@@ -3071,207 +4661,148 @@ class DashboardTests(TestCase):
             total_line_count=row_count * 4,
             valid_event_count=row_count * 4,
         )
-        events = []
-        line_number = 1
+        audit_file.groups.add(group)
+        evidence_event = AuditEvent.objects.create(
+            audit_file=audit_file,
+            group=group,
+            line_number=1,
+            line_hash="evidence".ljust(64, "0"),
+            raw_line="{}",
+            parse_status=AuditEvent.STATUS_VALID,
+            event_type="transport_received",
+            engine_id=ENGINE_ALICE,
+            account_ref=ACCOUNT_ALICE,
+            group_ref=GROUP_REF,
+            seq=1,
+            wall_time_ms=1_700_000_000_000,
+            msg_id=MSG_ID,
+        )
         for i in range(row_count):
-            shared_action = i < 2
-            events.append(
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=line_number,
-                    line_hash=f"action-{i:056x}",
-                    raw_line=f"ACTION-RAW-MARKER-{i}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="human_action",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=line_number,
-                    wall_time_ms=1_700_000_000_000 + line_number,
-                    context_operation_id=(
-                        "shared-action-op" if shared_action else f"action-op-{i:03d}"
-                    ),
-                    human_action_action="action_000" if shared_action else f"action_{i:03d}",
-                    human_action_origin="local_user",
-                )
+            artifact = DeliveryArtifact.objects.create(
+                group=group,
+                artifact_id=f"{i:064x}",
+                artifact_kind="application_message",
+                first_seen_ms=1_700_000_000_000 + i,
             )
-            line_number += 1
-        for i in range(row_count):
-            events.append(
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=line_number,
-                    line_hash=f"message-{i:055x}",
-                    raw_line=f"MESSAGE-RAW-MARKER-{i}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="ingest_entry",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=line_number,
-                    wall_time_ms=1_700_000_100_000 + i,
-                    msg_id=f"{i:016x}" + "a" * 48,
-                )
+            DeliveryObservation.objects.create(
+                artifact=artifact,
+                engine_id=ENGINE_ALICE,
+                latest_state=f"delivery-marker-{i:03d}",
+                first_seen_ms=1_700_000_000_000 + i,
             )
-            line_number += 1
-        for i in range(row_count):
-            events.append(
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=line_number,
-                    line_hash=f"fork-{i:058x}",
-                    raw_line=f"FORK-RAW-MARKER-{i}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="fork_resolution",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=line_number,
-                    wall_time_ms=1_700_000_200_000 + i,
-                    source_epoch=i,
-                    candidate_digest=f"{i:016x}" + "b" * 48,
-                    reason=f"fork-marker-{i:03d}",
-                    winner="candidate",
-                )
+            NetworkObservation.objects.create(
+                group=group,
+                artifact=artifact,
+                audit_event=evidence_event,
+                direction="inbound",
+                phase=f"network-marker-{i:03d}",
+                message_id=artifact.artifact_id,
+                engine_id=ENGINE_ALICE,
+                wall_time_ms=1_700_000_100_000 + i,
             )
-            line_number += 1
-        for i in range(row_count):
-            events.append(
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=line_number,
-                    line_hash=f"peeler-{i:056x}",
-                    raw_line=f"PEELER-RAW-MARKER-{i}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="peeler_outcome",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=line_number,
-                    wall_time_ms=1_700_000_300_000 + i,
-                    msg_id=f"{i:016x}" + "c" * 48,
-                    outcome="decrypt_failed",
-                    detail=f"peeler-marker-{i:03d}",
-                )
+            run = ConvergenceRun.objects.create(
+                group=group,
+                run_id=f"run-{i:03d}",
+                engine_id=ENGINE_ALICE,
+                phase=f"convergence-marker-{i:03d}",
+                started_at_ms=1_700_000_200_000 + i,
             )
-            line_number += 1
-        AuditEvent.objects.bulk_create(events)
+            ConvergenceCandidate.objects.create(
+                run=run,
+                branch_id=f"branch-{i:03d}",
+                fork_epoch=i,
+                tip_epoch=i + 1,
+            )
+            StateDelta.objects.create(
+                group=group,
+                audit_event=evidence_event,
+                epoch=i,
+                change_kind=f"state-marker-{i:03d}",
+                wall_time_ms=1_700_000_300_000 + i,
+            )
+            EpochStateTransition.objects.create(
+                group=group,
+                audit_event=evidence_event,
+                engine_id=ENGINE_ALICE,
+                new_state=f"epoch-marker-{i:03d}",
+                epoch=i,
+                wall_time_ms=1_700_000_400_000 + i,
+            )
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
-        actions_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "actions"})
+        delivery_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
         )
-        messages_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+        network_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
         )
-        integrity_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "integrity"})
+        convergence_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
+        )
+        state_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
         )
 
-        self.assertEqual(actions_response.status_code, 200)
-        human_action_groups = actions_response.context["human_action_groups"]
-        self.assertEqual(len(human_action_groups), tab_limit - 1)
-        shared_group = next(
-            group for group in human_action_groups if group["operation_id"] == "shared-action-op"
-        )
-        self.assertEqual(len(shared_group["events"]), 2)
-        self.assertContains(actions_response, f"Showing first {tab_limit} matching events")
-        self.assertContains(actions_response, "action_000")
-        self.assertNotContains(actions_response, f"action_{row_count - 1:03d}")
+        self.assertEqual(delivery_response.status_code, 200)
+        self.assertEqual(len(delivery_response.context["artifacts"]), tab_limit)
+        self.assertContains(delivery_response, f"Showing first {tab_limit} message artifacts")
+        self.assertContains(delivery_response, "delivery-marker-000")
+        self.assertNotContains(delivery_response, f"delivery-marker-{row_count - 1:03d}")
 
-        self.assertEqual(messages_response.status_code, 200)
-        self.assertEqual(len(messages_response.context["message_matrix"]["rows"]), tab_limit)
-        self.assertContains(messages_response, f"Showing first {tab_limit} matching")
-        self.assertContains(messages_response, "0000000000000000")
-        self.assertNotContains(messages_response, f"{row_count - 1:016x}")
+        self.assertEqual(network_response.status_code, 200)
+        self.assertEqual(len(network_response.context["observations"]), tab_limit)
+        self.assertContains(network_response, f"Showing first {tab_limit} network observations")
+        self.assertContains(network_response, "network-marker-000")
+        self.assertNotContains(network_response, f"network-marker-{row_count - 1:03d}")
 
-        self.assertEqual(integrity_response.status_code, 200)
-        self.assertEqual(len(integrity_response.context["fork_events"]), tab_limit)
-        self.assertEqual(len(integrity_response.context["peeler_events"]), tab_limit)
-        self.assertContains(
-            integrity_response,
-            f"Showing first {tab_limit} fork/convergence events",
-        )
-        self.assertContains(
-            integrity_response,
-            f"Showing first {tab_limit} peeler/rejection events",
-        )
-        self.assertContains(integrity_response, "fork-marker-000")
-        self.assertNotContains(integrity_response, f"fork-marker-{row_count - 1:03d}")
-        self.assertContains(integrity_response, "peeler-marker-000")
-        self.assertNotContains(integrity_response, f"peeler-marker-{row_count - 1:03d}")
+        self.assertEqual(convergence_response.status_code, 200)
+        self.assertEqual(len(convergence_response.context["runs"]), tab_limit)
+        self.assertContains(convergence_response, f"Showing first {tab_limit} convergence runs")
+        self.assertContains(convergence_response, "convergence-marker-000")
+        self.assertNotContains(convergence_response, f"convergence-marker-{row_count - 1:03d}")
 
-    def test_group_messages_tab_caps_trace_expansion_consistently(self):
+        self.assertEqual(state_response.status_code, 200)
+        self.assertEqual(len(state_response.context["state_deltas"]), tab_limit)
+        self.assertEqual(len(state_response.context["epoch_transitions"]), tab_limit)
+        self.assertContains(state_response, f"Showing first {tab_limit} state deltas")
+        self.assertContains(state_response, f"Showing first {tab_limit} epoch transitions")
+        self.assertContains(state_response, "state-marker-000")
+        self.assertNotContains(state_response, f"state-marker-{row_count - 1:03d}")
+
+    def test_group_delivery_tab_caps_artifact_expansion_consistently(self):
         tab_limit = GROUP_DETAIL_TAB_EVENT_LIMIT
         visible_msg_ids = [f"{i:064x}" for i in range(tab_limit)]
         hidden_msg_id = "f" * 64
         group = AuditGroup.objects.create(
-            name="Expanded trace group",
-            slug="expanded-trace-group",
+            name="Expanded artifact group",
+            slug="expanded-artifact-group",
             group_ref=GROUP_REF,
         )
-        audit_file = AuditFile.objects.create(
-            file_sha256="d" * 64,
-            byte_size=4096,
-            raw_text="x" * 4096,
-            validation_status=AuditFile.STATUS_VALID,
-            source_name="expanded-traces.jsonl",
-            total_line_count=2,
-            valid_event_count=2,
-        )
-        AuditEvent.objects.bulk_create(
-            [
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=1,
-                    line_hash="a" * 64,
-                    raw_line="TRACE-EXPANSION-ALICE",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="send_outcome",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=1,
-                    wall_time_ms=1_700_000_000_001,
-                    outcome_kind="published",
-                    outbound_welcome_msg_ids=visible_msg_ids + [hidden_msg_id],
-                ),
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=2,
-                    line_hash="b" * 64,
-                    raw_line="TRACE-EXPANSION-BOB",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="send_outcome",
-                    engine_id=ENGINE_BOB,
-                    account_ref=ACCOUNT_BOB,
-                    group_ref=GROUP_REF,
-                    seq=2,
-                    wall_time_ms=1_700_000_000_001,
-                    outcome_kind="published",
-                    outbound_welcome_msg_ids=visible_msg_ids,
-                ),
-            ]
-        )
+        for msg_id in [*visible_msg_ids, hidden_msg_id]:
+            artifact = DeliveryArtifact.objects.create(
+                group=group,
+                artifact_id=msg_id,
+                artifact_kind="application_message",
+                first_seen_ms=1_700_000_000_001,
+            )
+            DeliveryObservation.objects.create(
+                artifact=artifact,
+                engine_id=ENGINE_ALICE,
+                latest_state="decoded",
+                first_seen_ms=1_700_000_000_001,
+            )
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
         response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.context["message_matrix_limited"])
-        self.assertEqual(len(response.context["message_matrix"]["rows"]), tab_limit)
-        self.assertEqual(response.context["breaks"], [])
-        self.assertContains(response, f"Showing first {tab_limit} matching")
+        self.assertTrue(response.context["artifacts_limited"])
+        self.assertEqual(len(response.context["artifacts"]), tab_limit)
+        self.assertContains(response, f"Showing first {tab_limit} message artifacts")
         self.assertContains(response, visible_msg_ids[0][:16])
         self.assertNotContains(response, hidden_msg_id[:16])
 
@@ -3386,16 +4917,16 @@ class DashboardTests(TestCase):
         self.assertNotContains(response, "RAW-LINE-MARKER-2999")
         self.assertNotContains(response, 'id="timeline-data"')
 
-        timeline_response = self.client.get(
-            reverse("group-timeline", kwargs={"slug": group.slug}), {"page_size": 50}
+        evidence_response = self.client.get(
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
         )
 
-        self.assertEqual(timeline_response.status_code, 200)
-        payload = timeline_response.json()
-        self.assertEqual(payload["pagination"]["event_count"], 3_000)
-        self.assertEqual(payload["pagination"]["page_size"], 50)
-        self.assertTrue(payload["pagination"]["has_next"])
-        self.assertLessEqual(len(payload["items"]), 50)
+        self.assertEqual(evidence_response.status_code, 200)
+        self.assertLess(len(evidence_response.content), 250_000)
+        self.assertLessEqual(
+            len(evidence_response.context["recent_events"]),
+            GROUP_DETAIL_TAB_EVENT_LIMIT,
+        )
 
 
 class AuditFileDetailViewTests(TestCase):
@@ -3547,6 +5078,18 @@ class SeedDevCommandTests(TestCase):
             2,
         )
         self.assertEqual(AuditEvent.objects.filter(group=group).count(), 6)
+        v2_group = AuditGroup.objects.get(group_ref="55" * 32)
+        self.assertEqual(DeliveryArtifact.objects.filter(group=v2_group).count(), 1)
+        self.assertEqual(NetworkObservation.objects.filter(group=v2_group).count(), 2)
+        self.assertEqual(ConvergenceRun.objects.filter(group=v2_group).count(), 1)
+        self.assertEqual(StateDelta.objects.filter(group=v2_group).count(), 1)
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                group=v2_group,
+                event_type="audit_data_mode_changed",
+            ).count(),
+            1,
+        )
         self.assertIn("Dev user ready: admin", output.getvalue())
         self.assertNotIn("pass123", output.getvalue())
 
@@ -3633,6 +5176,16 @@ class SeedDevCommandTests(TestCase):
         self.assertTrue(any(item["type"] == "human_action" for item in payload["items"]))
         self.assertTrue(any(item["type"] == "publish_outcome" for item in payload["items"]))
         self.assertEqual(payload["excluded"]["count"], 0)
+
+        v2_group = AuditGroup.objects.get(group_ref="55" * 32)
+        self.assertEqual(
+            DeliveryArtifact.objects.get(group=v2_group).decoded_payload["text"],
+            "seeded v2 hello",
+        )
+        self.assertEqual(
+            ConvergenceRun.objects.get(group=v2_group).selected_branch_id,
+            "seed-branch-a",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4569,23 +6122,25 @@ class GroupListAnnotationTests(TestCase):
             + len(shell["timeline_summary"]["engines"]),
             content_engine_count,
         )
-        self.assertEqual(shell["tab_counts"]["messages"], content_message_count)
+        self.assertEqual(shell["tab_counts"]["overview"], len(content_events))
+        self.assertEqual(shell["tab_counts"]["evidence"], len(audit_files))
         self.assertEqual(
-            shell["tab_counts"]["actions"],
-            sum(1 for e in content_events if e.human_action_action),
+            shell["tab_counts"]["delivery"], DeliveryArtifact.objects.filter(group=group).count()
         )
         self.assertEqual(
-            shell["tab_counts"]["integrity"],
-            sum(
-                1
-                for e in content_events
-                if e.event_type
-                in (analysis_module.FORK_EVENT_TYPES + analysis_module.PEELER_EVENT_TYPES)
-            ),
+            shell["tab_counts"]["network"], NetworkObservation.objects.filter(group=group).count()
         )
-        # Timeline badge: the epoch count must match the timeline content,
-        # including the epoch that only the partially-invalid file carries.
-        self.assertEqual(shell["tab_counts"]["timeline"], content_epoch_count)
+        self.assertEqual(
+            shell["tab_counts"]["convergence"], ConvergenceRun.objects.filter(group=group).count()
+        )
+        self.assertEqual(
+            shell["tab_counts"]["state"],
+            StateDelta.objects.filter(group=group).count()
+            + EpochStateTransition.objects.filter(group=group).count(),
+        )
+        # The shell still carries the compact engine/epoch preview; it must match
+        # the content path, including the epoch that only the partially-invalid
+        # file carries.
         self.assertEqual(shell["timeline_summary"]["epoch_count"], content_epoch_count)
 
         # --- Persisted divergent count (divergent_counts_for_group_ids). ---
@@ -4735,7 +6290,7 @@ class MessageObservationMatrixTests(TestCase):
         self.assertFalse(seen_row["is_divergent"])
         self.assertEqual(seen_row["cells"][column[ENGINE_BOB]]["status"], "observed")
 
-    def test_messages_tab_renders_matrix_and_membership_aware_breaks(self):
+    def test_legacy_messages_tab_is_not_served(self):
         group = self.seed_break_group()
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
@@ -4744,20 +6299,11 @@ class MessageObservationMatrixTests(TestCase):
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "messages"})
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Message trace")
-        self.assertContains(response, "Missing observations")
-        # The matrix renders a per-engine "missed" cell and flags the break row;
-        # both the matrix and the breaks list name the divergent message.
-        self.assertContains(response, "missed</span>")
-        self.assertContains(response, "break</span>")
-        self.assertContains(response, self.BREAK_MSG[:16])
-        # The benign late-joiner message is shown in the matrix but not flagged.
-        self.assertContains(response, self.EARLY_MSG[:16])
+        self.assertEqual(response.status_code, 404)
 
 
 class GroupDetailTimelineViewTests(TestCase):
-    def test_group_detail_exposes_lazy_timeline_endpoint(self):
+    def test_group_detail_exposes_lazy_projection_tabs(self):
         ingest_body(representative_audit_log())
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
@@ -4766,86 +6312,50 @@ class GroupDetailTimelineViewTests(TestCase):
 
         self.assertNotContains(response, 'id="timeline-data"')
         self.assertContains(response, reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
-        self.assertContains(response, reverse("group-timeline", kwargs={"slug": GROUP_REF}))
+        for tab in ("delivery", "network", "convergence", "state", "evidence", "exports"):
+            self.assertContains(
+                response,
+                reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": tab}),
+            )
         self.assertContains(response, "Export JSON")
 
-        timeline_response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
-
-        self.assertEqual(timeline_response.status_code, 200)
-        payload = timeline_response.json()
-        self.assertEqual(payload["version"], 1)
-        self.assertEqual(len(payload["engines"]), 1)
-        self.assertEqual(payload["pagination"]["event_count"], 2)
-        self.assertEqual(json.loads(json.dumps(payload)), payload)
-
-    def test_group_timeline_integrity_uses_whole_group_summary_when_paged(self):
+    def test_convergence_tab_renders_projected_runs(self):
         group = AuditGroup.objects.create(
-            name="Paged integrity group",
-            slug="paged-integrity-group",
+            name="Projected convergence group",
+            slug="projected-convergence-group",
             group_ref=GROUP_REF,
-            divergent_message_count=4,
         )
-        audit_file = AuditFile.objects.create(
-            file_sha256="a" * 64,
-            byte_size=100,
-            raw_text="{}\n{}\n",
-            validation_status=AuditFile.STATUS_VALID,
-            source_name="paged.jsonl",
-            total_line_count=2,
-            valid_event_count=2,
+        run = ConvergenceRun.objects.create(
+            group=group,
+            run_id="run-paged",
+            engine_id=ENGINE_ALICE,
+            phase="selected",
+            selected_branch_id="branch-a",
+            started_at_ms=1_700_000_000_001,
         )
-        AuditEvent.objects.bulk_create(
-            [
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=1,
-                    line_hash="1" * 64,
-                    raw_line="{}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="ingest_entry",
-                    engine_id=ENGINE_ALICE,
-                    account_ref=ACCOUNT_ALICE,
-                    group_ref=GROUP_REF,
-                    seq=1,
-                    wall_time_ms=1_700_000_000_001,
-                    msg_id=MSG_ID,
-                ),
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=2,
-                    line_hash="2" * 64,
-                    raw_line="{}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="fork_resolution",
-                    engine_id=ENGINE_BOB,
-                    account_ref=ACCOUNT_BOB,
-                    group_ref=GROUP_REF,
-                    seq=2,
-                    wall_time_ms=1_700_000_000_002,
-                    source_epoch=6,
-                    candidate_digest=DIGEST_A,
-                    incumbent_digest=DIGEST_B,
-                    winner="candidate",
-                    invalidated_msg_id=OTHER_MSG_ID,
-                ),
-            ]
+        ConvergenceCandidate.objects.create(
+            run=run,
+            branch_id="branch-a",
+            fork_epoch=6,
+            tip_epoch=7,
+        )
+        ConvergenceRuleEvaluation.objects.create(
+            run=run,
+            rule_name="highest_weight",
+            decisive=True,
+            selected_branch_id="branch-a",
         )
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
         response = self.client.get(
-            reverse("group-timeline", kwargs={"slug": group.slug}), {"page_size": 1}
+            reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
         )
 
         self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["pagination"]["event_count"], 2)
-        self.assertEqual(len(payload["items"]), 1)
-        self.assertEqual(payload["integrity"]["divergent_message_count"], 4)
-        self.assertEqual(payload["integrity"]["fork_resolution_count"], 1)
-        self.assertTrue(payload["integrity"]["has_fork_activity"])
+        self.assertContains(response, "run-paged")
+        self.assertContains(response, "branch-a")
+        self.assertContains(response, "highest_weight")
 
     def test_group_detail_shows_engine_preview_overflow_count(self):
         group = AuditGroup.objects.create(
@@ -4925,12 +6435,14 @@ class GroupDetailTimelineViewTests(TestCase):
         self.client.login(username="analyst", password="correct horse battery staple")
 
         with CaptureQueriesContext(connection) as ctx:
-            response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
+            response = self.client.get(
+                reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "evidence"})
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertLessEqual(len(ctx.captured_queries), 12)
 
-    def test_group_timeline_skips_per_page_message_traces_for_global_integrity(self):
+    def test_group_detail_does_not_compute_message_traces_for_shell(self):
         ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
         ingest_body(representative_audit_log(engine_id=ENGINE_BOB))
         group = AuditGroup.objects.get(slug=GROUP_REF)
@@ -4942,12 +6454,12 @@ class GroupDetailTimelineViewTests(TestCase):
         with mock.patch.object(
             analysis_module,
             "message_traces_from_events",
-            side_effect=AssertionError("timeline view must use persisted divergence counts"),
+            side_effect=AssertionError("group shell must use projection/header counts"),
         ):
-            response = self.client.get(reverse("group-timeline", kwargs={"slug": GROUP_REF}))
+            response = self.client.get(reverse("group-detail", kwargs={"slug": GROUP_REF}))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["integrity"]["divergent_message_count"], 7)
+        self.assertContains(response, "Overview")
 
     def test_group_detail_query_count_does_not_grow_with_file_count(self):
         # Per-file group_event_count is annotated in SQL by
@@ -4968,7 +6480,7 @@ class GroupDetailTimelineViewTests(TestCase):
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
-        files_url = reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "files"})
+        files_url = reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "evidence"})
         with CaptureQueriesContext(connection) as few_ctx:
             response_few = self.client.get(files_url)
         self.assertEqual(response_few.status_code, 200)
@@ -5024,7 +6536,7 @@ class GroupDetailTimelineViewTests(TestCase):
 
         with CaptureQueriesContext(connection) as ctx:
             response = self.client.get(
-                reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "files"})
+                reverse("group-tab", kwargs={"slug": GROUP_REF, "tab": "evidence"})
             )
 
         self.assertEqual(response.status_code, 200)

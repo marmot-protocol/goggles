@@ -3,7 +3,22 @@ from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.http import urlencode
 
-from .models import AnalysisRun, AuditEvent, AuditFile, AuditGroup, UploadToken
+from .models import (
+    AnalysisRun,
+    AuditEvent,
+    AuditFile,
+    AuditGroup,
+    ConvergenceCandidate,
+    ConvergenceRuleEvaluation,
+    ConvergenceRun,
+    DeliveryArtifact,
+    DeliveryObservation,
+    EpochStateTransition,
+    NetworkObservation,
+    RecipientExpectation,
+    StateDelta,
+    UploadToken,
+)
 
 # Hard cap on how much of an audit file's raw JSONL the change page renders.
 # A single upload can be tens of megabytes (hundreds of thousands of lines),
@@ -143,5 +158,86 @@ class AuditEventAdmin(admin.ModelAdmin):
 
 @admin.register(AnalysisRun)
 class AnalysisRunAdmin(admin.ModelAdmin):
-    list_display = ("group", "created_at")
+    list_display = ("id", "title", "group", "created_by", "created_at")
+    search_fields = ("title", "notes", "group__group_ref")
+    autocomplete_fields = ("group", "created_by")
     readonly_fields = ("created_at",)
+
+
+@admin.register(DeliveryArtifact)
+class DeliveryArtifactAdmin(admin.ModelAdmin):
+    list_display = ("artifact_id", "artifact_kind", "group", "first_seen_ms", "last_seen_ms")
+    search_fields = ("artifact_id__exact",)
+    autocomplete_fields = ("group",)
+    show_full_result_count = False
+
+
+@admin.register(DeliveryObservation)
+class DeliveryObservationAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "engine_id", "latest_state", "first_seen_ms", "last_seen_ms")
+    search_fields = ("engine_id__exact", "artifact__artifact_id__exact")
+    autocomplete_fields = ("artifact",)
+    show_full_result_count = False
+
+
+@admin.register(RecipientExpectation)
+class RecipientExpectationAdmin(admin.ModelAdmin):
+    list_display = ("artifact", "recipient_scope", "membership_epoch", "expected_count")
+    search_fields = ("artifact__artifact_id__exact",)
+    autocomplete_fields = ("artifact", "evidence_event")
+    show_full_result_count = False
+
+
+@admin.register(NetworkObservation)
+class NetworkObservationAdmin(admin.ModelAdmin):
+    list_display = ("phase", "direction", "message_id", "engine_id", "wall_time_ms")
+    search_fields = (
+        "message_id__exact",
+        "engine_id__exact",
+        "nostr_event_id__exact",
+        "welcome_nostr_event_id__exact",
+        "welcome_rumor_event_id__exact",
+        "welcome_key_package_tag__exact",
+    )
+    autocomplete_fields = ("group", "artifact", "audit_event")
+    show_full_result_count = False
+
+
+@admin.register(ConvergenceRun)
+class ConvergenceRunAdmin(admin.ModelAdmin):
+    list_display = ("run_id", "group", "engine_id", "phase", "started_at_ms", "ended_at_ms")
+    search_fields = ("run_id__exact", "engine_id__exact", "selected_branch_id__exact")
+    autocomplete_fields = ("group",)
+    show_full_result_count = False
+
+
+@admin.register(ConvergenceCandidate)
+class ConvergenceCandidateAdmin(admin.ModelAdmin):
+    list_display = ("run", "branch_id", "fork_epoch", "tip_epoch", "eligible")
+    search_fields = ("branch_id__exact",)
+    autocomplete_fields = ("run",)
+    show_full_result_count = False
+
+
+@admin.register(ConvergenceRuleEvaluation)
+class ConvergenceRuleEvaluationAdmin(admin.ModelAdmin):
+    list_display = ("run", "sequence", "rule_name", "decisive", "selected_branch_id")
+    search_fields = ("rule_name", "selected_branch_id__exact")
+    autocomplete_fields = ("run",)
+    show_full_result_count = False
+
+
+@admin.register(StateDelta)
+class StateDeltaAdmin(admin.ModelAdmin):
+    list_display = ("change_kind", "membership_change_source", "group", "epoch", "wall_time_ms")
+    search_fields = ("origin_commit_id__exact",)
+    autocomplete_fields = ("group", "audit_event")
+    show_full_result_count = False
+
+
+@admin.register(EpochStateTransition)
+class EpochStateTransitionAdmin(admin.ModelAdmin):
+    list_display = ("new_state", "group", "engine_id", "epoch", "wall_time_ms")
+    search_fields = ("engine_id__exact",)
+    autocomplete_fields = ("group", "audit_event")
+    show_full_result_count = False

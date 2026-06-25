@@ -1,0 +1,180 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Engine delivery matrix</span>
+    <span class="is-muted">message artifacts by observed engine lifecycle</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if artifacts and delivery_engines %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Message</th>
+            {% for engine in delivery_engines %}
+              <th title="{{ engine.engine_id }}">
+                <span class="cell-lines">
+                  <span class="cell-title">{{ engine.label|truncatechars:18 }}</span>
+                  <span class="cell-sub is-mono">{{ engine.engine_id|truncatechars:9 }}</span>
+                </span>
+              </th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for artifact in artifacts %}
+            <tr>
+              <td class="is-wrap">
+                <div class="is-mono">{{ artifact.artifact_id|truncatechars:33 }}</div>
+                <a class="badge" href="{% url 'api-message-detail' artifact.artifact_id %}">trace</a>
+              </td>
+              {% for cell in artifact.delivery_engine_cells %}
+                <td class="is-wrap">
+                  <span class="badge {{ cell.badge_class }}">{{ cell.status_label }}</span>
+                  {% if cell.last_seen_ms != None %}
+                    <div class="is-mono is-muted">{{ cell.last_seen_ms }}</div>
+                  {% endif %}
+                  {% if cell.latest_evidence_id %}
+                    <a class="badge" href="{% url 'api-event-evidence' cell.latest_evidence_id %}">line</a>
+                  {% endif %}
+                </td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% elif artifacts %}
+      <p class="empty-state">No engine metadata is available for this group yet.</p>
+    {% else %}
+      <p class="empty-state">No message artifacts have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Message artifacts</span>
+    <span class="is-muted">decoded content, per-engine observations, and recipient expectations</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if artifacts_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} message artifacts.</p>
+    {% endif %}
+    {% if artifacts %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Message</th>
+            <th>Kind</th>
+            <th>Modes</th>
+            <th>Author</th>
+            <th>Observations</th>
+            <th>Expected recipients</th>
+            <th>Evidence</th>
+            <th class="is-right">First seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for artifact in artifacts %}
+            <tr>
+              <td class="is-wrap">
+                <div class="is-mono">{{ artifact.artifact_id|truncatechars:33 }}</div>
+                <a class="badge" href="{% url 'api-message-detail' artifact.artifact_id %}">trace</a>
+              </td>
+              <td>{{ artifact.artifact_kind|default:"unknown" }}</td>
+              <td class="is-wrap">
+                {% for mode in artifact.audit_data_modes %}
+                  <span class="badge{% if mode == 'full_data' %} badge--warning{% endif %}">{{ mode }}</span>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-mono is-muted is-wrap">
+                {% firstof artifact.author.member_ref artifact.author.account_pubkey_hex artifact.author.npub "–" %}
+              </td>
+              <td class="is-wrap">
+                {% for observation in artifact.engine_observations.all %}
+                  <span class="badge" title="{{ observation.engine_id }}">{{ observation.latest_state|default:"seen" }} · {{ observation.engine_id|truncatechars:9 }}</span>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for recipient in artifact.recipient_matrix %}
+                  <span
+                    class="badge{% if recipient.status == 'observed' or recipient.status == 'expected_count_satisfied' %} badge--accent{% elif recipient.status == 'missing_inferred' or recipient.status == 'missing_count_inferred' or recipient.status == 'partial_count_inferred' %} badge--danger{% elif recipient.status == 'unobserved_no_uploaded_engine' or recipient.status == 'observed_count_exceeds_expected' %} badge--warning{% endif %}"
+                    title="{{ recipient.recipient_type }} {{ recipient.recipient_id }}"
+                  >
+                    {{ recipient.status_label }}{% if recipient.recipient_id %} · {{ recipient.recipient_id|truncatechars:9 }}{% endif %}{% if recipient.recipient_type == "count_only" %} · {{ recipient.observed_count }}/{{ recipient.expected_count }} observed{% if recipient.missing_count %} · {{ recipient.missing_count }} missing{% endif %}{% endif %}
+                  </span>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for event in artifact.evidence_events.all|slice:":3" %}
+                  <a class="badge" href="{% url 'api-event-evidence' event.id %}">line {{ event.line_number }}</a>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-right is-mono is-muted">{{ artifact.first_seen_ms|default_if_none:"–" }}</td>
+            </tr>
+            {% if artifact.decoded_payload %}
+              <tr>
+                <td></td>
+                <td colspan="7" class="is-muted is-wrap">
+                  {% if "full_data" in artifact.audit_data_modes %}
+                    <span class="badge badge--warning">decrypted content</span>
+                  {% endif %}
+                  decoded {{ artifact.decoded_payload.content_type|default:"payload" }}
+                  {% if artifact.decoded_payload.text %} · {{ artifact.decoded_payload.text|truncatechars:160 }}{% endif %}
+                  {% if artifact.decoded_app_event.kind %} · app kind {{ artifact.decoded_app_event.kind }}{% endif %}
+                </td>
+              </tr>
+            {% endif %}
+            {% if artifact.engine_observations.all %}
+              <tr>
+                <td></td>
+                <td colspan="7">
+                  <div class="projection-detail">
+                    <div class="projection-detail__section">
+                      <div class="projection-detail__title">Engine state trail</div>
+                      <div class="projection-detail__grid">
+                        {% for observation in artifact.engine_observations.all %}
+                          <div class="projection-detail__item">
+                            <span class="is-mono">{{ observation.engine_id|truncatechars:13 }}</span>
+                            {% for state in observation.states %}
+                              <span class="badge">
+                                {{ state.state }}
+                                {% if state.wall_time_ms != None %} · {{ state.wall_time_ms }}{% endif %}
+                                {% if state.event_id %}
+                                  · <a href="{% url 'api-event-evidence' state.event_id %}">line</a>
+                                {% endif %}
+                              </span>
+                            {% empty %}
+                              <span class="is-muted">–</span>
+                            {% endfor %}
+                          </div>
+                        {% endfor %}
+                      </div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            {% endif %}
+            {% if artifact.has_inferred_missing %}
+              <tr>
+                <td></td>
+                <td colspan="7" class="is-wrap">
+                  <span class="badge badge--danger"><span class="badge__dot"></span>delivery gap inferred</span>
+                  <span class="is-muted">At least one expected recipient or expected recipient count has comparable group evidence but no observation for this artifact.</span>
+                </td>
+              </tr>
+            {% endif %}
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No message artifacts have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>

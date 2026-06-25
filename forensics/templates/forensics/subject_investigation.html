@@ -1,0 +1,77 @@
+{% extends "forensics/base.html" %}
+{% load humanize %}
+{% load static %}
+
+{% block title %}{{ subject_kind }} · Goggles{% endblock %}
+
+{% block breadcrumb %}
+  <a class="crumb" href="{% url 'group-list' %}">Groups</a>
+  <span class="crumb-separator">/</span>
+  <span class="crumb">{{ subject_kind }}</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Cross-group investigation</p>
+    <h1>{{ subject_kind }}</h1>
+    <p class="page-heading__sub is-mono is-wrap">{{ subject_ref }}</p>
+  </div>
+  <div class="heading-status">
+    <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>
+    {{ groups|length }} group{{ groups|length|pluralize }} with matching evidence
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header card__header--with-tools">
+    <span class="card__title">Groups</span>
+    <a class="btn btn--secondary btn--sm" href="{% url api_url_name subject_ref %}">
+      <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>Open JSON
+    </a>
+  </header>
+  <div class="card__body table-scroll">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Group</th>
+          <th class="is-right">Events</th>
+          <th class="is-right">Engines</th>
+          <th class="is-right">Accounts</th>
+          <th>Window (ms)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for group in groups %}
+          <tr data-href="{% url 'group-detail' group.slug %}">
+            <td class="is-mono is-wrap">
+              <a href="{% url 'group-detail' group.slug %}">{{ group.group_ref|default:group.slug|truncatechars:33 }}</a>
+            </td>
+            <td class="is-right is-mono is-muted">{{ group.subject_event_count|intcomma }}</td>
+            <td class="is-right is-mono is-muted">{{ group.subject_engine_count }}</td>
+            <td class="is-right is-mono is-muted">{{ group.subject_account_count }}</td>
+            <td class="is-mono is-muted">
+              {{ group.subject_first_ms|default_if_none:"–" }} → {{ group.subject_last_ms|default_if_none:"–" }}
+            </td>
+            <td class="is-right is-wrap">
+              <a class="btn btn--secondary btn--sm" href="{% url 'api-group-projections' group.slug %}?download=1">
+                <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>Export
+              </a>
+              <a class="btn btn--secondary btn--sm" href="{% url 'group-detail' group.slug %}">Open</a>
+            </td>
+          </tr>
+        {% empty %}
+          <tr>
+            <td colspan="6" class="empty">No groups have matching evidence.</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{% static 'forensics/js/rowlink.js' %}"></script>
+{% endblock %}

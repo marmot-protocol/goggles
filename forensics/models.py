@@ -153,8 +153,13 @@ class AuditFile(models.Model):
     source_name = models.CharField(max_length=255, blank=True)
     source_account_label = models.CharField(max_length=255, blank=True)
     source_device_label = models.CharField(max_length=255, blank=True)
+    source_device_id = models.CharField(max_length=255, blank=True)
+    source_device_name = models.CharField(max_length=255, blank=True)
     source_platform = models.CharField(max_length=120, blank=True)
     source_app_version = models.CharField(max_length=120, blank=True)
+    source_upload_trigger = models.CharField(max_length=160, blank=True)
+    source_account_pubkey_hex = models.CharField(max_length=64, blank=True)
+    source_account_npub = models.CharField(max_length=120, blank=True)
     content_type = models.CharField(max_length=120, blank=True)
     file_sha256 = models.CharField(max_length=64)
     byte_size = models.PositiveBigIntegerField()
@@ -181,6 +186,7 @@ class AuditFile(models.Model):
     engine_ids = models.JSONField(default=list, blank=True)
     group_refs = models.JSONField(default=list, blank=True)
     schema_versions = models.JSONField(default=list, blank=True)
+    audit_data_modes = models.JSONField(default=list, blank=True)
 
     source_ip = models.GenericIPAddressField(null=True, blank=True)
     user_agent = models.TextField(blank=True)
@@ -237,6 +243,8 @@ class AuditEvent(models.Model):
     validation_error = models.TextField(blank=True)
 
     schema_version = models.CharField(max_length=80, blank=True)
+    recorder_session_id = models.CharField(max_length=160, blank=True)
+    audit_data_mode = models.CharField(max_length=80, blank=True)
     seq = models.PositiveBigIntegerField(null=True, blank=True)
     wall_time_ms = models.PositiveBigIntegerField(null=True, blank=True)
     account_ref = models.CharField(max_length=64, blank=True)
@@ -248,6 +256,8 @@ class AuditEvent(models.Model):
     context_transport = models.JSONField(default=dict, blank=True)
     context_engine = models.JSONField(default=dict, blank=True)
     context_group = models.JSONField(default=dict, blank=True)
+    context_convergence = models.JSONField(default=dict, blank=True)
+    context_source = models.JSONField(default=dict, blank=True)
 
     human_action_action = models.CharField(max_length=120, blank=True)
     human_action_origin = models.CharField(max_length=80, blank=True)
@@ -317,6 +327,8 @@ class AuditEvent(models.Model):
             # its projected dedup key from the index after filtering line_hash.
             models.Index(fields=["line_hash", "engine_id"], name="forensics_a_line_hash_eng_idx"),
             models.Index(fields=["account_ref", "engine_id"]),
+            models.Index(fields=["audit_data_mode"]),
+            models.Index(fields=["recorder_session_id"]),
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["group_ref", "wall_time_ms"]),
             models.Index(fields=["msg_id"]),
@@ -336,6 +348,15 @@ class AuditEvent(models.Model):
 
 class AnalysisRun(models.Model):
     group = models.ForeignKey(AuditGroup, related_name="analysis_runs", on_delete=models.CASCADE)
+    created_by = models.ForeignKey(
+        get_user_model(),
+        related_name="saved_investigations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=160, blank=True)
+    notes = models.TextField(blank=True)
     report_json = models.JSONField()
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -343,4 +364,306 @@ class AnalysisRun(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self) -> str:
-        return f"{self.group} analysis at {self.created_at:%Y-%m-%d %H:%M:%S}"
+        label = self.title or "saved investigation"
+        return f"{self.group} {label} at {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
+class DeliveryArtifact(models.Model):
+    group = models.ForeignKey(
+        AuditGroup, related_name="delivery_artifacts", on_delete=models.CASCADE
+    )
+    artifact_id = models.TextField()
+    artifact_kind = models.CharField(max_length=80, blank=True)
+    first_seen_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    last_seen_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    audit_data_modes = models.JSONField(default=list, blank=True)
+    author = models.JSONField(default=dict, blank=True)
+    decoded_payload = models.JSONField(default=dict, blank=True)
+    decoded_app_event = models.JSONField(default=dict, blank=True)
+    evidence_events = models.ManyToManyField(AuditEvent, related_name="delivery_artifact_evidence")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["first_seen_ms", "artifact_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["group", "artifact_id"],
+                name="unique_delivery_artifact_per_group",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["group", "artifact_kind"]),
+            models.Index(fields=["artifact_id"]),
+            models.Index(fields=["first_seen_ms"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.group_id}:{self.artifact_id[:16]}"
+
+
+class DeliveryObservation(models.Model):
+    artifact = models.ForeignKey(
+        DeliveryArtifact,
+        related_name="engine_observations",
+        on_delete=models.CASCADE,
+    )
+    engine_id = models.CharField(max_length=64)
+    account_ref = models.CharField(max_length=64, blank=True)
+    first_seen_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    last_seen_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    states = models.JSONField(default=list, blank=True)
+    latest_state = models.CharField(max_length=120, blank=True)
+    missing_inferred = models.BooleanField(default=False)
+    evidence_events = models.ManyToManyField(
+        AuditEvent, related_name="delivery_observation_evidence"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["artifact_id", "engine_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["artifact", "engine_id"],
+                name="unique_delivery_observation_per_engine",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["engine_id", "latest_state"]),
+            models.Index(fields=["first_seen_ms"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.artifact_id}:{self.engine_id[:8]}:{self.latest_state}"
+
+
+class RecipientExpectation(models.Model):
+    artifact = models.ForeignKey(
+        DeliveryArtifact,
+        related_name="recipient_expectations",
+        on_delete=models.CASCADE,
+    )
+    artifact_kind = models.CharField(max_length=80, blank=True)
+    recipient_scope = models.CharField(max_length=80)
+    membership_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    basis_commit_id = models.TextField(blank=True)
+    expected_member_refs = models.JSONField(default=list, blank=True)
+    expected_pubkeys_hex = models.JSONField(default=list, blank=True)
+    expected_count = models.PositiveBigIntegerField(null=True, blank=True)
+    evidence_event = models.ForeignKey(
+        AuditEvent,
+        related_name="recipient_expectations",
+        on_delete=models.CASCADE,
+    )
+
+    class Meta:
+        ordering = ["artifact_id", "id"]
+        indexes = [
+            models.Index(fields=["recipient_scope"]),
+            models.Index(fields=["membership_epoch"]),
+        ]
+
+
+class NetworkObservation(models.Model):
+    group = models.ForeignKey(
+        AuditGroup, related_name="network_observations", on_delete=models.CASCADE
+    )
+    artifact = models.ForeignKey(
+        DeliveryArtifact,
+        related_name="network_observations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    audit_event = models.ForeignKey(
+        AuditEvent,
+        related_name="network_observations",
+        on_delete=models.CASCADE,
+    )
+    direction = models.CharField(max_length=40)
+    phase = models.CharField(max_length=80)
+    message_id = models.TextField(blank=True)
+    artifact_kind = models.CharField(max_length=80, blank=True)
+    engine_id = models.CharField(max_length=64, blank=True)
+    account_ref = models.CharField(max_length=64, blank=True)
+    wall_time_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    transport_source = models.CharField(max_length=80, blank=True)
+    delivery_plane = models.CharField(max_length=80, blank=True)
+    relay_url = models.TextField(blank=True)
+    subscription_id = models.CharField(max_length=255, blank=True)
+    wire_id = models.TextField(blank=True)
+    wire_kind = models.CharField(max_length=80, blank=True)
+    wire_pubkey_hex = models.CharField(max_length=64, blank=True)
+    transport_group_id = models.TextField(blank=True)
+    nostr_event_id = models.CharField(max_length=64, blank=True)
+    nostr_kind = models.PositiveBigIntegerField(null=True, blank=True)
+    nostr_pubkey_hex = models.CharField(max_length=64, blank=True)
+    gift_wrap_event_id = models.CharField(max_length=64, blank=True)
+    welcome_nostr_event_id = models.CharField(max_length=64, blank=True)
+    welcome_rumor_event_id = models.CharField(max_length=64, blank=True)
+    welcome_key_package_tag = models.TextField(blank=True)
+    publish_result_id = models.CharField(max_length=255, blank=True)
+    payload_len = models.PositiveBigIntegerField(null=True, blank=True)
+    payload_digest = models.CharField(max_length=128, blank=True)
+    outcome = models.CharField(max_length=120, blank=True)
+    accepted_relay_urls = models.JSONField(default=list, blank=True)
+    failed_relays = models.JSONField(default=list, blank=True)
+    required_acks = models.PositiveIntegerField(null=True, blank=True)
+    met_required_acks = models.BooleanField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["wall_time_ms", "engine_id", "id"]
+        indexes = [
+            models.Index(fields=["group", "phase"]),
+            models.Index(fields=["message_id"]),
+            models.Index(fields=["engine_id", "wall_time_ms"]),
+            models.Index(fields=["nostr_event_id"]),
+            models.Index(fields=["relay_url"]),
+        ]
+
+
+class ConvergenceRun(models.Model):
+    group = models.ForeignKey(AuditGroup, related_name="convergence_runs", on_delete=models.CASCADE)
+    run_id = models.CharField(max_length=160)
+    engine_id = models.CharField(max_length=64)
+    account_ref = models.CharField(max_length=64, blank=True)
+    inferred = models.BooleanField(default=False)
+    phase = models.CharField(max_length=80, blank=True)
+    started_at_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    ended_at_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    current_tip_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    selected_branch_id = models.CharField(max_length=256, blank=True)
+    selected_fork_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    selected_tip_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    max_rewind_commits = models.PositiveBigIntegerField(null=True, blank=True)
+    losing_branch_ids = models.JSONField(default=list, blank=True)
+    error_kinds = models.JSONField(default=list, blank=True)
+    evidence_events = models.ManyToManyField(AuditEvent, related_name="convergence_run_evidence")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["started_at_ms", "engine_id", "run_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["group", "engine_id", "run_id"],
+                name="unique_convergence_run_per_engine",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["group", "phase"]),
+            models.Index(fields=["engine_id", "started_at_ms"]),
+        ]
+
+
+class ConvergenceCandidate(models.Model):
+    run = models.ForeignKey(ConvergenceRun, related_name="candidates", on_delete=models.CASCADE)
+    branch_id = models.CharField(max_length=256)
+    fork_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    tip_epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    commit_ids = models.JSONField(default=list, blank=True)
+    commit_count = models.PositiveBigIntegerField(null=True, blank=True)
+    state_digest = models.CharField(max_length=64, blank=True)
+    tip_digest = models.CharField(max_length=64, blank=True)
+    tip_priority = models.CharField(max_length=80, blank=True)
+    tip_committer_ref = models.CharField(max_length=32, blank=True)
+    tip_committer_pubkey_hex = models.CharField(max_length=64, blank=True)
+    retained_anchor_status = models.CharField(max_length=120, blank=True)
+    last_input_time_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    eligible = models.BooleanField(null=True, blank=True)
+    rejection_reasons = models.JSONField(default=list, blank=True)
+    score = models.JSONField(default=dict, blank=True)
+    app_witnesses = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["run_id", "fork_epoch", "tip_epoch", "branch_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "branch_id"],
+                name="unique_convergence_candidate_per_run",
+            )
+        ]
+
+
+class ConvergenceRuleEvaluation(models.Model):
+    run = models.ForeignKey(
+        ConvergenceRun,
+        related_name="rule_evaluations",
+        on_delete=models.CASCADE,
+    )
+    rule_name = models.CharField(max_length=160)
+    scope = models.CharField(max_length=80, blank=True)
+    candidate_branch_id = models.CharField(max_length=256, blank=True)
+    other_candidate_branch_id = models.CharField(max_length=256, blank=True)
+    inputs = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+    decisive = models.BooleanField(default=False)
+    selected_branch_id = models.CharField(max_length=256, blank=True)
+    rejected_branch_id = models.CharField(max_length=256, blank=True)
+    sequence = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["run_id", "sequence", "id"]
+        indexes = [
+            models.Index(fields=["rule_name"]),
+            models.Index(fields=["decisive"]),
+        ]
+
+
+class StateDelta(models.Model):
+    group = models.ForeignKey(AuditGroup, related_name="state_deltas", on_delete=models.CASCADE)
+    audit_event = models.ForeignKey(
+        AuditEvent, related_name="state_deltas", on_delete=models.CASCADE
+    )
+    epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    change_kind = models.CharField(max_length=120)
+    membership_change_source = models.CharField(max_length=80, blank=True)
+    actor_member_ref = models.CharField(max_length=32, blank=True)
+    actor_pubkey_hex = models.CharField(max_length=64, blank=True)
+    subject_member_ref = models.CharField(max_length=32, blank=True)
+    subject_pubkey_hex = models.CharField(max_length=64, blank=True)
+    origin_commit_id = models.TextField(blank=True)
+    fields = models.JSONField(default=list, blank=True)
+    component_ids = models.JSONField(default=list, blank=True)
+    value = models.JSONField(default=dict, blank=True)
+    audit_data_mode = models.CharField(max_length=80, blank=True)
+    wall_time_ms = models.PositiveBigIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["epoch", "wall_time_ms", "id"]
+        indexes = [
+            models.Index(fields=["group", "epoch"]),
+            models.Index(fields=["change_kind"]),
+            models.Index(fields=["origin_commit_id"]),
+        ]
+
+
+class EpochStateTransition(models.Model):
+    group = models.ForeignKey(
+        AuditGroup,
+        related_name="epoch_state_transitions",
+        on_delete=models.CASCADE,
+    )
+    audit_event = models.ForeignKey(
+        AuditEvent,
+        related_name="epoch_state_transitions",
+        on_delete=models.CASCADE,
+    )
+    engine_id = models.CharField(max_length=64)
+    account_ref = models.CharField(max_length=64, blank=True)
+    previous_state = models.CharField(max_length=120, blank=True)
+    new_state = models.CharField(max_length=120)
+    epoch = models.PositiveBigIntegerField(null=True, blank=True)
+    reason = models.CharField(max_length=240, blank=True)
+    pending_ref = models.PositiveBigIntegerField(null=True, blank=True)
+    pending_kind = models.CharField(max_length=120, blank=True)
+    wall_time_ms = models.PositiveBigIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["wall_time_ms", "engine_id", "id"]
+        indexes = [
+            models.Index(fields=["group", "epoch"]),
+            models.Index(fields=["engine_id", "wall_time_ms"]),
+            models.Index(fields=["new_state"]),
+        ]

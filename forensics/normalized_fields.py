@@ -20,6 +20,8 @@ NON_NORMALIZED_AUDIT_EVENT_FIELDS = frozenset(
         "parse_status",
         "validation_error",
         "schema_version",
+        "recorder_session_id",
+        "audit_data_mode",
         "seq",
         "wall_time_ms",
         "account_ref",
@@ -40,6 +42,8 @@ AGENT_EXPORT_NORMALIZED_FIELD_EXCLUDE = frozenset(
         "context_transport",
         "context_engine",
         "context_group",
+        "context_convergence",
+        "context_source",
     }
 )
 AGENT_EXPORT_NORMALIZED_FIELD_EXTRA = ()
@@ -66,6 +70,8 @@ EXPECTED_PERSISTED_NORMALIZED_FIELDS = (
     "context_transport",
     "context_engine",
     "context_group",
+    "context_convergence",
+    "context_source",
     "human_action_action",
     "human_action_origin",
     "human_action_phase",

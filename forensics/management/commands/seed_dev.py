@@ -10,6 +10,7 @@ from forensics.ingest import ingest_audit_log_bytes
 DEFAULT_FIXTURES = (
     "sample-audit-log-alice.jsonl",
     "sample-audit-log-bob.jsonl",
+    "sample-audit-log-v2.jsonl",
 )
 ALLOW_SEED_ENV = "GOGGLES_ALLOW_SEED"
 ALLOW_SEED_VALUES = {"1", "true", "yes", "on"}
@@ -19,6 +20,7 @@ ALLOW_SEED_VALUES = {"1", "true", "yes", "on"}
 FIXTURE_SOURCE_LABELS = {
     "sample-audit-log-alice.jsonl": ("Alice", "iPhone 15", "ios"),
     "sample-audit-log-bob.jsonl": ("Bob", "Pixel 9", "android"),
+    "sample-audit-log-v2.jsonl": ("Casey", "MacBook Pro", "macos"),
 }
 
 

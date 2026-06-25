@@ -64,9 +64,19 @@ dev: migrate
 token name *args: migrate
     DATABASE_URL='{{database_url}}' {{python}} manage.py create_upload_token "{{name}}" {{args}}
 
+# Delete audit uploads, events, groups, projections, and saved reports while
+# preserving users and upload tokens. Pass `--dry-run` first, then
+# `--confirm-delete-audit-data` when performing the deployment cutover.
+purge-audit-data *args: migrate
+    DATABASE_URL='{{database_url}}' {{python}} manage.py purge_audit_data {{args}}
+
 # Open a Django shell against the durable local development database.
 shell: migrate
     DATABASE_URL='{{database_url}}' {{python}} manage.py shell
+
+# Validate JSONL audit events against the committed V2 schema.
+validate-schema *paths:
+    {{python}} manage.py validate_audit_schema {{paths}}
 
 # Run the Django test suite.
 test:

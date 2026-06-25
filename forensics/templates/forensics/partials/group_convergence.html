@@ -1,0 +1,165 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Convergence runs</span>
+    <span class="is-muted">branch candidates, winning decisions, and rule traces</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if runs_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} convergence runs.</p>
+    {% endif %}
+    {% if runs %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Engine</th>
+            <th>Phase</th>
+            <th>Window</th>
+            <th>Selected branch</th>
+            <th>Candidates</th>
+            <th>Decisive rules</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in runs %}
+            <tr>
+              <td class="is-mono is-wrap">{{ run.run_id|truncatechars:33 }}{% if run.inferred %}<br><span class="badge badge--warning">inferred</span>{% endif %}</td>
+              <td class="is-mono is-muted" title="{{ run.engine_id }}">{{ run.engine_id|truncatechars:9 }}</td>
+              <td>{{ run.phase|default:"–" }}</td>
+              <td class="is-mono is-muted">{{ run.started_at_ms|default_if_none:"–" }} → {{ run.ended_at_ms|default_if_none:"–" }}</td>
+              <td class="is-mono is-wrap">
+                {{ run.selected_branch_id|default:"–"|truncatechars:33 }}
+                {% if run.selected_tip_epoch != None %}<br>tip {{ run.selected_tip_epoch }}{% endif %}
+              </td>
+              <td class="is-wrap">
+                {% for candidate in run.candidates.all %}
+                  <span class="badge{% if candidate.branch_id == run.selected_branch_id %} badge--accent{% endif %}" title="{{ candidate.branch_id }}">
+                    {{ candidate.branch_id|truncatechars:13 }} · {{ candidate.fork_epoch|default_if_none:"?" }}→{{ candidate.tip_epoch|default_if_none:"?" }}
+                  </span>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for rule in run.rule_evaluations.all %}
+                  {% if rule.decisive %}
+                    <span class="badge badge--accent">{{ rule.rule_name }}</span>
+                  {% endif %}
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for event in run.evidence_events.all|slice:":3" %}
+                  <a class="badge" href="{% url 'api-event-evidence' event.id %}">line {{ event.line_number }}</a>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+            </tr>
+            {% if run.candidates.all %}
+              <tr>
+                <td></td>
+                <td colspan="7">
+                  <div class="branch-graph" aria-label="Branch graph for convergence run {{ run.run_id }}">
+                    {% for candidate in run.candidates.all %}
+                      <div class="branch-row{% if candidate.branch_id == run.selected_branch_id %} is-selected{% elif candidate.eligible == False %} is-rejected{% endif %}">
+                        <div class="branch-row__meta">
+                          <span class="is-mono is-wrap">{{ candidate.branch_id|truncatechars:21 }}</span>
+                          {% if candidate.branch_id == run.selected_branch_id %}
+                            <span class="badge badge--accent">selected</span>
+                          {% elif candidate.eligible == False %}
+                            <span class="badge badge--warning">rejected</span>
+                          {% elif candidate.eligible == True %}
+                            <span class="badge">eligible</span>
+                          {% endif %}
+                        </div>
+                        <div class="branch-row__track">
+                          <span class="branch-row__epoch">fork {{ candidate.fork_epoch|default_if_none:"?" }}</span>
+                          <span class="branch-row__bar">
+                            {% if candidate.commit_count != None %}
+                              {{ candidate.commit_count }} commits
+                            {% else %}
+                              {{ candidate.commit_ids|length }} commits
+                            {% endif %}
+                          </span>
+                          <span class="branch-row__epoch">tip {{ candidate.tip_epoch|default_if_none:"?" }}</span>
+                        </div>
+                        <div class="branch-row__detail is-wrap">
+                          {% for commit_id in candidate.commit_ids %}
+                            <a class="badge" href="{% url 'api-message-detail' commit_id %}" title="{{ commit_id }}">commit {{ commit_id|truncatechars:13 }}</a>
+                          {% endfor %}
+                          {% for reason in candidate.rejection_reasons %}
+                            <span class="badge badge--warning">{{ reason }}</span>
+                          {% endfor %}
+                          {% if candidate.retained_anchor_status %}
+                            <span class="badge">{{ candidate.retained_anchor_status }}</span>
+                          {% endif %}
+                        </div>
+                      </div>
+                    {% endfor %}
+                  </div>
+                  <div class="projection-detail">
+                    <div class="projection-detail__section">
+                      <div class="projection-detail__title">Candidate scoring</div>
+                      <div class="projection-detail__grid">
+                        {% for candidate in run.candidates.all %}
+                          <div class="projection-detail__item">
+                            <span class="is-mono">{{ candidate.branch_id|truncatechars:21 }}</span>
+                            {% if candidate.score.valid_commit_depth != None %}
+                              <span class="badge">valid depth {{ candidate.score.valid_commit_depth }}</span>
+                            {% endif %}
+                            {% if candidate.score.effective_commit_depth != None %}
+                              <span class="badge">effective depth {{ candidate.score.effective_commit_depth }}</span>
+                            {% endif %}
+                            {% if candidate.score.app_witness_score != None %}
+                              <span class="badge">app witness {{ candidate.score.app_witness_score }}</span>
+                            {% endif %}
+                            {% if candidate.score.witness_quorum_met == True %}
+                              <span class="badge badge--accent">quorum met</span>
+                            {% elif candidate.score.witness_quorum_met == False %}
+                              <span class="badge badge--warning">quorum missing</span>
+                            {% endif %}
+                            {% if candidate.score.tip_priority %}
+                              <span class="badge">priority {{ candidate.score.tip_priority }}</span>
+                            {% endif %}
+                            {% if candidate.state_digest %}
+                              <span class="badge">state {{ candidate.state_digest|truncatechars:13 }}</span>
+                            {% endif %}
+                          </div>
+                        {% endfor %}
+                      </div>
+                    </div>
+                    <div class="projection-detail__section">
+                      <div class="projection-detail__title">Rule trace</div>
+                      <div class="projection-detail__grid">
+                        {% for rule in run.rule_evaluations.all %}
+                          <div class="projection-detail__item">
+                            <span class="badge{% if rule.decisive %} badge--accent{% endif %}">{{ rule.sequence }} · {{ rule.rule_name }}</span>
+                            {% if rule.scope %}<span class="badge">{{ rule.scope }}</span>{% endif %}
+                            {% if rule.candidate_branch_id %}<span class="badge">{{ rule.candidate_branch_id|truncatechars:13 }}</span>{% endif %}
+                            {% if rule.other_candidate_branch_id %}<span class="badge">vs {{ rule.other_candidate_branch_id|truncatechars:13 }}</span>{% endif %}
+                            {% if rule.inputs.branch_a_weight != None %}<span class="badge">branch_a_weight {{ rule.inputs.branch_a_weight }}</span>{% endif %}
+                            {% if rule.inputs.branch_b_weight != None %}<span class="badge">branch_b_weight {{ rule.inputs.branch_b_weight }}</span>{% endif %}
+                            {% if rule.result.winner %}<span class="badge">winner {{ rule.result.winner }}</span>{% endif %}
+                            {% if rule.selected_branch_id %}<span class="badge badge--accent">selected {{ rule.selected_branch_id|truncatechars:13 }}</span>{% endif %}
+                            {% if rule.rejected_branch_id %}<span class="badge badge--warning">rejected {{ rule.rejected_branch_id|truncatechars:13 }}</span>{% endif %}
+                          </div>
+                        {% empty %}
+                          <span class="is-muted">–</span>
+                        {% endfor %}
+                      </div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            {% endif %}
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No convergence runs have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>

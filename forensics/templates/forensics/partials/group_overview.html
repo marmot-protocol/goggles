@@ -1,0 +1,394 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Projection summary</span>
+    <span class="is-muted">group-scoped tables built from preserved JSONL</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if overview.classification.contains_full_data %}
+      <p class="empty-state">
+        Full data auditing evidence is present for this group. API responses and derived views may include decrypted message content, full author identifiers, or transport wire identifiers.
+      </p>
+    {% endif %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Area</th>
+          <th>Top values</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Audit modes</td>
+          <td class="is-wrap">
+            {% for row in overview.audit_data_modes %}
+              <span class="badge">{{ row.mode }} · {{ row.count }}</span>
+            {% empty %}
+              <span class="is-muted">–</span>
+            {% endfor %}
+          </td>
+        </tr>
+        <tr>
+          <td>Delivery artifacts</td>
+          <td class="is-wrap">
+            {% for row in overview.delivery_by_kind %}
+              <span class="badge">{{ row.artifact_kind|default:"unknown" }} · {{ row.count }}</span>
+            {% empty %}
+              <span class="is-muted">–</span>
+            {% endfor %}
+          </td>
+        </tr>
+        <tr>
+          <td>Network phases</td>
+          <td class="is-wrap">
+            {% for row in overview.network_by_phase %}
+              <span class="badge">{{ row.phase|default:"unknown" }} · {{ row.count }}</span>
+            {% empty %}
+              <span class="is-muted">–</span>
+            {% endfor %}
+          </td>
+        </tr>
+        <tr>
+          <td>Convergence phases</td>
+          <td class="is-wrap">
+            {% for row in overview.convergence_by_phase %}
+              <span class="badge">{{ row.phase|default:"unknown" }} · {{ row.count }}</span>
+            {% empty %}
+              <span class="is-muted">–</span>
+            {% endfor %}
+          </td>
+        </tr>
+        <tr>
+          <td>State changes</td>
+          <td class="is-wrap">
+            {% for row in overview.state_by_kind %}
+              <span class="badge">{{ row.change_kind|default:"unknown" }} · {{ row.count }}</span>
+            {% empty %}
+              <span class="is-muted">–</span>
+            {% endfor %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Action attribution</span>
+    <span class="is-muted">user intent separated from engine/system stamps</span>
+  </header>
+  <div class="card__body table-scroll">
+    <div class="metric-grid metric-grid--compact">
+      {% for row in overview.action_origin_counts %}
+        <div class="metric">
+          <span class="metric__label">{{ row.origin|default:"unknown" }}</span>
+          <span class="metric__value">{{ row.count }}</span>
+          <span class="metric__hint">{{ row.attribution_kind }}</span>
+        </div>
+      {% empty %}
+        <p class="empty-state">No action attribution recorded for this group.</p>
+      {% endfor %}
+    </div>
+
+    {% if overview.recent_user_actions %}
+      <h3 class="section-kicker">User actions</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Action</th>
+            <th>Messages</th>
+            <th>Events</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for action in overview.recent_user_actions %}
+            <tr>
+              <td class="is-mono is-muted">{{ action.first_wall_time_ms|default:"–" }}</td>
+              <td>
+                <span class="cell-lines">
+                  <span class="cell-title">{{ action.action_label|default:action.action }}</span>
+                  <span class="cell-sub">{{ action.origin|default:"unknown" }}{% if action.phase %} · {{ action.phase }}{% endif %}{% if action.operation_id %} · {{ action.operation_id|truncatechars:18 }}{% endif %}</span>
+                </span>
+              </td>
+              <td class="is-wrap">
+                {% for message_id in action.message_ids %}
+                  <a class="badge is-mono" href="{% url 'api-message-detail' message_id %}" title="{{ message_id }}">{{ message_id|truncatechars:13 }}</a>
+                {% empty %}
+                  <span class="is-muted">–</span>
+                {% endfor %}
+              </td>
+              <td class="is-right is-mono">{{ action.event_count }}</td>
+              <td>
+                {% if action.evidence_refs %}
+                  <a class="btn btn--secondary btn--sm" href="{{ action.evidence_refs.0.api_path }}">Evidence</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    {% if overview.recent_system_attribution %}
+      <h3 class="section-kicker">System attribution</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Action</th>
+            <th>Events</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for action in overview.recent_system_attribution %}
+            <tr>
+              <td class="is-mono is-muted">{{ action.first_wall_time_ms|default:"–" }}</td>
+              <td>
+                <span class="cell-lines">
+                  <span class="cell-title">{{ action.action_label|default:action.action }}</span>
+                  <span class="cell-sub">{{ action.origin|default:"unknown" }}{% if action.phase %} · {{ action.phase }}{% endif %}</span>
+                </span>
+              </td>
+              <td class="is-right is-mono">{{ action.event_count }}</td>
+              <td>
+                {% if action.evidence_refs %}
+                  <a class="btn btn--secondary btn--sm" href="{{ action.evidence_refs.0.api_path }}">Evidence</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    {% if overview.recent_other_attribution %}
+      <h3 class="section-kicker">Other attribution</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Action</th>
+            <th>Origin</th>
+            <th>Events</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for action in overview.recent_other_attribution %}
+            <tr>
+              <td class="is-mono is-muted">{{ action.first_wall_time_ms|default:"–" }}</td>
+              <td>{{ action.action_label|default:action.action }}</td>
+              <td>{{ action.origin|default:"unknown" }}</td>
+              <td class="is-right is-mono">{{ action.event_count }}</td>
+              <td>
+                {% if action.evidence_refs %}
+                  <a class="btn btn--secondary btn--sm" href="{{ action.evidence_refs.0.api_path }}">Evidence</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Audit data mode changes</span>
+    <span class="is-muted">recorder boundaries and full-data opt-ins</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if overview.audit_data_mode_changes_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} mode-change rows.</p>
+    {% endif %}
+    {% if overview.audit_data_mode_changes %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Engine</th>
+            <th>Mode</th>
+            <th>Reason</th>
+            <th>Recorder</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for change in overview.audit_data_mode_changes %}
+            <tr>
+              <td class="is-mono is-muted">{{ change.wall_time_ms|default:"–" }}</td>
+              <td class="is-mono is-muted" title="{{ change.engine_id }}">{{ change.engine_id|truncatechars:9 }}</td>
+              <td>
+                <span class="badge">{{ change.previous_mode|default:"unknown" }}</span>
+                <span class="is-muted">&rarr;</span>
+                <span class="badge{% if change.new_mode == 'full_data' %} badge--warning{% endif %}">{{ change.new_mode|default:"unknown" }}</span>
+              </td>
+              <td class="is-wrap">{{ change.reason|default:"–" }}</td>
+              <td>
+                {% if change.recorder_restarted == True %}
+                  <span class="badge badge--accent">restarted</span>
+                {% elif change.recorder_restarted == False %}
+                  <span class="badge badge--warning">not restarted</span>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+                {% if change.recorder_session_id %}<br><span class="is-mono is-muted">{{ change.recorder_session_id|truncatechars:17 }}</span>{% endif %}
+              </td>
+              <td>
+                {% if change.evidence_ref %}
+                  <a class="btn btn--secondary btn--sm" href="{{ change.evidence_ref.api_path }}">Evidence</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No audit data mode changes recorded for this group.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Engines and devices</span>
+    <span class="is-muted">source labels from uploads and V2 context</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if overview.engines_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} engines.</p>
+    {% endif %}
+    {% if overview.engines %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Engine</th>
+            <th>Account</th>
+            <th>Device</th>
+            <th>App</th>
+            <th class="is-right">Events</th>
+            <th>Activity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for engine in overview.engines %}
+            <tr>
+              <td>
+                <span class="badge" title="{{ engine.engine_id }}">{{ engine.label }}</span><br>
+                <span class="is-mono is-muted">{{ engine.engine_id|truncatechars:13 }}</span>
+              </td>
+              <td class="is-wrap">
+                {% for label in engine.source_metadata.account_labels %}
+                  <span class="badge">{{ label }}</span>
+                {% endfor %}
+                {% for account_ref in engine.account_refs %}
+                  <span class="badge is-mono" title="{{ account_ref }}">{{ account_ref|truncatechars:13 }}</span>
+                {% empty %}
+                  {% if not engine.source_metadata.account_labels %}<span class="is-muted">–</span>{% endif %}
+                {% endfor %}
+                {% for npub in engine.source_metadata.account_npubs %}
+                  <br><span class="is-mono is-muted" title="{{ npub }}">{{ npub|truncatechars:24 }}</span>
+                {% endfor %}
+                {% for pubkey in engine.source_metadata.account_pubkeys_hex %}
+                  <br><span class="is-mono is-muted" title="{{ pubkey }}">{{ pubkey|truncatechars:17 }}</span>
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for name in engine.source_metadata.device_names %}
+                  <span class="badge">{{ name }}</span>
+                {% endfor %}
+                {% for label in engine.source_metadata.device_labels %}
+                  <span class="badge">{{ label }}</span>
+                {% endfor %}
+                {% for device_id in engine.source_metadata.device_ids %}
+                  <br><span class="is-mono is-muted" title="{{ device_id }}">{{ device_id|truncatechars:18 }}</span>
+                {% empty %}
+                  {% if not engine.source_metadata.device_names and not engine.source_metadata.device_labels %}<span class="is-muted">–</span>{% endif %}
+                {% endfor %}
+              </td>
+              <td class="is-wrap">
+                {% for platform in engine.source_metadata.platforms %}
+                  <span class="badge">{{ platform }}</span>
+                {% endfor %}
+                {% for app_version in engine.source_metadata.app_versions %}
+                  <span class="badge">{{ app_version }}</span>
+                {% endfor %}
+                {% for trigger in engine.source_metadata.upload_triggers %}
+                  <br><span class="is-muted">{{ trigger }}</span>
+                {% empty %}
+                  {% if not engine.source_metadata.platforms and not engine.source_metadata.app_versions %}<span class="is-muted">–</span>{% endif %}
+                {% endfor %}
+              </td>
+              <td class="is-right is-mono">{{ engine.event_count }}</td>
+              <td class="is-mono is-muted">
+                {{ engine.first_event_ms|default:"–" }}{% if engine.last_event_ms and engine.last_event_ms != engine.first_event_ms %}<br>{{ engine.last_event_ms }}{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No engine metadata found for this group.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Audit files</span>
+    <span class="is-muted">recent source uploads</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if overview.audit_files_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} audit files. Open Evidence for the full file list.</p>
+    {% endif %}
+    {% if overview.audit_files %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Status</th>
+            <th>Source</th>
+            <th class="is-right">Valid</th>
+            <th class="is-right">Invalid</th>
+            <th>Engines</th>
+            <th>Uploaded</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for audit_file in overview.audit_files %}
+            <tr>
+              <td><a href="{% url 'audit-file-detail' audit_file.id %}">{{ audit_file.source_name }}</a></td>
+              <td>
+                {% if audit_file.validation_status == "valid" %}
+                  <span class="badge badge--accent"><span class="badge__dot"></span>valid</span>
+                {% else %}
+                  <span class="badge badge--danger"><span class="badge__dot"></span>invalid</span>
+                {% endif %}
+              </td>
+              <td class="is-muted">{{ audit_file.source_label|default:"–" }}</td>
+              <td class="is-right is-mono">{{ audit_file.valid_event_count }}</td>
+              <td class="is-right is-mono">{{ audit_file.invalid_event_count }}</td>
+              <td class="is-mono is-muted is-wrap">{% for engine_id in audit_file.engine_ids %}{{ engine_id|truncatechars:9 }}{% if not forloop.last %}, {% endif %}{% empty %}–{% endfor %}</td>
+              <td class="is-mono is-muted">{{ audit_file.created_at|date:"Y-m-d H:i" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No audit logs uploaded for this group.</p>
+    {% endif %}
+  </div>
+</section>

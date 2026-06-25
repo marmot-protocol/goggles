@@ -1,0 +1,103 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Group state deltas</span>
+    <span class="is-muted">changes emitted from the MLS-backed group state</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if state_deltas_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} state deltas.</p>
+    {% endif %}
+    {% if state_deltas %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Epoch</th>
+            <th>Change</th>
+            <th>Source</th>
+            <th>Actor</th>
+            <th>Subject</th>
+            <th>Fields</th>
+            <th>Value</th>
+            <th>Origin</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for delta in state_deltas %}
+            <tr>
+              <td class="is-mono is-muted">{{ delta.wall_time_ms|default_if_none:"–" }}</td>
+              <td class="is-mono">{{ delta.epoch|default_if_none:"–" }}</td>
+              <td>{{ delta.change_kind }}</td>
+              <td>{{ delta.membership_change_source|default:"–" }}</td>
+              <td class="is-mono is-muted is-wrap">{% firstof delta.actor_member_ref delta.actor_pubkey_hex "–" %}</td>
+              <td class="is-mono is-muted is-wrap">{% firstof delta.subject_member_ref delta.subject_pubkey_hex "–" %}</td>
+              <td class="is-wrap">{% for field in delta.fields %}<span class="badge">{{ field }}</span>{% empty %}<span class="is-muted">–</span>{% endfor %}</td>
+              <td class="is-mono is-muted is-wrap">
+                {% if delta.audit_data_mode == "full_data" %}
+                  <span class="badge badge--warning">full data</span>
+                {% endif %}
+                {% firstof delta.value.text delta.value.digest "–" %}
+              </td>
+              <td class="is-wrap">
+                {% if delta.origin_commit_id %}
+                  <a class="badge" href="{% url 'api-message-detail' delta.origin_commit_id %}" title="{{ delta.origin_commit_id }}">commit {{ delta.origin_commit_id|truncatechars:13 }}</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+              <td>
+                <a class="badge" href="{% url 'api-event-evidence' delta.audit_event.id %}">line {{ delta.audit_event.line_number }}</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No group state deltas have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Epoch state transitions</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if epoch_transitions_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} epoch transitions.</p>
+    {% endif %}
+    {% if epoch_transitions %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Engine</th>
+            <th>Epoch</th>
+            <th>State</th>
+            <th>Pending</th>
+            <th>Reason</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for transition in epoch_transitions %}
+            <tr>
+              <td class="is-mono is-muted">{{ transition.wall_time_ms|default_if_none:"–" }}</td>
+              <td class="is-mono is-muted" title="{{ transition.engine_id }}">{{ transition.engine_id|truncatechars:9 }}</td>
+              <td class="is-mono">{{ transition.epoch|default_if_none:"–" }}</td>
+              <td>{{ transition.previous_state|default:"–" }} → {{ transition.new_state }}</td>
+              <td class="is-mono is-muted">{% if transition.pending_ref != None %}{{ transition.pending_kind|default:"pending" }} {{ transition.pending_ref }}{% else %}–{% endif %}</td>
+              <td class="is-muted is-wrap">{{ transition.reason|default:"–" }}</td>
+              <td>
+                <a class="badge" href="{% url 'api-event-evidence' transition.audit_event.id %}">line {{ transition.audit_event.line_number }}</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No epoch state transitions have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>
