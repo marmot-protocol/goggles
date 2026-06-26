@@ -29,20 +29,27 @@
   <header class="card__header"><span class="card__title">Source</span></header>
   <div class="card__body">
     <div class="rail-row">
-      <span class="eyebrow">Label</span>
+      <span class="eyebrow">Account</span>
       <span class="rail-row__value">
-        {% if audit_file.source_account_label or audit_file.source_device_label or audit_file.source_platform %}
-          {{ audit_file.source_account_label|default:"–" }}{% if audit_file.source_device_label %} / {{ audit_file.source_device_label }}{% endif %}{% if audit_file.source_platform %} / {{ audit_file.source_platform }}{% endif %}
+        {{ audit_file.source_account_label|default:"–" }}
+        {% if audit_file.source_account_pubkey_hex %}<br><span class="is-mono is-muted">{{ audit_file.source_account_pubkey_hex }}</span>{% endif %}
+      </span>
+    </div>
+    <div class="rail-row">
+      <span class="eyebrow">Account refs</span>
+      <span class="rail-row__value is-mono">{% for account_ref in audit_file.account_refs %}{{ account_ref }}{% if not forloop.last %}<br>{% endif %}{% empty %}–{% endfor %}</span>
+    </div>
+    <div class="rail-row">
+      <span class="eyebrow">Device</span>
+      <span class="rail-row__value">
+        {% if audit_file.source_device_label or audit_file.source_platform %}
+          {{ audit_file.source_device_label|default:"" }}{% if audit_file.source_device_label and audit_file.source_platform %} / {% endif %}{{ audit_file.source_platform }}
         {% else %}–{% endif %}
       </span>
     </div>
     <div class="rail-row">
       <span class="eyebrow">App version</span>
       <span class="rail-row__value">{{ audit_file.source_app_version|default:"–" }}</span>
-    </div>
-    <div class="rail-row">
-      <span class="eyebrow">Accounts</span>
-      <span class="rail-row__value is-mono">{% for account_ref in audit_file.account_refs %}{{ account_ref }}{% if not forloop.last %}<br>{% endif %}{% empty %}–{% endfor %}</span>
     </div>
     <div class="rail-row">
       <span class="eyebrow">Engines</span>

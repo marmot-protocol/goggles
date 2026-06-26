@@ -60,21 +60,26 @@ Each line must be one JSON object in the new action-aware `marmot-forensics-audi
 curl -X POST http://127.0.0.1:8000/api/v1/audit-logs/ \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
   -H "Content-Type: application/x-ndjson" \
-  -H "X-Goggles-Account-Label: Alice" \
   -H "X-Goggles-Device-Label: Alice iPhone" \
   -H "X-Goggles-Platform: ios" \
   -H "X-Goggles-App-Version: 2026.6.8" \
-  --data-binary @fixtures/sample-audit-log-alice.jsonl
+  --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
-The source metadata headers are optional labels for humans. The forensic joins still come from the JSONL `account_ref`, `engine_id`, and `group_ref` fields.
+Account identity comes from the JSONL body: `source_context.account_label`, the
+top-level `account_ref`, and (in full-data mode) `source_context.account_pubkey_hex`.
+Goggles surfaces the account label as the primary identifier with the pubkey hex
+shown alongside it. The remaining upload headers (`X-Goggles-Device-Label`,
+`X-Goggles-Platform`, `X-Goggles-App-Version`) are optional human labels; the
+forensic joins still come from the JSONL `account_ref`, `engine_id`, and
+`group_ref` fields.
 
 The group URL is only a fallback for group-less lines or broken logs. Event-level `group_ref` values take precedence:
 
 ```sh
 curl -X POST http://127.0.0.1:8000/api/v1/groups/qa-fork/audit-logs/ \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
-  -F "audit_log=@fixtures/sample-audit-log-alice.jsonl;type=application/x-ndjson"
+  -F "audit_log=@fixtures/sample-audit-log-trailhead-maya.jsonl;type=application/x-ndjson"
 ```
 
 Query parameters also work as the same fallback:
@@ -83,10 +88,10 @@ Query parameters also work as the same fallback:
 curl -X POST "http://127.0.0.1:8000/api/v1/audit-logs/?group=qa-fork" \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
   -H "Content-Type: application/x-ndjson" \
-  --data-binary @fixtures/sample-audit-log-alice.jsonl
+  --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
-Upload another one-engine file, such as `fixtures/sample-audit-log-bob.jsonl`, to compare multiple clients in the same group. Invalid JSONL, mixed-engine uploads, or mixed-account uploads return `400` and are still saved as quarantined audit files so damaged lines can be inspected.
+Upload another one-engine file, such as `fixtures/sample-audit-log-trailhead-theo.jsonl`, to compare multiple clients in the same group. Invalid JSONL, mixed-engine uploads, or mixed-account uploads return `400` and are still saved as quarantined audit files so damaged lines can be inspected.
 
 ## Production Deployment: goggles.ipf.dev
 
@@ -220,10 +225,9 @@ Upload a sample log through the public endpoint:
 curl -X POST https://goggles.ipf.dev/api/v1/audit-logs/ \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
   -H "Content-Type: application/x-ndjson" \
-  -H "X-Goggles-Account-Label: Alice" \
   -H "X-Goggles-Device-Label: Alice iPhone" \
   -H "X-Goggles-Platform: ios" \
-  --data-binary @fixtures/sample-audit-log-alice.jsonl
+  --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
 Invalid JSONL is saved as a quarantined upload and returns `400`.

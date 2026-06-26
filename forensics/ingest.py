@@ -196,6 +196,13 @@ def ingest_audit_log_bytes(
 
     parsed_lines = parse_jsonl(raw_text)
     metadata = file_metadata(parsed_lines)
+    # Account identity is sourced from the JSONL body (source_context), not from
+    # upload headers. Backfill the per-file account fields so file-level views
+    # and the identity indexes keep resolving who is who. An explicit header/POST
+    # value (if one is ever supplied) still wins over the body.
+    body_identity = body_account_identity(parsed_lines)
+    source_account_label = source_account_label or body_identity["account_label"]
+    source_account_pubkey_hex = source_account_pubkey_hex or body_identity["account_pubkey_hex"]
     validation_errors = [
         f"line {line.line_number}: {'; '.join(line.errors)}" for line in parsed_lines if line.errors
     ]
@@ -1116,6 +1123,32 @@ def file_metadata(parsed_lines: list[ParsedLine]) -> dict[str, Any]:
         "schema_versions": schema_versions,
         "audit_data_modes": audit_data_modes,
     }
+
+
+def body_account_identity(parsed_lines: list[ParsedLine]) -> dict[str, str]:
+    """Derive the file's account label and pubkey from the JSONL body.
+
+    Account identity travels in the ``source_context`` object (stored per-event
+    as ``context_source``); ``account_pubkey_hex`` is only present in full-data
+    mode. One account per file is enforced by ``file_validation_errors``, so the
+    first non-empty value from a valid line is representative. Returns "" for any
+    field the body does not carry.
+    """
+    account_label = ""
+    account_pubkey_hex = ""
+    for line in parsed_lines:
+        if line.errors:
+            continue
+        source = line.normalized.get("context_source")
+        if not isinstance(source, dict):
+            continue
+        if not account_label:
+            account_label = value_if_str(source.get("account_label"))
+        if not account_pubkey_hex:
+            account_pubkey_hex = value_if_str(source.get("account_pubkey_hex"))
+        if account_label and account_pubkey_hex:
+            break
+    return {"account_label": account_label, "account_pubkey_hex": account_pubkey_hex}
 
 
 def file_validation_errors(parsed_lines: list[ParsedLine]) -> list[str]:

@@ -17,6 +17,22 @@ FORK_EVENT_TYPES = (
     "epoch_rolled_back",
 )
 
+# Every ``AuditEvent`` column that carries a group epoch. The group-list epoch
+# range spans all of them so that groups whose epoch activity is expressed via
+# ``epoch_state_changed`` / ``group_state_changed`` / convergence events (i.e.
+# anything other than ``epoch_confirmed``) still report a range instead of "–".
+GROUP_EPOCH_RANGE_FIELDS = (
+    "epoch",
+    "source_epoch",
+    "from_epoch",
+    "to_epoch",
+    "pending_epoch",
+    "restored_epoch",
+    "current_tip_epoch",
+    "selected_fork_epoch",
+    "selected_tip_epoch",
+)
+
 PEELER_EVENT_TYPES = ("peeler_outcome", "rejection", "message_state_changed")
 
 FAILED_MESSAGE_STATES = {"failed", "epoch_invalidated"}
@@ -235,16 +251,22 @@ def event_stats_for_groups(groups):
         group_id__in=group_ids,
         parse_status=AuditEvent.STATUS_VALID,
     )
-    stats = {
-        row["group_id"]: row
-        for row in valid_events.values("group_id").annotate(
-            event_count=Count("id", distinct=True),
-            engine_count=Count("engine_id", filter=~Q(engine_id=""), distinct=True),
-            epoch_min=Min("from_epoch", filter=Q(event_type="epoch_confirmed")),
-            epoch_max=Max("to_epoch", filter=Q(event_type="epoch_confirmed")),
-            last_activity_ms=Max("wall_time_ms"),
-        )
+    annotations = {
+        "event_count": Count("id", distinct=True),
+        "engine_count": Count("engine_id", filter=~Q(engine_id=""), distinct=True),
+        "last_activity_ms": Max("wall_time_ms"),
     }
+    for field in GROUP_EPOCH_RANGE_FIELDS:
+        annotations[f"epoch_min_{field}"] = Min(field)
+        annotations[f"epoch_max_{field}"] = Max(field)
+
+    stats = {}
+    for row in valid_events.values("group_id").annotate(**annotations):
+        mins = [row[f"epoch_min_{field}"] for field in GROUP_EPOCH_RANGE_FIELDS]
+        maxs = [row[f"epoch_max_{field}"] for field in GROUP_EPOCH_RANGE_FIELDS]
+        row["epoch_min"] = min((v for v in mins if v is not None), default=None)
+        row["epoch_max"] = max((v for v in maxs if v is not None), default=None)
+        stats[row["group_id"]] = row
     fork_group_ids = set(
         valid_events.filter(event_type__in=["fork_resolution", "epoch_rolled_back"])
         .values_list("group_id", flat=True)
