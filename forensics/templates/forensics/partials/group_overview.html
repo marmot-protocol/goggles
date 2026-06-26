@@ -292,17 +292,17 @@
               <td class="is-wrap">
                 {% for label in engine.source_metadata.account_labels %}
                   <span class="badge">{{ label }}</span>
-                {% endfor %}
-                {% for account_ref in engine.account_refs %}
-                  <span class="badge is-mono" title="{{ account_ref }}">{{ account_ref|truncatechars:13 }}</span>
                 {% empty %}
-                  {% if not engine.source_metadata.account_labels %}<span class="is-muted">–</span>{% endif %}
-                {% endfor %}
-                {% for npub in engine.source_metadata.account_npubs %}
-                  <br><span class="is-mono is-muted" title="{{ npub }}">{{ npub|truncatechars:24 }}</span>
+                  {% if not engine.account_refs and not engine.source_metadata.account_pubkeys_hex %}<span class="is-muted">–</span>{% endif %}
                 {% endfor %}
                 {% for pubkey in engine.source_metadata.account_pubkeys_hex %}
                   <br><span class="is-mono is-muted" title="{{ pubkey }}">{{ pubkey|truncatechars:17 }}</span>
+                {% endfor %}
+                {% for account_ref in engine.account_refs %}
+                  <br><span class="is-mono is-muted" title="{{ account_ref }}">{{ account_ref|truncatechars:13 }}</span>
+                {% endfor %}
+                {% for npub in engine.source_metadata.account_npubs %}
+                  <br><span class="is-mono is-muted" title="{{ npub }}">{{ npub|truncatechars:24 }}</span>
                 {% endfor %}
               </td>
               <td class="is-wrap">

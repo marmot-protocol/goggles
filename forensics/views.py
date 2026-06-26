@@ -2973,25 +2973,19 @@ def read_upload_bytes(upload) -> bytes:
 
 
 def source_metadata_from_request(request: HttpRequest) -> dict[str, str]:
+    # Account identity (account_label, account_pubkey_hex) now arrives in the
+    # JSONL body via the source_context object and is backfilled onto the
+    # AuditFile at ingest -- it is no longer sent as an X-Goggles-* header.
+    # Likewise device_id/device_name/upload_trigger/account_npub, when present,
+    # ride along in source_context. Only the device label, platform, and app
+    # version are still carried as upload headers (alongside Authorization).
     return {
-        "source_account_label": request.POST.get("account_label")
-        or request.headers.get("X-Goggles-Account-Label", ""),
         "source_device_label": request.POST.get("device_label")
         or request.headers.get("X-Goggles-Device-Label", ""),
-        "source_device_id": request.POST.get("device_id")
-        or request.headers.get("X-Goggles-Device-Id", ""),
-        "source_device_name": request.POST.get("device_name")
-        or request.headers.get("X-Goggles-Device-Name", ""),
         "source_platform": request.POST.get("platform")
         or request.headers.get("X-Goggles-Platform", ""),
         "source_app_version": request.POST.get("app_version")
         or request.headers.get("X-Goggles-App-Version", ""),
-        "source_upload_trigger": request.POST.get("upload_trigger")
-        or request.headers.get("X-Goggles-Upload-Trigger", ""),
-        "source_account_pubkey_hex": request.POST.get("account_pubkey_hex")
-        or request.headers.get("X-Goggles-Account-Pubkey-Hex", ""),
-        "source_account_npub": request.POST.get("account_npub")
-        or request.headers.get("X-Goggles-Account-Npub", ""),
     }
 
 

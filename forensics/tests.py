@@ -53,6 +53,7 @@ from .models import (
     StateDelta,
     UploadToken,
 )
+from .seed_data import SCENARIO_GROUPS, build_dev_scenario, group_ref_for
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     GROUP_DETAIL_TAB_EVENT_LIMIT,
@@ -322,11 +323,26 @@ NORMALIZED_KIND_EXAMPLES = (
 )
 
 
-def representative_audit_log(engine_id=ENGINE_ALICE):
+def representative_audit_log(engine_id=ENGINE_ALICE, source=None):
+    # Account identity (account_label / account_pubkey_hex) rides in the JSONL
+    # body's source_context, not in upload headers. Pass ``source`` to embed it.
+    context = None
+    if source is not None:
+        context = {
+            "operation_id": "op-source",
+            "human_action": {
+                "action": "update_group_profile",
+                "origin": "local_user",
+                "fields": ["name"],
+                "component_ids": [32769],
+            },
+            "source": source,
+        }
     return jsonl(
         audit_event(
             0,
             engine_id=engine_id,
+            context=context,
             kind={
                 "type": "ingest_entry",
                 "msg_id": MSG_ID,
@@ -338,6 +354,7 @@ def representative_audit_log(engine_id=ENGINE_ALICE):
         audit_event(
             1,
             engine_id=engine_id,
+            context=context,
             kind={
                 "type": "ingest_outcome",
                 "msg_id": MSG_ID,
@@ -1115,15 +1132,18 @@ class AuditLogIngestionTests(TestCase):
             [second_group_ref],
         )
 
-    def test_upload_source_metadata_headers_are_saved(self):
+    def test_upload_source_metadata_is_saved(self):
+        # Account identity is backfilled from the body's source_context; only the
+        # device label, platform, and app version still arrive as headers.
         raw_token, _token = UploadToken.issue("alice iphone")
 
         response = self.client.post(
             reverse("api-audit-log-upload"),
-            data=representative_audit_log(),
+            data=representative_audit_log(
+                source={"account_label": "Alice", "account_pubkey_hex": "aa" * 32}
+            ),
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            HTTP_X_GOGGLES_ACCOUNT_LABEL="Alice",
             HTTP_X_GOGGLES_DEVICE_LABEL="Alice iPhone",
             HTTP_X_GOGGLES_PLATFORM="ios",
             HTTP_X_GOGGLES_APP_VERSION="2026.6.8",
@@ -1137,14 +1157,33 @@ class AuditLogIngestionTests(TestCase):
                 "device_label": "Alice iPhone",
                 "platform": "ios",
                 "app_version": "2026.6.8",
+                "account_pubkey_hex": "aa" * 32,
             },
         )
 
         audit_file = AuditFile.objects.get()
         self.assertEqual(audit_file.source_account_label, "Alice")
+        self.assertEqual(audit_file.source_account_pubkey_hex, "aa" * 32)
         self.assertEqual(audit_file.source_device_label, "Alice iPhone")
         self.assertEqual(audit_file.source_platform, "ios")
         self.assertEqual(audit_file.source_app_version, "2026.6.8")
+
+    def test_upload_ignores_legacy_account_label_header(self):
+        # The X-Goggles-Account-Label header is no longer read; identity must
+        # come from the body. A stray header alongside a body label must not win.
+        raw_token, _token = UploadToken.issue("legacy client")
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log(source={"account_label": "Body Alice"}),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            HTTP_X_GOGGLES_ACCOUNT_LABEL="Header Alice",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.source_account_label, "Body Alice")
 
     def test_v2_upload_builds_audit_projections(self):
         raw_token, _token = UploadToken.issue("v2 test client")
@@ -1348,12 +1387,18 @@ class AuditLogIngestionTests(TestCase):
             ),
             audit_event_v2(
                 10,
+                audit_data_mode="full_data",
                 context={
                     "operation_id": "op-system-recorder",
                     "human_action": {
                         "action": "background_sync",
                         "origin": "system",
                         "phase": "observed",
+                    },
+                    "source": {
+                        "account_pubkey_hex": "aa" * 32,
+                        "device_id": "device-1",
+                        "device_name": "Alice MacBook",
                     },
                 },
                 kind={
@@ -1370,9 +1415,6 @@ class AuditLogIngestionTests(TestCase):
             data=body,
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            HTTP_X_GOGGLES_DEVICE_ID="device-1",
-            HTTP_X_GOGGLES_DEVICE_NAME="Alice MacBook",
-            HTTP_X_GOGGLES_ACCOUNT_PUBKEY_HEX="aa" * 32,
         )
 
         self.assertEqual(response.status_code, 201)
@@ -1381,7 +1423,8 @@ class AuditLogIngestionTests(TestCase):
             response.json()["audit_data_modes"],
             ["full_data", "obfuscated_sensitive_data"],
         )
-        self.assertEqual(response.json()["source"]["device_id"], "device-1")
+        # Account pubkey is backfilled from the body's source_context.
+        self.assertEqual(response.json()["source"]["account_pubkey_hex"], "aa" * 32)
 
         bob_response = self.client.post(
             reverse("api-audit-log-upload"),
@@ -1400,8 +1443,7 @@ class AuditLogIngestionTests(TestCase):
         )
         self.assertEqual(bob_response.status_code, 201)
 
-        audit_file = AuditFile.objects.get(source_device_id="device-1")
-        self.assertEqual(audit_file.source_device_name, "Alice MacBook")
+        audit_file = AuditFile.objects.get(source_account_pubkey_hex="aa" * 32)
         self.assertEqual(audit_file.source_account_pubkey_hex, "aa" * 32)
 
         group = AuditGroup.objects.get(slug=GROUP_REF)
@@ -4083,11 +4125,11 @@ class ValidateAuditSchemaCommandTests(TestCase):
 
         call_command(
             "validate_audit_schema",
-            "fixtures/sample-audit-log-v2.jsonl",
+            "fixtures/sample-audit-log-acme-dana.jsonl",
             stdout=output,
         )
 
-        self.assertIn("Schema validation passed for 8 event(s)", output.getvalue())
+        self.assertIn("Schema validation passed for 14 event(s)", output.getvalue())
 
     def test_validate_audit_schema_reports_line_without_raw_body(self):
         with TemporaryDirectory() as temp_dir:
@@ -4458,10 +4500,9 @@ class DashboardTests(TestCase):
 
         valid_response = self.client.post(
             reverse("api-audit-log-upload"),
-            data=representative_audit_log(),
+            data=representative_audit_log(source={"account_label": "Alice"}),
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            HTTP_X_GOGGLES_ACCOUNT_LABEL="Alice",
             HTTP_X_GOGGLES_DEVICE_LABEL="MacBook",
             HTTP_X_GOGGLES_PLATFORM="macOS",
             HTTP_X_GOGGLES_APP_VERSION="1.2.3",
@@ -4526,10 +4567,9 @@ class DashboardTests(TestCase):
         )
         upload_response = self.client.post(
             reverse("api-audit-log-upload"),
-            data=representative_audit_log(),
+            data=representative_audit_log(source={"account_label": "Alice"}),
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            HTTP_X_GOGGLES_ACCOUNT_LABEL="Alice",
             HTTP_USER_AGENT="DarkMatter/1.2.3",
             REMOTE_ADDR="203.0.113.10",
         )
@@ -5113,6 +5153,60 @@ class HealthCheckTests(TestCase):
         self.assertEqual(response.json(), {"status": "ok"})
 
 
+class SeedDataScenarioTests(TestCase):
+    def test_scenario_is_deterministic(self):
+        first = build_dev_scenario()
+        second = build_dev_scenario()
+        self.assertEqual(
+            [(log.source_name, log.jsonl) for log in first],
+            [(log.source_name, log.jsonl) for log in second],
+        )
+
+    def test_scenario_conforms_to_canonical_json_schema(self):
+        import json as _json
+
+        from forensics.management.commands.validate_audit_schema import (
+            DEFAULT_SCHEMA_PATH,
+            schema_validator,
+        )
+
+        validator = schema_validator(DEFAULT_SCHEMA_PATH)
+        for log in build_dev_scenario():
+            for line_number, line in enumerate(log.jsonl.splitlines(), 1):
+                event = _json.loads(line)
+                errors = sorted(validator.iter_errors(event), key=lambda error: error.path)
+                self.assertEqual(
+                    errors,
+                    [],
+                    msg=f"{log.source_name}:{line_number}: {[e.message for e in errors]}",
+                )
+
+    def test_scenario_logs_all_ingest_as_valid_single_engine_files(self):
+        logs = build_dev_scenario()
+        self.assertEqual(len(logs), sum(count for _name, count in SCENARIO_GROUPS))
+
+        for log in logs:
+            result = ingest_audit_log_bytes(
+                dump_bytes=log.dump_bytes,
+                source_name=log.source_name,
+                source_device_label=log.device_label,
+                source_platform=log.platform,
+                content_type="application/x-ndjson",
+            )
+            audit_file = result.audit_file
+            self.assertEqual(
+                audit_file.validation_status,
+                AuditFile.STATUS_VALID,
+                msg=f"{log.source_name}: {audit_file.validation_error}",
+            )
+            # One recorder (engine) and one account per participant log.
+            self.assertEqual(len(audit_file.engine_ids), 1, msg=log.source_name)
+            self.assertLessEqual(len(audit_file.account_refs), 1, msg=log.source_name)
+            # Account label/pubkey are backfilled from the body, not headers.
+            self.assertEqual(audit_file.source_account_label, log.account_label)
+            self.assertEqual(audit_file.source_account_pubkey_hex, log.account_pubkey_hex)
+
+
 @override_settings(DEBUG=True)
 class SeedDevCommandTests(TestCase):
     def test_seed_dev_creates_admin_user_and_sample_audit_log_idempotently(self):
@@ -5126,25 +5220,28 @@ class SeedDevCommandTests(TestCase):
         self.assertTrue(admin.is_staff)
         self.assertTrue(admin.is_superuser)
 
-        group = AuditGroup.objects.get(group_ref=GROUP_REF)
-        self.assertEqual(group.slug, GROUP_REF)
-        self.assertEqual(
-            AuditFile.objects.filter(events__group=group).distinct().count(),
-            2,
+        # Re-seeding is idempotent (dedup by sha256): 2 + 3 + 4 + 6 participant logs.
+        self.assertEqual(AuditFile.objects.count(), 15)
+        self.assertTrue(
+            all(f.validation_status == AuditFile.STATUS_VALID for f in AuditFile.objects.all())
         )
-        self.assertEqual(AuditEvent.objects.filter(group=group).count(), 6)
-        v2_group = AuditGroup.objects.get(group_ref="55" * 32)
-        self.assertEqual(DeliveryArtifact.objects.filter(group=v2_group).count(), 1)
-        self.assertEqual(NetworkObservation.objects.filter(group=v2_group).count(), 2)
-        self.assertEqual(ConvergenceRun.objects.filter(group=v2_group).count(), 1)
-        self.assertEqual(StateDelta.objects.filter(group=v2_group).count(), 1)
-        self.assertEqual(
-            AuditEvent.objects.filter(
-                group=v2_group,
-                event_type="audit_data_mode_changed",
-            ).count(),
-            1,
-        )
+        for name, participant_count in SCENARIO_GROUPS:
+            group = AuditGroup.objects.get(group_ref=group_ref_for(name))
+            self.assertEqual(
+                AuditFile.objects.filter(events__group=group).distinct().count(),
+                participant_count,
+                msg=name,
+            )
+
+        # The busy family group exercises every projection surface.
+        family = AuditGroup.objects.get(group_ref=group_ref_for("Family"))
+        self.assertTrue(DeliveryArtifact.objects.filter(group=family).exists())
+        self.assertTrue(NetworkObservation.objects.filter(group=family).exists())
+        self.assertTrue(StateDelta.objects.filter(group=family).exists())
+        # The work group records a fork/convergence decision.
+        acme = AuditGroup.objects.get(group_ref=group_ref_for("Acme Standup"))
+        self.assertTrue(ConvergenceRun.objects.filter(group=acme).exists())
+
         self.assertIn("Dev user ready: admin", output.getvalue())
         self.assertNotIn("pass123", output.getvalue())
 
@@ -5205,42 +5302,62 @@ class SeedDevCommandTests(TestCase):
         self.assertFalse(existing.is_staff)
         self.assertFalse(existing.is_superuser)
 
-    def test_seed_dev_seeds_new_format_action_logs(self):
+    def test_seed_dev_seeds_realistic_group_activity(self):
         call_command("seed_dev", stdout=StringIO())
 
-        group = AuditGroup.objects.get(group_ref=GROUP_REF)
-        files = list(audit_files_for_group(group))
-        self.assertEqual(len(files), 2)
+        # Identity is backfilled from the body's source_context, so the engine
+        # lanes read with account label / device / platform.
+        family = AuditGroup.objects.get(group_ref=group_ref_for("Family"))
+        files = list(audit_files_for_group(family))
+        self.assertEqual(len(files), 6)
         self.assertTrue(all(f.validation_status == AuditFile.STATUS_VALID for f in files))
 
-        events = list(valid_events_for_group(group))
-        self.assertEqual(len(events), 6)
-        self.assertEqual(
-            sorted({event.human_action_action for event in events}),
-            ["promote_admin", "update_group_profile"],
-        )
-
-        payload = timeline_payload_for_group(group, events, files)
-        self.assertEqual(
-            [engine["label"] for engine in payload["engines"]],
-            [
-                "Alice / iPhone 15 / ios",
-                "Bob / Pixel 9 / android",
-            ],
-        )
-        self.assertTrue(any(item["type"] == "human_action" for item in payload["items"]))
-        self.assertTrue(any(item["type"] == "publish_outcome" for item in payload["items"]))
+        events = list(valid_events_for_group(family))
+        payload = timeline_payload_for_group(family, events, files)
+        labels = {engine["label"] for engine in payload["engines"]}
+        self.assertIn("Rosa Family / iPhone 15 / ios", labels)
+        self.assertIn("Hank Family / Pixel 9 / android", labels)
         self.assertEqual(payload["excluded"]["count"], 0)
 
-        v2_group = AuditGroup.objects.get(group_ref="55" * 32)
-        self.assertEqual(
-            DeliveryArtifact.objects.get(group=v2_group).decoded_payload["text"],
-            "seeded v2 hello",
+        # The promote-admin human action and a published message are on the timeline.
+        self.assertIn("promote_admin", {event.human_action_action for event in events})
+        self.assertTrue(any(item["type"] == "human_action" for item in payload["items"]))
+        self.assertTrue(any(item["type"] == "publish_outcome" for item in payload["items"]))
+
+        # Decoded message content survives ingestion in full-data mode.
+        self.assertTrue(
+            DeliveryArtifact.objects.filter(
+                group=family,
+                decoded_payload__text="Sunday dinner at 5 — who's coming?",
+            ).exists()
         )
+
+        # The work group's fork resolves to a selected branch.
+        acme = AuditGroup.objects.get(group_ref=group_ref_for("Acme Standup"))
+        run = ConvergenceRun.objects.get(group=acme, run_id="run-standup-1")
+        self.assertTrue(run.selected_branch_id)
+        self.assertEqual(ConvergenceCandidate.objects.filter(run=run).count(), 2)
+
+        # The fork-failure group's convergence blocks with no winner, then the
+        # epoch is rolled back -- a real convergence failure, not a clean resolve.
+        mesh = AuditGroup.objects.get(group_ref=group_ref_for("Mesh Relay QA"))
+        failed_run = ConvergenceRun.objects.get(group=mesh, run_id="conv-mesh-31")
+        self.assertEqual(failed_run.phase, "failed")
+        self.assertFalse(failed_run.selected_branch_id)
         self.assertEqual(
-            ConvergenceRun.objects.get(group=v2_group).selected_branch_id,
-            "seed-branch-a",
+            ConvergenceCandidate.objects.filter(run=failed_run, eligible=True).count(), 0
         )
+        self.assertTrue(
+            AuditEvent.objects.filter(group=mesh, event_type="epoch_rolled_back").exists()
+        )
+        self.assertTrue(
+            AuditEvent.objects.filter(group=mesh, event_type="fork_resolution").exists()
+        )
+        # The epoch range now renders (regression for the epoch-display fix).
+        mesh_row = {row.slug: row for row in group_list_rows()}[group_ref_for("Mesh Relay QA")]
+        self.assertIsNotNone(mesh_row.epoch_min)
+        self.assertIsNotNone(mesh_row.epoch_max)
+        self.assertTrue(mesh_row.has_fork_activity)
 
 
 # ---------------------------------------------------------------------------
@@ -5801,6 +5918,40 @@ class GroupListAnnotationTests(TestCase):
 
     def seed_clean_group(self):
         ingest_body(jsonl(epoch_confirmed(0, ENGINE_CAROL, 2, 3, T0 + 400)))
+
+    def test_epoch_range_spans_non_epoch_confirmed_events(self):
+        # Regression: a group whose epoch activity is expressed only via
+        # epoch_state_changed / group_state_changed (the ``epoch`` field) must
+        # still report a range instead of "–" on the landing page.
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 8,
+                        "change_kind": "topic_changed",
+                        "fields": ["topic"],
+                    },
+                    wall_time_ms=T0,
+                ),
+                audit_event(
+                    1,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 9,
+                        "reason": "winning_commit_applied",
+                    },
+                    wall_time_ms=T0 + 100,
+                ),
+            )
+        )
+
+        group = {row.slug: row for row in group_list_rows()}[GROUP_REF]
+        self.assertEqual(group.epoch_min, 8)
+        self.assertEqual(group.epoch_max, 9)
 
     def test_rows_annotate_engines_epochs_files_and_divergence(self):
         self.seed_fork_group()
