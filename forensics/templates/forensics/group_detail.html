@@ -7,7 +7,7 @@
 {% block main_class %}app-main{% endblock %}
 
 {% block extra_css %}
-<link rel="stylesheet" href="{% static 'forensics/timeline.css' %}?v=20260620">
+<link rel="stylesheet" href="{% static 'forensics/timeline.css' %}?v=20260624">
 {% endblock %}
 
 {% block breadcrumb %}
@@ -28,7 +28,7 @@
 <div class="tl-header">
   <div class="tl-header__top">
     <div class="tl-header__id">
-      <p class="eyebrow">{{ group.slug }} · coalesced from {{ summary.file_count }} member log{{ summary.file_count|pluralize }}</p>
+      <p class="eyebrow">{{ group.slug }} · coalesced from {{ summary.file_count }} audit file{{ summary.file_count|pluralize }}</p>
       <div class="tl-title-row">
         <h2>{{ group.name }}</h2>
         <span class="avatar-stack">
@@ -39,18 +39,17 @@
             <span class="avatar avatar--26 avatar--more" title="{{ timeline_summary.engine_overflow_count }} more engines">+{{ timeline_summary.engine_overflow_count }}</span>
           {% endif %}
         </span>
-        <span class="tl-participants">{{ summary.engine_count }} engine{{ summary.engine_count|pluralize }}</span>
+      <span class="tl-participants">{{ summary.engine_count }} engine{{ summary.engine_count|pluralize }}</span>
       </div>
       {% if group.notes %}<p class="tl-notes">{{ group.notes }}</p>{% endif %}
     </div>
     <div class="tl-header__badges">
-      <span class="badge">{{ timeline_summary.epoch_count }} epoch{{ timeline_summary.epoch_count|pluralize }}</span>
-      {% if timeline_summary.integrity.divergent_message_count %}
-        <span class="badge badge--danger"><span class="badge__dot"></span>{{ timeline_summary.integrity.divergent_message_count }} divergent</span>
+      <span class="badge">{{ summary.delivery_count }} delivery artifact{{ summary.delivery_count|pluralize }}</span>
+      {% if summary.raw_message_count %}
+        <span class="badge">{{ summary.raw_message_count }} raw message id{{ summary.raw_message_count|pluralize }}</span>
       {% endif %}
-      {% if timeline_summary.integrity.has_fork_activity %}
-        <span class="badge badge--danger">fork detected</span>
-      {% endif %}
+      <span class="badge">{{ summary.network_count }} network observation{{ summary.network_count|pluralize }}</span>
+      <span class="badge">{{ summary.convergence_count }} convergence run{{ summary.convergence_count|pluralize }}</span>
       {% if summary.invalid_event_count %}
         <span class="badge badge--warning">{{ summary.invalid_event_count }} invalid</span>
       {% endif %}
@@ -58,64 +57,69 @@
   </div>
 
   <div class="tl-legend">
-    <span class="legend-key"><span class="legend-swatch legend-swatch--commit"><svg class="icon" width="9" height="9" aria-hidden="true"><use href="#i-branch"/></svg></span>commit · rolls epoch</span>
-    <span class="legend-key"><span class="legend-swatch legend-swatch--joined"></span>first seen / joined</span>
-    <span class="legend-key"><span class="legend-swatch legend-swatch--applied"></span>applied commit</span>
-    <span class="legend-key"><span class="legend-swatch legend-swatch--rollback"></span>rollback</span>
-    <span class="legend-key"><span class="legend-swatch legend-swatch--warning"></span>peeler retry/defer</span>
-    <span class="legend-key"><span class="legend-swatch legend-swatch--connector"></span>commit → joiner welcome</span>
-    <span class="legend-note"><svg class="icon" width="12" height="12" aria-hidden="true"><use href="#i-clock"/></svg> vertical axis = wall-clock · idle gaps compressed</span>
+    <span class="legend-key"><span class="legend-swatch legend-swatch--commit"><svg class="icon" width="9" height="9" aria-hidden="true"><use href="#i-arrow-down"/></svg></span>delivery</span>
+    <span class="legend-key"><span class="legend-swatch legend-swatch--joined"></span>network</span>
+    <span class="legend-key"><span class="legend-swatch legend-swatch--applied"></span>convergence</span>
+    <span class="legend-key"><span class="legend-swatch legend-swatch--rollback"></span>MLS state</span>
+    <span class="legend-note"><svg class="icon" width="12" height="12" aria-hidden="true"><use href="#i-clock"/></svg> focused projections from preserved JSONL evidence</span>
   </div>
 
   <div class="tabs" role="tablist" aria-label="Group views">
-    <button type="button" class="tab" role="tab" id="tab-timeline" data-panel="panel-timeline" aria-controls="panel-timeline" aria-selected="true">
-      Timeline <span class="tab__count">{{ tab_counts.timeline }}</span>
+    <button type="button" class="tab" role="tab" id="tab-overview" data-panel="panel-overview" aria-controls="panel-overview" aria-selected="true">
+      Overview <span class="tab__count">{{ tab_counts.overview }}</span>
     </button>
-    <button type="button" class="tab" role="tab" id="tab-actions" data-panel="panel-actions" aria-controls="panel-actions" aria-selected="false" tabindex="-1">
-      Actions <span class="tab__count">{{ tab_counts.actions }}</span>
+    <button type="button" class="tab" role="tab" id="tab-delivery" data-panel="panel-delivery" aria-controls="panel-delivery" aria-selected="false" tabindex="-1">
+      Delivery <span class="tab__count">{{ tab_counts.delivery }}</span>
     </button>
-    <button type="button" class="tab" role="tab" id="tab-messages" data-panel="panel-messages" aria-controls="panel-messages" aria-selected="false" tabindex="-1">
-      Messages <span class="tab__count">{{ tab_counts.messages }}</span>
+    <button type="button" class="tab" role="tab" id="tab-network" data-panel="panel-network" aria-controls="panel-network" aria-selected="false" tabindex="-1">
+      Network <span class="tab__count">{{ tab_counts.network }}</span>
     </button>
-    <button type="button" class="tab" role="tab" id="tab-integrity" data-panel="panel-integrity" aria-controls="panel-integrity" aria-selected="false" tabindex="-1">
-      Integrity <span class="tab__count">{{ tab_counts.integrity }}</span>
+    <button type="button" class="tab" role="tab" id="tab-convergence" data-panel="panel-convergence" aria-controls="panel-convergence" aria-selected="false" tabindex="-1">
+      Convergence <span class="tab__count">{{ tab_counts.convergence }}</span>
     </button>
-    <button type="button" class="tab" role="tab" id="tab-files" data-panel="panel-files" aria-controls="panel-files" aria-selected="false" tabindex="-1">
-      Files <span class="tab__count">{{ tab_counts.files }}</span>
+    <button type="button" class="tab" role="tab" id="tab-state" data-panel="panel-state" aria-controls="panel-state" aria-selected="false" tabindex="-1">
+      State <span class="tab__count">{{ tab_counts.state }}</span>
+    </button>
+    <button type="button" class="tab" role="tab" id="tab-evidence" data-panel="panel-evidence" aria-controls="panel-evidence" aria-selected="false" tabindex="-1">
+      Evidence <span class="tab__count">{{ tab_counts.evidence }}</span>
+    </button>
+    <button type="button" class="tab" role="tab" id="tab-exports" data-panel="panel-exports" aria-controls="panel-exports" aria-selected="false" tabindex="-1">
+      Exports
     </button>
   </div>
 </div>
 
 <div class="tab-panels">
-  <section id="panel-timeline" class="tl-body" role="tabpanel" aria-labelledby="tab-timeline">
-    <div class="tl-scroll">
-      <div id="timeline" data-timeline-url="{% url 'group-timeline' group.slug %}">
-        <p class="empty-state">Loading timeline…</p>
-        <noscript><p class="empty-state">The epoch timeline needs JavaScript. Heavy detail tabs are loaded on demand.</p></noscript>
-      </div>
-    </div>
-    <aside id="mls-rail" class="rail" aria-live="polite" aria-label="MLS state at selected epoch"></aside>
+  <section id="panel-overview" class="tab-scroll" role="tabpanel" aria-labelledby="tab-overview">
+    {% include "forensics/partials/group_overview.html" %}
   </section>
 
-  <section id="panel-actions" class="tab-scroll" role="tabpanel" aria-labelledby="tab-actions" data-lazy-url="{% url 'group-tab' group.slug 'actions' %}" hidden>
-    <p class="empty-state">Select Actions to load grouped human actions.</p>
+  <section id="panel-delivery" class="tab-scroll" role="tabpanel" aria-labelledby="tab-delivery" data-lazy-url="{% url 'group-tab' group.slug 'delivery' %}" hidden>
+    <p class="empty-state">Select Delivery to load message artifacts and engine observations.</p>
   </section>
 
-  <section id="panel-messages" class="tab-scroll" role="tabpanel" aria-labelledby="tab-messages" data-lazy-url="{% url 'group-tab' group.slug 'messages' %}" hidden>
-    <p class="empty-state">Select Messages to load message traces and missing observations.</p>
+  <section id="panel-network" class="tab-scroll" role="tabpanel" aria-labelledby="tab-network" data-lazy-url="{% url 'group-tab' group.slug 'network' %}" hidden>
+    <p class="empty-state">Select Network to load transport send and receive observations.</p>
   </section>
 
-  <section id="panel-integrity" class="tab-scroll" role="tabpanel" aria-labelledby="tab-integrity" data-lazy-url="{% url 'group-tab' group.slug 'integrity' %}" hidden>
-    <p class="empty-state">Select Integrity to load fork, convergence, and peeler details.</p>
+  <section id="panel-convergence" class="tab-scroll" role="tabpanel" aria-labelledby="tab-convergence" data-lazy-url="{% url 'group-tab' group.slug 'convergence' %}" hidden>
+    <p class="empty-state">Select Convergence to load branch decisions and rule traces.</p>
   </section>
 
-  <section id="panel-files" class="tab-scroll" role="tabpanel" aria-labelledby="tab-files" data-lazy-url="{% url 'group-tab' group.slug 'files' %}" hidden>
-    <p class="empty-state">Select Files to load member audit-log rows.</p>
+  <section id="panel-state" class="tab-scroll" role="tabpanel" aria-labelledby="tab-state" data-lazy-url="{% url 'group-tab' group.slug 'state' %}" hidden>
+    <p class="empty-state">Select State to load group and epoch state changes.</p>
+  </section>
+
+  <section id="panel-evidence" class="tab-scroll" role="tabpanel" aria-labelledby="tab-evidence" data-lazy-url="{% url 'group-tab' group.slug 'evidence' %}" hidden>
+    <p class="empty-state">Select Evidence to load audit files and recent evidence rows.</p>
+  </section>
+
+  <section id="panel-exports" class="tab-scroll" role="tabpanel" aria-labelledby="tab-exports" data-lazy-url="{% url 'group-tab' group.slug 'exports' %}" hidden>
+    <p class="empty-state">Select Exports to load API and JSON export links.</p>
   </section>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script type="module" src="{% static 'forensics/js/tabs.js' %}"></script>
-<script type="module" src="{% static 'forensics/js/timeline/main.js' %}"></script>
 {% endblock %}

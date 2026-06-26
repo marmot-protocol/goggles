@@ -1,0 +1,57 @@
+{% include "forensics/partials/group_files.html" %}
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Recent evidence rows</span>
+    <span class="is-muted">bounded line-level sample</span>
+    <a class="btn btn--secondary btn--sm" href="{% url 'api-group-evidence' group.slug %}">Open JSON</a>
+  </header>
+  <div class="card__body table-scroll">
+    {% if recent_events %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Line</th>
+            <th>Status</th>
+            <th>Time (ms)</th>
+            <th>Engine</th>
+            <th>Type</th>
+            <th>Message</th>
+            <th>Hash</th>
+            <th>Summary</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for event in recent_events %}
+            <tr>
+              <td class="is-mono"><a href="{% url 'audit-file-detail' event.audit_file_id %}">#{{ event.line_number }}</a></td>
+              <td>
+                {% if event.parse_status == "valid" %}
+                  <span class="badge badge--accent">valid</span>
+                {% else %}
+                  <span class="badge badge--danger">invalid</span>
+                {% endif %}
+              </td>
+              <td class="is-mono is-muted">{{ event.wall_time_ms|default_if_none:"–" }}</td>
+              <td class="is-mono is-muted">{{ event.engine_id|truncatechars:9 }}</td>
+              <td>{{ event.event_type|default:"–" }}</td>
+              <td class="is-wrap">
+                {% if event.msg_id %}
+                  <a class="badge is-mono" href="{% url 'api-message-detail' event.msg_id %}" title="{{ event.msg_id }}">{{ event.msg_id|truncatechars:17 }}</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+              <td class="is-mono is-muted" title="{{ event.line_hash }}">{{ event.line_hash|truncatechars:13 }}</td>
+              <td class="is-muted is-wrap">{{ event.summary|default:event.validation_error|default:"–" }}</td>
+              <td><a class="badge" href="{% url 'api-event-evidence' event.id %}">JSON</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No evidence rows found for this group.</p>
+    {% endif %}
+  </div>
+</section>

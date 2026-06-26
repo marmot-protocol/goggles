@@ -953,12 +953,12 @@ def message_ids_from_events(events):
 
 
 # ---------------------------------------------------------------------------
-# Epoch timeline payload
+# Legacy epoch timeline payload
 # ---------------------------------------------------------------------------
 #
-# Server-side contract for the client geometry engine
-# (forensics/static/forensics/js/timeline/). The client does all pixel math;
-# this payload carries semantics only:
+# Server-side semantic payload retained for regression tests and agent exports.
+# The group workspace no longer serves the all-events timeline as a primary UI,
+# but these helpers still encode useful ordering/integrity semantics:
 #   - engines[]: column order, labels, deterministic viz color
 #   - epochs[]:  per-epoch confirmations (commit node = first timed confirm,
 #                the rest are "applied" ticks), fork/rollback/snapshot detail

@@ -1,0 +1,112 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Exports</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if classification.contains_full_data %}
+      <p class="empty-state">
+        Full data auditing evidence is present. Projection exports may include decrypted message content, full author identifiers, and transport wire identifiers.
+      </p>
+    {% endif %}
+    <table class="data-table">
+      <tbody>
+        <tr>
+          <th>Group</th>
+          <td class="is-mono is-wrap">{{ group.slug }}</td>
+        </tr>
+        <tr>
+          <th>Group ref</th>
+          <td class="is-mono is-wrap">{{ group.group_ref|default:"–" }}</td>
+        </tr>
+        <tr>
+          <th>Agent state JSON</th>
+          <td><a class="btn btn--secondary btn--sm" href="{% url 'group-agent-export' group.slug %}"><svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>Export JSON</a></td>
+        </tr>
+        <tr>
+          <th>Projection API</th>
+          <td class="is-wrap">
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-projections' group.slug %}"><svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>Open JSON</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-projections' group.slug %}?download=1"><svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>Download JSON</a>
+          </td>
+        </tr>
+        <tr>
+          <th>Focused APIs</th>
+          <td class="is-wrap">
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-delivery' group.slug %}">Delivery</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-network' group.slug %}">Network</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-convergence-runs' group.slug %}">Convergence</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-state' group.slug %}">State</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-actions' group.slug %}">Actions</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-engines' group.slug %}">Engines</a>
+            <a class="btn btn--secondary btn--sm" href="{% url 'api-group-evidence' group.slug %}">Evidence</a>
+          </td>
+        </tr>
+        <tr>
+          <th>Summary</th>
+          <td class="is-wrap">
+            <span class="badge">{{ summary.file_count }} files</span>
+            <span class="badge">{{ summary.event_count }} events</span>
+            <span class="badge">{{ summary.message_count }} messages</span>
+            <span class="badge">{{ summary.network_count }} network</span>
+            <span class="badge">{{ summary.convergence_count }} convergence</span>
+            <span class="badge">{{ summary.state_count }} state</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Saved reports</span>
+    <span class="is-muted">internal snapshots with investigator notes</span>
+  </header>
+  <form method="post" action="{% url 'create-saved-report' group.slug %}" class="card__body profile-form">
+    {% csrf_token %}
+    <div class="field">
+      <label for="saved-report-title">Title</label>
+      <input class="input" id="saved-report-title" name="title" maxlength="160" value="Group forensic snapshot">
+    </div>
+    <div class="field">
+      <label for="saved-report-notes">Notes</label>
+      <textarea class="input" id="saved-report-notes" name="notes" rows="3"></textarea>
+    </div>
+    <div class="profile-form__actions">
+      <button type="submit" class="btn btn--primary">Save report</button>
+    </div>
+  </form>
+  <div class="card__body table-scroll">
+    {% if saved_reports %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Report</th>
+            <th>Created</th>
+            <th>By</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for report in saved_reports %}
+            <tr>
+              <td>
+                <span class="cell-lines">
+                  <a class="cell-title" href="{% url 'saved-report-detail' report.id %}">{{ report.title|default:"Saved investigation" }}</a>
+                  {% if report.notes %}<span class="cell-sub">{{ report.notes|truncatechars:120 }}</span>{% endif %}
+                </span>
+              </td>
+              <td class="is-mono is-muted">{{ report.created_at|date:"Y-m-d H:i" }}</td>
+              <td class="is-muted">{% if report.created_by %}{{ report.created_by.username }}{% else %}–{% endif %}</td>
+              <td class="is-right">
+                <a class="btn btn--secondary btn--sm" href="{% url 'saved-report-json' report.id %}">JSON</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No saved reports for this group yet.</p>
+    {% endif %}
+  </div>
+</section>

@@ -1,0 +1,74 @@
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Transport observations</span>
+    <span class="is-muted">wire ids, relays, payload digests, and publish outcomes</span>
+  </header>
+  <div class="card__body table-scroll">
+    {% if observations_limited %}
+      <p class="empty-state">Showing first {{ tab_event_limit }} network observations.</p>
+    {% endif %}
+    {% if observations %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Time (ms)</th>
+            <th>Direction</th>
+            <th>Phase</th>
+            <th>Message</th>
+            <th>Engine</th>
+            <th>Relay / transport</th>
+            <th>Wire id</th>
+            <th>Payload</th>
+            <th>Outcome</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for observation in observations %}
+            <tr>
+              <td class="is-mono is-muted">{{ observation.wall_time_ms|default_if_none:"–" }}</td>
+              <td><span class="badge">{{ observation.direction }}</span></td>
+              <td>{{ observation.phase }}</td>
+              <td class="is-wrap">
+                {% if observation.message_id %}
+                  <div class="is-mono">{{ observation.message_id|truncatechars:33 }}</div>
+                  <a class="badge" href="{% url 'api-message-detail' observation.message_id %}">trace</a>
+                {% else %}
+                  <span class="is-muted">–</span>
+                {% endif %}
+              </td>
+              <td class="is-mono is-muted" title="{{ observation.engine_id }}">{{ observation.engine_id|truncatechars:9 }}</td>
+              <td class="is-muted is-wrap">
+                {{ observation.relay_url|default:observation.transport_source|default:"–" }}
+                {% if observation.delivery_plane %}<br>{{ observation.delivery_plane }}{% endif %}
+              </td>
+              <td class="is-mono is-muted is-wrap">
+                {% if observation.audit_event.audit_data_mode == "full_data" %}
+                  <span class="badge badge--warning">full data</span><br>
+                {% endif %}
+                {% firstof observation.wire_id observation.nostr_event_id observation.gift_wrap_event_id observation.welcome_nostr_event_id observation.welcome_rumor_event_id observation.welcome_key_package_tag "–" %}
+              </td>
+              <td class="is-mono is-muted is-wrap">
+                {% if observation.payload_len != None %}{{ observation.payload_len }} bytes{% else %}–{% endif %}
+                {% if observation.payload_digest %}<br>{{ observation.payload_digest|truncatechars:17 }}{% endif %}
+              </td>
+              <td class="is-wrap">
+                {% if observation.met_required_acks == True %}
+                  <span class="badge badge--accent"><span class="badge__dot"></span>acks met</span>
+                {% elif observation.met_required_acks == False %}
+                  <span class="badge badge--warning"><span class="badge__dot"></span>acks missing</span>
+                {% endif %}
+                {{ observation.outcome|default:"–" }}
+              </td>
+              <td>
+                <a class="badge" href="{% url 'api-event-evidence' observation.audit_event.id %}">line {{ observation.audit_event.line_number }}</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty-state">No transport observations have been projected for this group yet.</p>
+    {% endif %}
+  </div>
+</section>

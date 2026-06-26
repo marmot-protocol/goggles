@@ -1,0 +1,82 @@
+{% extends "forensics/base.html" %}
+
+{% block title %}Saved report · Goggles{% endblock %}
+
+{% block breadcrumb %}
+  <a class="crumb" href="{% url 'group-list' %}">Groups</a>
+  <span class="crumb-separator">/</span>
+  <a class="crumb" href="{% url 'group-detail' report.group.slug %}">{{ report.group.slug }}</a>
+  <span class="crumb-separator">/</span>
+  <span class="crumb">Saved report</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">Saved investigation</p>
+    <h1>{{ report.title|default:"Saved report" }}</h1>
+    <p class="page-heading__sub is-mono is-wrap">report {{ report.id }}</p>
+  </div>
+  <div class="heading-status">
+    <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>
+    {{ report.created_at|date:"Y-m-d H:i" }}{% if report.created_by %} · {{ report.created_by.username }}{% endif %}
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header card__header--with-tools">
+    <span class="card__title">Report</span>
+    <div>
+      <a class="btn btn--secondary btn--sm" href="{% url 'group-detail' report.group.slug %}">Open group</a>
+      <a class="btn btn--secondary btn--sm" href="{% url 'saved-report-json' report.id %}">
+        <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg>JSON
+      </a>
+    </div>
+  </header>
+  <div class="card__body table-scroll">
+    <table class="data-table">
+      <tbody>
+        <tr>
+          <th>Group</th>
+          <td class="is-mono is-wrap">{{ report.group.group_ref|default:report.group.slug }}</td>
+        </tr>
+        <tr>
+          <th>Notes</th>
+          <td class="is-wrap">{{ report.notes|default:"–" }}</td>
+        </tr>
+        <tr>
+          <th>Snapshot schema</th>
+          <td class="is-mono is-muted">{{ report.report_json.schema_version }}</td>
+        </tr>
+        <tr>
+          <th>Saved at</th>
+          <td class="is-mono is-muted">{{ report.report_json.saved_at }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card card--flush">
+  <header class="card__header">
+    <span class="card__title">Snapshot summary</span>
+  </header>
+  <div class="card__body table-scroll">
+    <table class="data-table">
+      <tbody>
+        {% for row in snapshot_summary %}
+          <tr>
+            <th>{{ row.label }}</th>
+            <td class="is-wrap">
+              <span class="is-mono">{{ row.count }}</span>
+              {% if row.has_more %}
+                <span class="badge badge--warning">more from offset {{ row.next_offset }}</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
