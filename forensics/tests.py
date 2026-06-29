@@ -50,6 +50,7 @@ from .models import (
     DeliveryObservation,
     EpochStateTransition,
     NetworkObservation,
+    RecipientExpectation,
     StateDelta,
     UploadToken,
 )
@@ -4169,6 +4170,7 @@ class RebuildAuditProjectionsCommandTests(TestCase):
 
         self.assertEqual(DeliveryArtifact.objects.filter(group=group).count(), 0)
         self.assertEqual(DeliveryObservation.objects.filter(artifact__group=group).count(), 0)
+        self.assertEqual(RecipientExpectation.objects.filter(artifact__group=group).count(), 0)
         self.assertEqual(NetworkObservation.objects.filter(group=group).count(), 0)
         self.assertEqual(ConvergenceRun.objects.filter(group=group).count(), 0)
         self.assertEqual(ConvergenceCandidate.objects.filter(run__group=group).count(), 0)
@@ -4183,6 +4185,156 @@ class RebuildAuditProjectionsCommandTests(TestCase):
         self.assertEqual(summary["tab_counts"]["network"], 0)
         self.assertEqual(summary["tab_counts"]["convergence"], 0)
         self.assertEqual(summary["tab_counts"]["state"], 0)
+
+    def test_rebuild_preserves_clean_file_projections_with_structural_quarantine(self):
+        quarantined_result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    kind={
+                        "type": "transport_received",
+                        "msg_id": MSG_ID,
+                        "transport": {
+                            "transport": "nostr",
+                            "delivery_plane": "relay",
+                            "relay_url": "wss://quarantined.example",
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    1,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    context={"convergence": {"run_id": "run-quarantined", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 7,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-quarantined",
+                        "candidates": [{"branch_id": "branch-quarantined", "eligible": True}],
+                        "rule_trace": [{"rule_name": "highest_weight", "decisive": True}],
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 8,
+                        "change_kind": "member_added",
+                        "origin_commit_id": MSG_ID,
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 8,
+                        "reason": "winning_commit_applied",
+                    },
+                ),
+            ).encode("utf-8"),
+            source_name="v2-structural-quarantine-mixed.jsonl",
+        )
+        clean_result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    kind={
+                        "type": "transport_received",
+                        "msg_id": OTHER_MSG_ID,
+                        "transport": {
+                            "transport": "nostr",
+                            "delivery_plane": "relay",
+                            "relay_url": "wss://clean.example",
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    1,
+                    kind={
+                        "type": "recipient_expectation",
+                        "msg_id": OTHER_MSG_ID,
+                        "expectation": {
+                            "artifact_kind": "application_message",
+                            "recipient_scope": "all_other_current_group_members",
+                            "expected_member_refs": [ACCOUNT_BOB],
+                            "expected_count": 1,
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    context={"convergence": {"run_id": "run-clean", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 9,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-clean",
+                        "candidates": [{"branch_id": "branch-clean", "eligible": True}],
+                        "rule_trace": [{"rule_name": "highest_weight", "decisive": True}],
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 10,
+                        "change_kind": "member_added",
+                        "origin_commit_id": OTHER_MSG_ID,
+                    },
+                ),
+                audit_event_v2(
+                    4,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 10,
+                        "reason": "winning_commit_applied",
+                    },
+                ),
+            ).encode("utf-8"),
+            source_name="v2-clean-mixed.jsonl",
+        )
+
+        self.assertEqual(quarantined_result.audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertEqual(clean_result.audit_file.validation_status, AuditFile.STATUS_VALID)
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.assertEqual(valid_group_event_queryset(group).count(), 5)
+
+        artifact = DeliveryArtifact.objects.get(group=group)
+        self.assertEqual(artifact.artifact_id, OTHER_MSG_ID)
+        self.assertEqual(
+            set(artifact.evidence_events.values_list("audit_file_id", flat=True)),
+            {clean_result.audit_file.id},
+        )
+        self.assertEqual(DeliveryObservation.objects.filter(artifact=artifact).count(), 1)
+        self.assertEqual(RecipientExpectation.objects.filter(artifact=artifact).count(), 1)
+        self.assertEqual(
+            NetworkObservation.objects.get(group=group).relay_url, "wss://clean.example"
+        )
+        self.assertEqual(ConvergenceRun.objects.get(group=group).selected_branch_id, "branch-clean")
+        self.assertEqual(ConvergenceCandidate.objects.filter(run__group=group).count(), 1)
+        self.assertEqual(ConvergenceRuleEvaluation.objects.filter(run__group=group).count(), 1)
+        self.assertEqual(StateDelta.objects.get(group=group).change_kind, "member_added")
+        self.assertEqual(EpochStateTransition.objects.get(group=group).new_state, "committed")
+
+        summary = group_summary_context(group)
+        self.assertEqual(summary["summary"]["event_count"], 5)
+        self.assertEqual(summary["summary"]["engine_count"], 1)
+        self.assertEqual(summary["tab_counts"]["overview"], 5)
+        self.assertEqual(summary["tab_counts"]["delivery"], 1)
+        self.assertEqual(summary["tab_counts"]["network"], 1)
+        self.assertEqual(summary["tab_counts"]["convergence"], 1)
+        self.assertEqual(summary["tab_counts"]["state"], 2)
 
     def test_rebuild_default_ignores_v1_only_groups(self):
         result = ingest_audit_log_bytes(
