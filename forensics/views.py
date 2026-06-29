@@ -1598,6 +1598,8 @@ def paginated_payloads(
 def ordered_payload_items(ordered, *, chunk_size: int):
     iterator = getattr(ordered, "iterator", None)
     if callable(iterator):
+        # Django requires an explicit chunk_size here so QuerySet.iterator()
+        # still honors any prefetch_related() work the ordered queryset carries.
         return iterator(chunk_size=max(1, chunk_size))
     return iter(ordered)
 
