@@ -64,6 +64,7 @@ from .views import (
     group_detail_shell_context,
     group_epoch_count,
     groups_for_audit_file,
+    paginated_payloads,
     saved_report_projection_summary,
     valid_group_event_queryset,
 )
@@ -534,6 +535,144 @@ class SavedReportProjectionSummaryTests(SimpleTestCase):
         self.assertFalse(rows["User actions"]["has_more"])
         self.assertEqual(rows["System attribution"]["count"], 1)
         self.assertTrue(rows["System attribution"]["has_more"])
+
+
+class ProjectionPaginationTests(TestCase):
+    def test_filtered_payload_pagination_stops_after_page_plus_one_match(self):
+        class FakeQuerySet:
+            def __init__(self, items):
+                self.items = items
+                self.iterator_chunk_sizes = []
+
+            def order_by(self, *fields):
+                return self
+
+            def __iter__(self):
+                return iter(self.items)
+
+            def iterator(self, chunk_size=None):
+                if chunk_size is None or chunk_size < 1:
+                    raise AssertionError("iterator chunk_size must be a positive integer")
+                self.iterator_chunk_sizes.append(chunk_size)
+                return iter(self.items)
+
+        built = []
+
+        def payload_factory(value):
+            built.append(value)
+            return {"value": value, "severity": "warning"}
+
+        queryset = FakeQuerySet(list(range(5)))
+
+        page, pagination = paginated_payloads(
+            queryset,
+            order_by=("value",),
+            filters={"limit": 1, "offset": 0, "severity": "warning"},
+            payload_factory=payload_factory,
+            severity_factory=lambda payload: payload["severity"],
+        )
+
+        self.assertEqual(page, [{"value": 0, "severity": "warning"}])
+        self.assertEqual(built, [0, 1])
+        self.assertEqual(len(queryset.iterator_chunk_sizes), 1)
+        self.assertGreaterEqual(queryset.iterator_chunk_sizes[0], 1)
+        self.assertEqual(
+            pagination,
+            {"limit": 1, "offset": 0, "returned": 1, "has_more": True, "next_offset": 1},
+        )
+
+    def test_filtered_payload_pagination_applies_offset_after_filter_matches(self):
+        class FakeQuerySet:
+            def __init__(self, items):
+                self.items = items
+
+            def order_by(self, *fields):
+                return self
+
+            def __iter__(self):
+                return iter(self.items)
+
+            def iterator(self, chunk_size=None):
+                if chunk_size is None or chunk_size < 1:
+                    raise AssertionError("iterator chunk_size must be a positive integer")
+                return iter(self.items)
+
+        built = []
+
+        def payload_factory(value):
+            built.append(value)
+            return {"value": value, "severity": "warning"}
+
+        page, pagination = paginated_payloads(
+            FakeQuerySet(list(range(8))),
+            order_by=("value",),
+            filters={"limit": 2, "offset": 1, "severity": ""},
+            payload_factory=payload_factory,
+            severity_factory=lambda payload: payload["severity"],
+            payload_filter=lambda payload, filters: payload["value"] % 2 == 0,
+        )
+
+        self.assertEqual(
+            page,
+            [
+                {"value": 2, "severity": "warning"},
+                {"value": 4, "severity": "warning"},
+            ],
+        )
+        self.assertEqual(built, [0, 1, 2, 3, 4, 5, 6])
+        self.assertEqual(
+            pagination,
+            {"limit": 2, "offset": 1, "returned": 2, "has_more": True, "next_offset": 3},
+        )
+
+    def test_convergence_list_without_message_filter_paginates_before_payload_build(self):
+        group = AuditGroup.objects.create(
+            name="Paged convergence group",
+            slug="paged-convergence-group",
+            group_ref=GROUP_REF,
+        )
+        for i in range(3):
+            ConvergenceRun.objects.create(
+                group=group,
+                run_id=f"run-{i:03d}",
+                engine_id=ENGINE_ALICE,
+                phase="selected",
+                started_at_ms=1_700_000_000_000 + i,
+            )
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        built = []
+
+        def lightweight_convergence_payload(run):
+            built.append(run.run_id)
+            return {
+                "run_id": run.run_id,
+                "phase": run.phase,
+                "error_kinds": [],
+                "losing_branch_ids": [],
+                "selected_branch_id": "",
+                "candidates": [],
+                "rule_evaluations": [],
+                "evidence_refs": [],
+            }
+
+        with mock.patch(
+            "forensics.views.convergence_run_payload",
+            side_effect=lightweight_convergence_payload,
+        ):
+            response = self.client.get(
+                reverse("api-group-convergence-runs", kwargs={"slug": group.slug}),
+                {"limit": "1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(built, ["run-000"])
+        payload = response.json()
+        self.assertEqual([run["run_id"] for run in payload["convergence_runs"]], ["run-000"])
+        self.assertEqual(
+            payload["pagination"],
+            {"limit": 1, "offset": 0, "returned": 1, "has_more": True, "next_offset": 1},
+        )
 
 
 class AuditEventIndexTests(TestCase):
