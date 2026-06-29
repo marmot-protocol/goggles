@@ -172,7 +172,7 @@ The web container runs `python manage.py migrate --noinput` before Gunicorn star
 docker compose exec web python manage.py migrate --noinput
 ```
 
-The web container runs `collectstatic` into `var/static-assets`. The `static` Compose service serves that directory on `127.0.0.1:8001`, and Caddy proxies `/static/*` to it. Django/Gunicorn handles the application and upload API.
+The web container runs `collectstatic` into the Docker-managed `static-assets` volume. The `static` Compose service serves that volume on `127.0.0.1:8001`, and Caddy proxies `/static/*` to it. Django/Gunicorn handles the application and upload API.
 
 ### Caddy
 
