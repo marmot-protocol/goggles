@@ -199,6 +199,7 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
 
 
 def group_summary_header_context(group: AuditGroup, *, valid_events=None) -> dict:
+    """Build the cheap summary/tab-count context without timeline/overview previews."""
     valid_events = valid_events if valid_events is not None else valid_group_event_queryset(group)
     event_stats = valid_events.aggregate(
         event_count=Count("id"),
@@ -254,6 +255,8 @@ def group_summary_context(group: AuditGroup) -> dict:
         valid_events=valid_events,
         limit=GROUP_ENGINE_PREVIEW_LIMIT,
     )
+    # summary.engine_count is already coalesced to an integer by the cheap
+    # header builder, so the overflow math stays safe for empty groups.
     engine_count = header_context["summary"]["engine_count"]
     return {
         "summary": header_context["summary"],
