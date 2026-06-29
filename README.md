@@ -2,7 +2,9 @@
 
 Internal Marmot audit-log explorer.
 
-Goggles accepts sensitive `marmot-forensics-audit/v1` JSONL audit logs from Dark Matter clients, preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
+Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from Dark Matter clients (current schema `marmot-forensics-audit/v2`; legacy `v1` is still accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
+
+The audit event schema is committed at `docs/schemas/audit-log-event.v2.schema.json`. See also `docs/api-v1.md` for the authenticated read API, `docs/deployment.md` for VM deployment notes, and `docs/audit-debugging-platform-prd.md` for the platform's product requirements.
 
 ## Local Development
 
@@ -14,6 +16,8 @@ just reset-db
 just dev
 ```
 
+Goggles supports Python 3.12 and 3.13 (`requires-python = ">=3.12,<3.14"`); point `--python` at whichever interpreter you have.
+
 The seeded development login is:
 
 ```text
@@ -24,18 +28,23 @@ password: pass123
 Useful commands:
 
 ```sh
+just sync                # install/update local Python dependencies (uv sync)
 just dev                 # run the dev server on 127.0.0.1:8000
 just seed                # create/update admin/pass123 and load sample audit data
 just reset-db            # delete, recreate, migrate, and seed the dev database
 just token "ios qa"      # create an upload bearer token in the dev database
+just purge-audit-data    # delete audit uploads/events/groups/projections/reports (keeps users + tokens)
 just migrate             # apply migrations to the dev database
 just makemigrations      # create migrations from model changes
+just shell               # open a Django shell against the dev database
+just validate-schema P   # validate JSONL paths against the committed V2 audit schema
 just django-check        # run Django's system checks
 just lint                # run Ruff lint checks
 just format              # format Python code with Ruff
 just format-check        # fail if Python code is not Ruff-formatted
+just test                # run the Django test suite against local SQLite
 just test-postgres       # run tests against a disposable Postgres service
-just check               # run tests, Django checks, Ruff, format check, and migrations
+just check               # run tests, Django checks, Ruff, format check, and migration drift check
 just audit-dependencies  # audit the locked dependency set with pip-audit
 just ci                  # run the same push/PR checks as GitHub Actions
 ```
@@ -54,7 +63,7 @@ format checking, migration drift checking, and the locked dependency audit.
 
 ## Upload An Audit Log
 
-Each line must be one JSON object in the new action-aware `marmot-forensics-audit/v1` JSONL shape. A valid row must include either `kind.type = "human_action"` or `context.human_action.action`; old action-less audit rows are quarantined. If the JSONL includes valid `group_ref` values, Goggles will create or reuse those groups automatically. One uploaded file can contain multiple groups, but it should normally contain one `engine_id` and one `account_ref`.
+Each line must be one JSON object in the `marmot-forensics-audit` JSONL shape. Current `marmot-forensics-audit/v2` rows must include `schema_version`, `seq`, `wall_time_ms`, `audit_data_mode` (`obfuscated_sensitive_data` or `full_data`), a non-empty `engine_id`, and a `kind` object. Legacy `marmot-forensics-audit/v1` rows are still accepted, but they must additionally carry a human action (`kind.type = "human_action"` or `context.human_action.action`); action-less v1 rows are quarantined. If the JSONL includes valid `group_ref` values, Goggles will create or reuse those groups automatically. One uploaded file can contain multiple groups, but it should normally contain one `engine_id` and one `account_ref`. The bundled `fixtures/*.jsonl` samples are all `marmot-forensics-audit/v2`.
 
 ```sh
 curl -X POST http://127.0.0.1:8000/api/v1/audit-logs/ \
@@ -264,6 +273,14 @@ docker compose exec web python manage.py shell -c "from forensics.models import 
 - Audit logs preserve raw engine ids, group refs, message ids, digests, payload metadata, raw lines, raw uploaded text, user agents, and source IPs; protect the database and backups accordingly.
 - Brain disk encryption is the expected at-rest protection for v1.
 - Upload size defaults to 50 MiB via `GOGGLES_MAX_DUMP_BYTES`.
+- Purge stored audit data without removing users or upload tokens with
+  `manage.py purge_audit_data`. Run it with `--dry-run` first, then
+  `--confirm-delete-audit-data` to perform a deployment cutover. Rebuild the
+  normalized projections from the preserved raw lines with
+  `manage.py rebuild_audit_projections` if a projection needs to be regenerated.
+- Validate JSONL against the committed V2 schema with
+  `manage.py validate_audit_schema <path>` (or `just validate-schema <path>`)
+  before relying on a third-party export.
 - Do not log bearer tokens or raw upload bodies. Keep Caddy access logs away from `Authorization` headers.
 - Back up the Postgres named volume with `pg_dump`, store backups encrypted, and test restore before relying on them:
 
@@ -275,9 +292,12 @@ cat backups/goggles-YYYY-MM-DD.sql | docker compose exec -T db psql -U goggles g
 
 ## What The Dashboard Shows
 
-- Imported audit files, validation status, duplicate counts, and quarantined bad lines.
-- Per-account and per-engine audit timelines with hover correlation and click-to-inspect event details.
-- Message traces across engines.
-- Missing observations when one engine saw a message and another did not.
-- Fork and convergence events.
+- Imported audit files (`/uploads/`), validation status, duplicate counts, and quarantined bad lines.
+- A per-group dashboard with tabs for overview, state deltas, network observations, message delivery, convergence, evidence (raw lines), and exports.
+- Per-account and per-engine investigations that correlate every group a subject touched, with hover correlation and click-to-inspect event details.
+- Message traces across engines, including missing observations when one engine saw a message and another did not.
+- Fork resolutions and convergence decisions, including witness-weighted branch selection and the rule traces behind each decision.
 - Peeler failures, rejections, invalidated messages, and failed message states.
+- Agent-state exports (`groups/<slug>/agent-state.json`, schema `goggles-agent-group-state/v1`) and saved reports that snapshot a group analysis as shareable JSON.
+
+The per-tab JSON these views consume is served under `/api/v1/groups/<slug>/...` and is session-gated by Django authentication (not the bearer-token upload API). The internal read API is documented in `docs/api-v1.md`.
