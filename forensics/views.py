@@ -253,7 +253,6 @@ def group_summary_context(group: AuditGroup) -> dict:
             "evidence": file_count,
             "exports": "",
         },
-        "overview": group_overview_context(group),
         "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
     }
 
