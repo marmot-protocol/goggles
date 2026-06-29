@@ -9,6 +9,9 @@ db.sqlite3
 var/
 staticfiles/
 backups/
+local-deploy-backups/
+Caddyfile.with-goggles
+caddy-with-goggles.json
 
 # Local deployment secrets stay outside the repo/build context.
 goggles-secrets.txt
