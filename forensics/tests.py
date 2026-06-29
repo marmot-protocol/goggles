@@ -7008,6 +7008,16 @@ class GroupOverviewLazyContextTests(TestCase):
             {"slug", "name", "group_ref", "summary", "tab_counts", "updated_at"},
         )
 
+    def test_group_api_payload_does_not_build_engine_preview(self):
+        with mock.patch("forensics.views.group_engine_rows", return_value=[]) as engine_rows:
+            payload = group_api_payload(self.group)
+
+        engine_rows.assert_not_called()
+        self.assertEqual(
+            set(payload),
+            {"slug", "name", "group_ref", "summary", "tab_counts", "updated_at"},
+        )
+
     def test_group_detail_shell_context_builds_overview_once(self):
         with mock.patch(
             "forensics.views.group_overview_context", wraps=group_overview_context
