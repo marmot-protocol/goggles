@@ -61,8 +61,11 @@ from .views import (
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    group_api_payload,
     group_detail_shell_context,
     group_epoch_count,
+    group_overview_context,
+    group_summary_context,
     groups_for_audit_file,
     saved_report_projection_summary,
     valid_group_event_queryset,
@@ -6837,6 +6840,43 @@ class GroupDetailTimelineViewTests(TestCase):
             "group detail prefetched the events of every related file just to "
             "count per-file group membership (goggles#65 over-fetch regression)",
         )
+
+
+class GroupOverviewLazyContextTests(TestCase):
+    # Regression guard for goggles#123: the heavy group_overview_context()
+    # builder must only run for the detail-page shell, never for the lightweight
+    # summary/API contexts that discard it.
+    def setUp(self):
+        ingest_body(representative_audit_log())
+        self.group = AuditGroup.objects.get(group_ref=GROUP_REF)
+
+    def test_group_summary_context_does_not_build_overview(self):
+        with mock.patch("forensics.views.group_overview_context") as overview:
+            context = group_summary_context(self.group)
+
+        overview.assert_not_called()
+        self.assertNotIn("overview", context)
+        self.assertIn("summary", context)
+        self.assertIn("tab_counts", context)
+
+    def test_group_api_payload_does_not_build_overview(self):
+        with mock.patch("forensics.views.group_overview_context") as overview:
+            payload = group_api_payload(self.group)
+
+        overview.assert_not_called()
+        self.assertEqual(
+            set(payload),
+            {"slug", "name", "group_ref", "summary", "tab_counts", "updated_at"},
+        )
+
+    def test_group_detail_shell_context_builds_overview_once(self):
+        with mock.patch(
+            "forensics.views.group_overview_context", wraps=group_overview_context
+        ) as overview:
+            context = group_detail_shell_context(self.group)
+
+        overview.assert_called_once_with(self.group)
+        self.assertIn("overview", context)
 
 
 class ProfileTests(TestCase):
