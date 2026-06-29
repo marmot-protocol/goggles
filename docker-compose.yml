@@ -39,7 +39,7 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - ./var/static-assets:/app/staticfiles
+      - static-assets:/app/staticfiles
     ports:
       - "127.0.0.1:8000:8000"
     command: >
@@ -64,9 +64,10 @@ services:
       web:
         condition: service_healthy
     volumes:
-      - ./var/static-assets:/usr/share/nginx/html:ro
+      - static-assets:/usr/share/nginx/html:ro
     ports:
       - "127.0.0.1:8001:80"
 
 volumes:
   postgres-data:
+  static-assets:
