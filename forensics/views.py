@@ -910,7 +910,7 @@ def message_related_projection_payload(group: AuditGroup, filters: dict) -> dict
         filters=filters,
         payload_factory=convergence_run_payload,
         severity_factory=convergence_payload_severity,
-        payload_filter=convergence_payload_matches_filters,
+        payload_filter=(convergence_payload_matches_filters if filters.get("message_id") else None),
     )
     state_deltas, state_delta_pagination = paginated_payloads(
         filtered_state_deltas(group, filters),
@@ -984,7 +984,7 @@ def api_group_convergence_runs(request: HttpRequest, slug: str):
         filters=filters,
         payload_factory=convergence_run_payload,
         severity_factory=convergence_payload_severity,
-        payload_filter=convergence_payload_matches_filters,
+        payload_filter=(convergence_payload_matches_filters if filters.get("message_id") else None),
     )
     return JsonResponse(
         {
@@ -1255,7 +1255,7 @@ def group_projection_payload(
         filters=filters,
         payload_factory=convergence_run_payload,
         severity_factory=convergence_payload_severity,
-        payload_filter=convergence_payload_matches_filters,
+        payload_filter=(convergence_payload_matches_filters if filters.get("message_id") else None),
     )
     state_delta_payloads, state_delta_pagination = paginated_payloads(
         state_deltas,
@@ -1569,15 +1569,23 @@ def paginated_payloads(
     severity = filters.get("severity", "")
     ordered = queryset.order_by(*order_by)
     if severity or payload_filter is not None:
-        payloads = [
-            payload
-            for item in ordered
-            for payload in [payload_factory(item)]
-            if (not severity or severity_factory(payload) == severity)
-            and (payload_filter is None or payload_filter(payload, filters))
-        ]
-        page = payloads[offset : offset + limit]
-        has_more = len(payloads) > offset + limit
+        page = []
+        matched = 0
+        has_more = False
+        for item in ordered_payload_items(ordered, chunk_size=limit + 1):
+            payload = payload_factory(item)
+            if severity and severity_factory(payload) != severity:
+                continue
+            if payload_filter is not None and not payload_filter(payload, filters):
+                continue
+            if matched < offset:
+                matched += 1
+                continue
+            if len(page) >= limit:
+                has_more = True
+                break
+            page.append(payload)
+            matched += 1
         return page, pagination_payload(limit, offset, len(page), has_more)
 
     rows = list(ordered[offset : offset + limit + 1])
@@ -1585,6 +1593,13 @@ def paginated_payloads(
     payloads = [payload_factory(row) for row in page_rows]
     has_more = len(rows) > limit
     return payloads, pagination_payload(limit, offset, len(payloads), has_more)
+
+
+def ordered_payload_items(ordered, *, chunk_size: int):
+    iterator = getattr(ordered, "iterator", None)
+    if callable(iterator):
+        return iterator(chunk_size=max(1, chunk_size))
+    return iter(ordered)
 
 
 def pagination_payload(limit: int, offset: int, returned: int, has_more: bool) -> dict:
