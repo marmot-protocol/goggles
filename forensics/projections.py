@@ -100,6 +100,7 @@ def project_file_events(audit_file: AuditFile, group_ids: list[int]) -> None:
     events = list(
         AuditEvent.objects.select_related("audit_file")
         .filter(
+            structural_quarantine_exclusion(),
             audit_file=audit_file,
             parse_status=AuditEvent.STATUS_VALID,
             group__isnull=False,
