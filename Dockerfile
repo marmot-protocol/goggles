@@ -17,6 +17,8 @@ COPY . .
 # non-root user. collectstatic writes to STATIC_ROOT (/app/staticfiles), so only
 # that runtime-writable directory is owned by the application user.
 RUN useradd --system --uid 10001 --no-create-home goggles \
+    && mkdir -p /home/goggles \
+    && chown goggles:goggles /home/goggles \
     && mkdir -p /app/staticfiles \
     && chown goggles:goggles /app/staticfiles
 USER goggles
