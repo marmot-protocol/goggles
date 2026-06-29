@@ -4297,6 +4297,19 @@ class IncrementalProjectionIngestTests(TestCase):
         self.assertEqual(
             NetworkObservation.objects.filter(group=group).count(), len(prior_msg_ids) + 1
         )
+        # The appended upload also gets its own fresh DeliveryObservation, not
+        # just surviving prior rows: a new observation PK appears alongside them.
+        appended_observation_pks = set(
+            DeliveryObservation.objects.filter(
+                artifact__group=group, artifact__artifact_id=new_msg_id
+            ).values_list("id", flat=True)
+        )
+        self.assertEqual(len(appended_observation_pks), 1)
+        self.assertTrue(appended_observation_pks.isdisjoint(prior_observation_pks))
+        self.assertEqual(
+            DeliveryObservation.objects.filter(artifact__group=group).count(),
+            len(prior_observation_pks) + 1,
+        )
 
     def test_append_does_not_duplicate_prior_leaf_projection_rows(self):
         # Leaf projection rows (NetworkObservation / RecipientExpectation) are
@@ -4438,6 +4451,63 @@ class IncrementalProjectionIngestTests(TestCase):
         self.assertEqual(runs[0].phase, "committed")
         self.assertEqual(runs[1].phase, "evaluating")
         self.assertEqual(runs[1].current_tip_epoch, 8)
+        # The later evaluating event belongs only to the new run, never to the
+        # already-closed earlier one.
+        self.assertEqual(runs[0].evidence_events.count(), 2)
+        self.assertEqual(runs[1].evidence_events.count(), 1)
+        self.assertEqual(runs[1].evidence_events.get().current_tip_epoch, 8)
+
+    def test_out_of_order_convergence_backfill_closes_inferred_run(self):
+        # An upload that backfills an *older* convergence opener after a newer
+        # terminal epoch event was already stored cannot be appended in place:
+        # the incremental path would leave the inferred run open (`evaluating`).
+        # The ordering guard must fall back to a full group rebuild so the
+        # terminal epoch event still closes the run onto `committed`
+        # (marmot-protocol/goggles#127).
+        ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    10,
+                    wall_time_ms=self.INCREMENTAL_T0 + 10,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 8,
+                        "reason": "winning_commit_applied",
+                    },
+                )
+            ).encode("utf-8"),
+            source_name="conv-terminal-newer.jsonl",
+        )
+
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        # The terminal epoch event alone does not open an inferred run.
+        self.assertEqual(ConvergenceRun.objects.filter(group=group).count(), 0)
+
+        ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    wall_time_ms=self.INCREMENTAL_T0,
+                    kind={
+                        "type": "convergence_run_state",
+                        "phase": "evaluating",
+                        "current_tip_epoch": 7,
+                    },
+                )
+            ).encode("utf-8"),
+            source_name="conv-opener-older.jsonl",
+        )
+
+        # One inferred run, closed onto the committed epoch, citing both the
+        # backfilled opener and the previously-stored terminal epoch event.
+        runs = list(ConvergenceRun.objects.filter(group=group))
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertTrue(run.inferred)
+        self.assertEqual(run.phase, "committed")
+        self.assertEqual(run.evidence_events.count(), 2)
 
 
 class ConvergenceRunApiTests(TestCase):
