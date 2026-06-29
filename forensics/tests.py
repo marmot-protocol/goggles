@@ -4094,6 +4094,96 @@ class RebuildAuditProjectionsCommandTests(TestCase):
         self.assertNotIn(GROUP_REF, output.getvalue())
         self.assertNotIn(ENGINE_ALICE, output.getvalue())
 
+    def test_rebuild_skips_structurally_quarantined_v2_files(self):
+        result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v2(
+                    0,
+                    engine_id=ENGINE_ALICE,
+                    account_ref=ACCOUNT_ALICE,
+                    kind={
+                        "type": "transport_received",
+                        "msg_id": MSG_ID,
+                        "transport": {
+                            "transport": "nostr",
+                            "delivery_plane": "relay",
+                            "relay_url": "wss://relay.example",
+                        },
+                    },
+                ),
+                audit_event_v2(
+                    1,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    context={"convergence": {"run_id": "run-quarantined", "phase": "selected"}},
+                    kind={
+                        "type": "convergence_decision",
+                        "current_tip_epoch": 7,
+                        "max_rewind_commits": 5,
+                        "selected_branch_id": "branch-a",
+                        "candidates": [{"branch_id": "branch-a", "eligible": True}],
+                        "rule_trace": [{"rule_name": "highest_weight", "decisive": True}],
+                    },
+                ),
+                audit_event_v2(
+                    2,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    kind={
+                        "type": "group_state_changed",
+                        "epoch": 8,
+                        "change_kind": "member_added",
+                        "origin_commit_id": MSG_ID,
+                    },
+                ),
+                audit_event_v2(
+                    3,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    kind={
+                        "type": "epoch_state_changed",
+                        "previous_state": "pending",
+                        "new_state": "committed",
+                        "epoch": 8,
+                        "reason": "winning_commit_applied",
+                    },
+                ),
+            ).encode("utf-8"),
+            source_name="v2-structural-quarantine.jsonl",
+        )
+
+        audit_file = result.audit_file
+        self.assertEqual(audit_file.validation_status, AuditFile.STATUS_INVALID)
+        self.assertIn("audit log contains multiple engine_ids", audit_file.validation_error)
+        self.assertIn("audit log contains multiple account_refs", audit_file.validation_error)
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.assertEqual(
+            AuditEvent.objects.filter(
+                audit_file=audit_file,
+                group=group,
+                parse_status=AuditEvent.STATUS_VALID,
+            ).count(),
+            4,
+        )
+        self.assertEqual(valid_group_event_queryset(group).count(), 0)
+
+        self.assertEqual(DeliveryArtifact.objects.filter(group=group).count(), 0)
+        self.assertEqual(DeliveryObservation.objects.filter(artifact__group=group).count(), 0)
+        self.assertEqual(NetworkObservation.objects.filter(group=group).count(), 0)
+        self.assertEqual(ConvergenceRun.objects.filter(group=group).count(), 0)
+        self.assertEqual(ConvergenceCandidate.objects.filter(run__group=group).count(), 0)
+        self.assertEqual(ConvergenceRuleEvaluation.objects.filter(run__group=group).count(), 0)
+        self.assertEqual(StateDelta.objects.filter(group=group).count(), 0)
+        self.assertEqual(EpochStateTransition.objects.filter(group=group).count(), 0)
+
+        summary = group_summary_context(group)
+        self.assertEqual(summary["summary"]["event_count"], 0)
+        self.assertEqual(summary["tab_counts"]["overview"], 0)
+        self.assertEqual(summary["tab_counts"]["delivery"], 0)
+        self.assertEqual(summary["tab_counts"]["network"], 0)
+        self.assertEqual(summary["tab_counts"]["convergence"], 0)
+        self.assertEqual(summary["tab_counts"]["state"], 0)
+
     def test_rebuild_default_ignores_v1_only_groups(self):
         result = ingest_audit_log_bytes(
             dump_bytes=representative_audit_log().encode("utf-8"),

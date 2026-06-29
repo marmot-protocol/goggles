@@ -5,6 +5,7 @@ from typing import Any
 
 from django.db import transaction
 
+from .analysis import structural_quarantine_exclusion
 from .models import (
     AuditEvent,
     AuditFile,
@@ -77,7 +78,11 @@ def rebuild_group_projections(group: AuditGroup) -> None:
     clear_group_projections(group)
     events = (
         AuditEvent.objects.select_related("audit_file")
-        .filter(group=group, parse_status=AuditEvent.STATUS_VALID)
+        .filter(
+            structural_quarantine_exclusion(),
+            group=group,
+            parse_status=AuditEvent.STATUS_VALID,
+        )
         .order_by("wall_time_ms", "engine_id", "line_number", "id")
     )
     state = ProjectionState(active_inferred_convergence_runs={})
