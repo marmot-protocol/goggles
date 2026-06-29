@@ -65,6 +65,7 @@ from .views import (
     client_ip,
     group_api_payload,
     group_detail_shell_context,
+    group_engine_rows,
     group_epoch_count,
     group_overview_context,
     group_summary_context,
@@ -7557,6 +7558,25 @@ class GroupOverviewLazyContextTests(TestCase):
             payload = group_api_payload(self.group)
 
         overview.assert_not_called()
+        self.assertEqual(
+            set(payload),
+            {"slug", "name", "group_ref", "summary", "tab_counts", "updated_at"},
+        )
+
+    def test_group_api_payload_does_not_build_engine_preview(self):
+        with (
+            mock.patch(
+                "forensics.views.engine_source_values",
+                side_effect=AssertionError(
+                    "group_api_payload must not load full engine source metadata"
+                ),
+            ) as source_values,
+            mock.patch("forensics.views.group_engine_rows", wraps=group_engine_rows) as engine_rows,
+        ):
+            payload = group_api_payload(self.group)
+
+        engine_rows.assert_not_called()
+        source_values.assert_not_called()
         self.assertEqual(
             set(payload),
             {"slug", "name", "group_ref", "summary", "tab_counts", "updated_at"},

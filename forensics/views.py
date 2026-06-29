@@ -198,8 +198,9 @@ def group_detail_shell_context(group: AuditGroup) -> dict:
     }
 
 
-def group_summary_context(group: AuditGroup) -> dict:
-    valid_events = valid_group_event_queryset(group)
+def group_summary_header_context(group: AuditGroup, *, valid_events=None) -> dict:
+    """Build the cheap summary/tab-count context without timeline/overview previews."""
+    valid_events = valid_events if valid_events is not None else valid_group_event_queryset(group)
     event_stats = valid_events.aggregate(
         event_count=Count("id"),
         engine_count=Count("engine_id", filter=~Q(engine_id=""), distinct=True),
@@ -210,12 +211,6 @@ def group_summary_context(group: AuditGroup) -> dict:
     invalid_event_count = AuditEvent.objects.filter(
         group=group, parse_status=AuditEvent.STATUS_INVALID
     ).count()
-    epoch_count = group_epoch_count(valid_events)
-    engine_preview = group_engine_rows(
-        group,
-        valid_events=valid_events,
-        limit=GROUP_ENGINE_PREVIEW_LIMIT,
-    )
     engine_count = event_stats["engine_count"] or 0
     delivery_count = DeliveryArtifact.objects.filter(group=group).count()
     network_count = NetworkObservation.objects.filter(group=group).count()
@@ -239,11 +234,6 @@ def group_summary_context(group: AuditGroup) -> dict:
             "convergence_count": convergence_count,
             "state_count": state_count,
         },
-        "timeline_summary": {
-            "engines": engine_preview,
-            "engine_overflow_count": max(engine_count - len(engine_preview), 0),
-            "epoch_count": epoch_count,
-        },
         "tab_counts": {
             "overview": event_stats["event_count"],
             "delivery": delivery_count,
@@ -254,6 +244,29 @@ def group_summary_context(group: AuditGroup) -> dict:
             "exports": "",
         },
         "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
+    }
+
+
+def group_summary_context(group: AuditGroup) -> dict:
+    valid_events = valid_group_event_queryset(group)
+    header_context = group_summary_header_context(group, valid_events=valid_events)
+    engine_preview = group_engine_rows(
+        group,
+        valid_events=valid_events,
+        limit=GROUP_ENGINE_PREVIEW_LIMIT,
+    )
+    # summary.engine_count is already coalesced to an integer by the cheap
+    # header builder, so the overflow math stays safe for empty groups.
+    engine_count = header_context["summary"]["engine_count"]
+    return {
+        "summary": header_context["summary"],
+        "timeline_summary": {
+            "engines": engine_preview,
+            "engine_overflow_count": max(engine_count - len(engine_preview), 0),
+            "epoch_count": group_epoch_count(valid_events),
+        },
+        "tab_counts": header_context["tab_counts"],
+        "tab_event_limit": header_context["tab_event_limit"],
     }
 
 
@@ -565,7 +578,7 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
     if tab == "exports":
         return {
             "group": group,
-            "summary": group_summary_context(group)["summary"],
+            "summary": group_summary_header_context(group)["summary"],
             "classification": group_classification(group),
             "saved_reports": list(group.analysis_runs.select_related("created_by")[:20]),
         }
@@ -1321,7 +1334,7 @@ def group_list_api_payload(group) -> dict:
 
 
 def group_api_payload(group: AuditGroup) -> dict:
-    shell = group_summary_context(group)
+    shell = group_summary_header_context(group)
     return {
         "slug": group.slug,
         "name": group.name,
