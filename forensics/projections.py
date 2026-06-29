@@ -59,6 +59,20 @@ class ProjectionState:
 
 
 def rebuild_file_projections(audit_file: AuditFile) -> None:
+    """Project an uploaded file's newly stored events onto existing projections.
+
+    Projecting incrementally — only this file's valid events, onto the
+    projection rows already built for the touched groups — keeps the ingest hot
+    path proportional to the *upload*, not the whole group. A small append no
+    longer deletes and re-inserts every projection row for the entire group
+    (marmot-protocol/goggles#127). The projection helpers are idempotent upserts
+    keyed on ``(group, artifact_id)`` / ``(artifact, engine_id)`` /
+    ``(group, engine_id, run_id)``, and each stored ``AuditEvent`` is projected
+    exactly once across uploads (a re-uploaded file short-circuits on its
+    ``file_sha256`` before any event is stored), so appending new evidence to
+    existing rows needs no full clear. Use ``rebuild_group_projections`` (the
+    management-command path) for an explicit full rebuild from raw evidence.
+    """
     if AUDIT_SCHEMA_VERSION_V2 not in (audit_file.schema_versions or []):
         return
     group_ids = set(audit_file.groups.values_list("id", flat=True))
@@ -67,8 +81,107 @@ def rebuild_file_projections(audit_file: AuditFile) -> None:
             "group_id", flat=True
         )
     )
-    for group in AuditGroup.objects.filter(id__in=group_ids).order_by("id"):
-        rebuild_group_projections(group)
+    if not group_ids:
+        return
+    project_file_events(audit_file, sorted(group_ids))
+
+
+@transaction.atomic
+def project_file_events(audit_file: AuditFile, group_ids: list[int]) -> None:
+    # Lock the touched groups in a stable order so concurrent uploads to the
+    # same group serialize on the projection writes without deadlocking, but
+    # only re-project this file's own newly stored events instead of the whole
+    # group's history.
+    list(
+        AuditGroup.objects.select_for_update()
+        .filter(id__in=group_ids)
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    events = list(
+        AuditEvent.objects.select_related("audit_file")
+        .filter(audit_file=audit_file, parse_status=AuditEvent.STATUS_VALID, group__isnull=False)
+        .order_by("wall_time_ms", "engine_id", "line_number", "id")
+    )
+    state = ProjectionState(
+        active_inferred_convergence_runs=active_inferred_runs_for_events(events),
+    )
+    for event in events:
+        project_event(event, state)
+
+
+def active_inferred_runs_for_events(
+    events: list[AuditEvent],
+) -> dict[tuple[int, str], ConvergenceRun]:
+    """Reconstruct the in-flight inferred convergence runs an append may continue.
+
+    Inferred runs (no explicit ``run_id``) are stitched across events keyed on
+    ``(group_id, engine_id)`` and stay "active" until a terminal event closes
+    them. When an upload appends more convergence evidence to a run opened by an
+    earlier upload, the fresh :class:`ProjectionState` must already know about
+    that open run so the new events extend it instead of spawning a duplicate.
+
+    Reconstruction is bounded to the convergence-relevant ``(group_id, engine_id)``
+    pairs this file actually touches (not the whole group): the latest inferred
+    run for each such pair is treated as active when its most recent evidence
+    event was not itself terminal.
+    """
+    keys = {
+        (event.group_id, event.engine_id)
+        for event in events
+        if event.group_id is not None
+        and event.engine_id
+        and event_may_need_inferred_convergence_state(event)
+    }
+    if not keys:
+        return {}
+    group_ids = {group_id for group_id, _engine_id in keys}
+    engine_ids = {engine_id for _group_id, engine_id in keys}
+    active: dict[tuple[int, str], ConvergenceRun] = {}
+    candidate_runs = (
+        ConvergenceRun.objects.filter(
+            group_id__in=group_ids,
+            engine_id__in=engine_ids,
+            inferred=True,
+        )
+        .prefetch_related("evidence_events")
+        .order_by("group_id", "engine_id", "started_at_ms", "id")
+    )
+    for run in candidate_runs:
+        key = (run.group_id, run.engine_id)
+        if key not in keys:
+            continue
+        # Later runs overwrite earlier ones, so the loop ends on the most recent
+        # run per key (ordered by started_at_ms, id above).
+        if run_is_active_inferred(run):
+            active[key] = run
+        else:
+            active.pop(key, None)
+    return active
+
+
+def event_may_need_inferred_convergence_state(event: AuditEvent) -> bool:
+    if event.event_type in CONVERGENCE_EVENT_TYPES or event.event_type == "epoch_state_changed":
+        return True
+    context = event.context_convergence if isinstance(event.context_convergence, dict) else {}
+    return bool(context and not str(context.get("run_id") or ""))
+
+
+def run_is_active_inferred(run: ConvergenceRun) -> bool:
+    last_event = max(
+        run.evidence_events.all(),
+        key=lambda event: (
+            event.wall_time_ms is None,
+            event.wall_time_ms or 0,
+            event.engine_id,
+            event.line_number,
+            event.id,
+        ),
+        default=None,
+    )
+    if last_event is None:
+        return True
+    return not inferred_convergence_event_is_terminal(last_event, run.phase)
 
 
 @transaction.atomic
