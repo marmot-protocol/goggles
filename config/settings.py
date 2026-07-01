@@ -3,6 +3,7 @@ from pathlib import Path
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.csp import CSP
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -16,6 +17,110 @@ def env_bool(name: str, default: bool) -> bool:
 
 def env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be a floating point number.") from exc
+
+
+SENSITIVE_EVENT_KEYS = {
+    "authorization",
+    "cookie",
+    "cookies",
+    "data",
+    "engine_id",
+    "group",
+    "group_ref",
+    "http_authorization",
+    "ip_address",
+    "message_id",
+    "msg_id",
+    "payload",
+    "payload_digest",
+    "query_string",
+    "raw",
+    "raw_body",
+    "raw_line",
+    "raw_text",
+    "remote_addr",
+    "request_body",
+    "source_ip",
+    "token",
+    "upload",
+    "upload_token",
+    "user-agent",
+    "user_agent",
+    "x-forwarded-for",
+    "x-goggles-account-label",
+    "x-goggles-app-version",
+    "x-goggles-device-label",
+    "x-goggles-group",
+    "x-goggles-platform",
+    "x-real-ip",
+}
+SENSITIVE_EVENT_KEY_PARTS = (
+    "account_ref",
+    "audit",
+    "authorization",
+    "bearer",
+    "body",
+    "digest",
+    "engine_id",
+    "group_ref",
+    "message_id",
+    "msg_id",
+    "payload",
+    "raw",
+    "secret",
+    "token",
+)
+SCRUBBED_VALUE = "[Filtered]"
+
+
+def _scrub_glitchtip_value(value):
+    if isinstance(value, dict):
+        scrubbed = {}
+        for key, child in value.items():
+            normalized = str(key).lower().replace("_", "-")
+            normalized_with_underscores = normalized.replace("-", "_")
+            if (
+                normalized in SENSITIVE_EVENT_KEYS
+                or normalized_with_underscores in SENSITIVE_EVENT_KEYS
+                or any(part in normalized_with_underscores for part in SENSITIVE_EVENT_KEY_PARTS)
+            ):
+                scrubbed[key] = SCRUBBED_VALUE
+            else:
+                scrubbed[key] = _scrub_glitchtip_value(child)
+        return scrubbed
+    if isinstance(value, list):
+        return [_scrub_glitchtip_value(child) for child in value]
+    return value
+
+
+def scrub_glitchtip_event(event, _hint):
+    event = _scrub_glitchtip_value(event)
+    request = event.get("request")
+    if isinstance(request, dict):
+        request.pop("data", None)
+        request.pop("cookies", None)
+        request.pop("query_string", None)
+        request.pop("env", None)
+        headers = request.get("headers")
+        if isinstance(headers, dict):
+            for key in list(headers):
+                normalized = str(key).lower()
+                if normalized in SENSITIVE_EVENT_KEYS or normalized.startswith("x-goggles-"):
+                    headers[key] = SCRUBBED_VALUE
+    user = event.get("user")
+    if isinstance(user, dict):
+        user.pop("ip_address", None)
+    return event
 
 
 # Fail closed: an absent DJANGO_DEBUG must default to production-safe (DEBUG=False)
@@ -70,6 +175,46 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
+GLITCHTIP_DSN = os.environ.get("GLITCHTIP_DSN", "")
+GLITCHTIP_SECURITY_ENDPOINT = os.environ.get("GLITCHTIP_SECURITY_ENDPOINT", "")
+GLITCHTIP_ENVIRONMENT = os.environ.get(
+    "GLITCHTIP_ENVIRONMENT",
+    "development" if DEBUG else "production",
+)
+GLITCHTIP_RELEASE = os.environ.get("GLITCHTIP_RELEASE", "")
+GLITCHTIP_TRACES_SAMPLE_RATE = env_float("GLITCHTIP_TRACES_SAMPLE_RATE", 0.05)
+
+if GLITCHTIP_SECURITY_ENDPOINT:
+    MIDDLEWARE.insert(1, "django.middleware.csp.ContentSecurityPolicyMiddleware")
+    SECURE_CSP_REPORT_ONLY = {
+        "default-src": [CSP.SELF],
+        "script-src": [CSP.SELF, CSP.UNSAFE_INLINE],
+        "style-src": [CSP.SELF, CSP.UNSAFE_INLINE],
+        "img-src": [CSP.SELF, "data:"],
+        "font-src": [CSP.SELF],
+        "connect-src": [CSP.SELF, "https://glitch.ipf.dev"],
+        "object-src": [CSP.NONE],
+        "frame-ancestors": [CSP.NONE],
+        "base-uri": [CSP.SELF],
+        "form-action": [CSP.SELF],
+        "report-uri": [GLITCHTIP_SECURITY_ENDPOINT],
+    }
+
+if GLITCHTIP_DSN:
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=GLITCHTIP_DSN,
+        traces_sample_rate=GLITCHTIP_TRACES_SAMPLE_RATE,
+        auto_session_tracking=False,
+        send_default_pii=False,
+        max_request_body_size="never",
+        include_local_variables=False,
+        environment=GLITCHTIP_ENVIRONMENT,
+        release=GLITCHTIP_RELEASE or None,
+        before_send=scrub_glitchtip_event,
+    )
 
 ROOT_URLCONF = "config.urls"
 

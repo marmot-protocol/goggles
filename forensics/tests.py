@@ -7924,7 +7924,7 @@ class DebugFailClosedSettingsTests(SimpleTestCase):
 
     # Environment keys the settings module reads; cleared for a clean slate so a
     # stray DJANGO_* var in the test runner's environment can't mask the default.
-    _MANAGED_PREFIXES = ("DJANGO_",)
+    _MANAGED_PREFIXES = ("DJANGO_", "GLITCHTIP_")
     _MANAGED_KEYS = ("DATABASE_URL",)
 
     # A representative production-style environment, deliberately missing
@@ -7997,6 +7997,104 @@ class DebugFailClosedSettingsTests(SimpleTestCase):
         with self._clean_env(DJANGO_DEBUG="0", **self._PROD_ENV):
             ns = self._load_settings()
         self.assertIs(ns["DEBUG"], False)
+
+    def test_missing_glitchtip_dsn_leaves_sdk_disabled(self):
+        with self._clean_env(**self._PROD_ENV):
+            with mock.patch("sentry_sdk.init") as sentry_init:
+                ns = self._load_settings()
+
+        self.assertEqual(ns["GLITCHTIP_DSN"], "")
+        sentry_init.assert_not_called()
+
+    def test_glitchtip_dsn_configures_privacy_safe_sdk_defaults(self):
+        dsn = "https://public@example.com/1"
+        with self._clean_env(**self._PROD_ENV, GLITCHTIP_DSN=dsn):
+            with mock.patch("sentry_sdk.init") as sentry_init:
+                ns = self._load_settings()
+
+        sentry_init.assert_called_once()
+        _args, kwargs = sentry_init.call_args
+        self.assertEqual(kwargs["dsn"], dsn)
+        self.assertEqual(kwargs["traces_sample_rate"], 0.05)
+        self.assertFalse(kwargs["auto_session_tracking"])
+        self.assertFalse(kwargs["send_default_pii"])
+        self.assertEqual(kwargs["max_request_body_size"], "never")
+        self.assertFalse(kwargs["include_local_variables"])
+        self.assertEqual(kwargs["environment"], "production")
+        self.assertIsNone(kwargs["release"])
+        self.assertIs(kwargs["before_send"], ns["scrub_glitchtip_event"])
+
+    def test_glitchtip_trace_sample_rate_is_env_overridable(self):
+        with self._clean_env(**self._PROD_ENV, GLITCHTIP_DSN="https://public@example.com/1"):
+            with mock.patch.dict(os.environ, {"GLITCHTIP_TRACES_SAMPLE_RATE": "0.2"}):
+                with mock.patch("sentry_sdk.init") as sentry_init:
+                    self._load_settings()
+
+        _args, kwargs = sentry_init.call_args
+        self.assertEqual(kwargs["traces_sample_rate"], 0.2)
+
+    def test_glitchtip_security_endpoint_enables_csp_report_only(self):
+        endpoint = "https://glitch.example.com/api/1/security/?glitchtip_key=public"
+        with self._clean_env(DJANGO_DEBUG="1", GLITCHTIP_SECURITY_ENDPOINT=endpoint):
+            with mock.patch("sentry_sdk.init") as sentry_init:
+                ns = self._load_settings()
+
+        sentry_init.assert_not_called()
+        self.assertEqual(
+            ns["MIDDLEWARE"][1],
+            "django.middleware.csp.ContentSecurityPolicyMiddleware",
+        )
+        policy = ns["SECURE_CSP_REPORT_ONLY"]
+        self.assertEqual(policy["report-uri"], [endpoint])
+        self.assertEqual(policy["default-src"], [ns["CSP"].SELF])
+        self.assertEqual(policy["object-src"], [ns["CSP"].NONE])
+        self.assertEqual(policy["frame-ancestors"], [ns["CSP"].NONE])
+
+    def test_glitchtip_scrubber_removes_sensitive_event_material(self):
+        with self._clean_env(DJANGO_DEBUG="1"):
+            ns = self._load_settings()
+
+        scrubbed = ns["scrub_glitchtip_event"](
+            {
+                "request": {
+                    "headers": {
+                        "Authorization": "Bearer raw-token",
+                        "User-Agent": "client",
+                        "X-Goggles-Device-Label": "iphone",
+                        "Accept": "application/json",
+                    },
+                    "data": "raw upload body",
+                    "cookies": {"sessionid": "secret"},
+                    "query_string": "token=secret",
+                    "env": {"REMOTE_ADDR": "203.0.113.8"},
+                },
+                "user": {"username": "investigator", "ip_address": "203.0.113.8"},
+                "extra": {
+                    "raw_text": '{"engine_id":"abc"}',
+                    "nested": {
+                        "payload_digest": "abc123",
+                        "safe_count": 2,
+                    },
+                    "upload_token": "secret",
+                },
+            },
+            {},
+        )
+
+        request = scrubbed["request"]
+        self.assertNotIn("data", request)
+        self.assertNotIn("cookies", request)
+        self.assertNotIn("query_string", request)
+        self.assertNotIn("env", request)
+        self.assertEqual(request["headers"]["Authorization"], ns["SCRUBBED_VALUE"])
+        self.assertEqual(request["headers"]["User-Agent"], ns["SCRUBBED_VALUE"])
+        self.assertEqual(request["headers"]["X-Goggles-Device-Label"], ns["SCRUBBED_VALUE"])
+        self.assertEqual(request["headers"]["Accept"], "application/json")
+        self.assertEqual(scrubbed["user"], {"username": "investigator"})
+        self.assertEqual(scrubbed["extra"]["raw_text"], ns["SCRUBBED_VALUE"])
+        self.assertEqual(scrubbed["extra"]["nested"]["payload_digest"], ns["SCRUBBED_VALUE"])
+        self.assertEqual(scrubbed["extra"]["nested"]["safe_count"], 2)
+        self.assertEqual(scrubbed["extra"]["upload_token"], ns["SCRUBBED_VALUE"])
 
 
 class ClientIpTests(SimpleTestCase):
