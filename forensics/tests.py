@@ -147,7 +147,7 @@ def audit_event_v2(
         "engine_id": engine_id,
         "group_ref": group_ref,
         "context": context if context is not None else {"operation_id": f"op-v2-{seq}"},
-        "kind": kind or {"type": "recorder_started", "recorder": "darkmatter"},
+        "kind": kind or {"type": "recorder_started", "recorder": "mdk"},
     }
 
 
@@ -1580,7 +1580,7 @@ class AuditLogIngestionTests(TestCase):
                     account_ref=ACCOUNT_BOB,
                     recorder_session_id="session-b",
                     context={"source": {"account_label": "Bob", "device_name": "Bob laptop"}},
-                    kind={"type": "recorder_started", "recorder": "darkmatter"},
+                    kind={"type": "recorder_started", "recorder": "mdk"},
                 )
             ),
             content_type="application/x-ndjson",
@@ -2216,7 +2216,7 @@ class AuditLogIngestionTests(TestCase):
             audit_event_v2(
                 0,
                 context={"source": "alice laptop", "convergence": ["run-1"]},
-                kind={"type": "recorder_started", "recorder": "darkmatter"},
+                kind={"type": "recorder_started", "recorder": "mdk"},
             )
         )
 
@@ -5203,7 +5203,7 @@ class DashboardTests(TestCase):
             HTTP_X_GOGGLES_DEVICE_LABEL="MacBook",
             HTTP_X_GOGGLES_PLATFORM="macOS",
             HTTP_X_GOGGLES_APP_VERSION="1.2.3",
-            HTTP_USER_AGENT="DarkMatter/1.2.3",
+            HTTP_USER_AGENT="MDK/1.2.3",
             REMOTE_ADDR="203.0.113.10",
         )
         self.assertEqual(valid_response.status_code, 201)
@@ -5267,7 +5267,7 @@ class DashboardTests(TestCase):
             data=representative_audit_log(source={"account_label": "Alice"}),
             content_type="application/x-ndjson",
             HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-            HTTP_USER_AGENT="DarkMatter/1.2.3",
+            HTTP_USER_AGENT="MDK/1.2.3",
             REMOTE_ADDR="203.0.113.10",
         )
         self.assertEqual(upload_response.status_code, 201)

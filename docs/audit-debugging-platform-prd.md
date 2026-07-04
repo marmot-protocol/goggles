@@ -2,7 +2,7 @@
 
 Status: Draft  
 Date: 2026-06-24  
-Audience: Dark Matter, Goggles, and client application engineers
+Audience: MDK, Goggles, and client application engineers
 
 ## Summary
 
@@ -27,12 +27,12 @@ content and transport wire identifiers.
 
 ## Background
 
-Dark Matter audit logging currently writes sensitive JSONL records using
+MDK audit logging currently writes sensitive JSONL records using
 `schema_version = "marmot-forensics-audit/v1"`. Goggles ingests those files,
 preserves exact raw text, normalizes common fields into database columns, and
 renders group-level dashboards.
 
-The latest Dark Matter audit changes add richer group and epoch breadcrumbs:
+The latest MDK audit changes add richer group and epoch breadcrumbs:
 
 - `epoch_state_changed` records engine epoch-state transitions such as stable,
   pending publish, recovering, and unrecoverable.
@@ -45,7 +45,7 @@ The latest Dark Matter audit changes add richer group and epoch breadcrumbs:
   attribution on every row.
 
 These changes are necessary but not sufficient. Goggles needs new product
-surfaces, derived data models, and programmatic APIs. Dark Matter and client
+surfaces, derived data models, and programmatic APIs. MDK and client
 libraries may also need additional audit events so Goggles can explain branch
 selection, transport gaps, and client/device behavior with confidence.
 
@@ -90,7 +90,7 @@ selection, transport gaps, and client/device behavior with confidence.
 ## Audit Data Modes
 
 The audit recorder should expose a two-option data-mode setting. The selected
-mode must be stored in Dark Matter settings, stamped into recorder or session
+mode must be stored in MDK settings, stamped into recorder or session
 context, visible in Goggles, included in API responses, and auditable when it
 changes.
 
@@ -189,7 +189,7 @@ Important distinction:
 
 Question: What did the convergence engine see, what did it choose, and why?
 
-The view should organize events by convergence run. Once Dark Matter emits a
+The view should organize events by convergence run. Once MDK emits a
 stable `convergence_run_id`, that id should define the run. Before then, Goggles
 can infer provisional runs from contiguous convergence and epoch-state events
 with the same engine id and group ref. An inferred run begins when an engine
@@ -214,7 +214,7 @@ Each run should show:
 - resulting epoch-state transition;
 - raw evidence links for every row.
 
-Current Dark Matter data can show high-level decisions through
+Current MDK data can show high-level decisions through
 `convergence_decision`, `error_kinds`, and `epoch_state_changed`. It likely does
 not yet expose enough candidate-level detail to fully explain branch selection.
 
@@ -312,10 +312,10 @@ projection model:
 - Update fixtures and parser tests for the V2 JSON Schema.
 - Include derived projections in agent export and API output.
 
-## Dark Matter Audit Data Gaps
+## MDK Audit Data Gaps
 
 The latest audit changes are a strong foundation, but Goggles probably needs
-additional Dark Matter events for complete explainability.
+additional MDK events for complete explainability.
 
 A first draft of the proposed V2 event-line schema is in
 [`docs/schemas/audit-log-event.v2.schema.json`](schemas/audit-log-event.v2.schema.json).
@@ -480,9 +480,9 @@ API behavior:
 
 Phase 0: Alignment
 
-- Review this PRD with Dark Matter, Goggles, and client owners.
+- Review this PRD with MDK, Goggles, and client owners.
 - Turn P0 items into issues.
-- Decide which Dark Matter schema gaps are required before UI redesign.
+- Decide which MDK schema gaps are required before UI redesign.
 
 Phase 1: Greenfield Storage And Ingest
 
@@ -510,15 +510,15 @@ Phase 3: UI Redesign
 
 Phase 4: Producer Gaps
 
-- Add Dark Matter audit settings and schema support for obfuscated versus full
+- Add MDK audit settings and schema support for obfuscated versus full
   data auditing.
-- Add missing Dark Matter audit events for convergence branch explainability.
+- Add missing MDK audit events for convergence branch explainability.
 - Add TypeScript/client audit-log parity.
 - Validate emitted logs against the committed schema.
 
 ## Decisions From Initial Review
 
-- Convergence runs should eventually be keyed by a Dark Matter emitted
+- Convergence runs should eventually be keyed by an MDK-emitted
   `convergence_run_id`. Until then, Goggles may infer provisional runs from
   contiguous convergence and epoch-state rows with the same engine id and group
   ref, and must label those runs as inferred.
@@ -566,7 +566,7 @@ Phase 4: Producer Gaps
 
 ## Remaining Open Questions
 
-- What exact schema names and field shapes should Dark Matter use for
+- What exact schema names and field shapes should MDK use for
   convergence rule outputs, expected-recipient sets, and full data auditing
   message contents?
 - Which derived projection tables and indexes are required for the first fast
@@ -578,7 +578,7 @@ Phase 4: Producer Gaps
 
 - Inferred missing transport events may be mistaken for proven non-delivery.
 - System-stamped audit rows may overwhelm human-action views if not separated.
-- Branch explainability will be incomplete unless Dark Matter emits candidate
+- Branch explainability will be incomplete unless MDK emits candidate
   details, not just final decisions.
 - Rich APIs may accidentally expose sensitive forensic data too broadly without
   tight authentication and careful response design.
