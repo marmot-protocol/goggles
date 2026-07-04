@@ -148,7 +148,7 @@ class GroupScript:
         """
         self.emit(
             participant,
-            {"type": "recorder_started", "recorder": "darkmatter"},
+            {"type": "recorder_started", "recorder": "mdk"},
             mode=OBFUSCATED,
             context={
                 "source": {

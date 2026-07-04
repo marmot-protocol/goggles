@@ -148,7 +148,7 @@ the convergence-decision evidence refs that produced those child rows.
 `message_id` filters convergence runs by selected branch id, losing branch id,
 candidate branch id, or candidate commit ids. `epoch` filters by run-level,
 candidate-level, and evidence-level convergence epoch fields.
-When Dark Matter does not emit a stable convergence `run_id`, Goggles groups
+When MDK does not emit a stable convergence `run_id`, Goggles groups
 contiguous convergence and epoch-state evidence for the same group engine into
 an inferred run and sets `inferred` to `true`.
 If multiple engines have the same run id, the detail endpoint returns `409` with
