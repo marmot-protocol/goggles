@@ -4,7 +4,11 @@ Internal Marmot audit-log explorer.
 
 Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from MDK clients (current schema `marmot-forensics-audit/v2`; legacy `v1` is still accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
 
-The audit event schema is committed at `docs/schemas/audit-log-event.v2.schema.json`. See also `docs/api-v1.md` for the authenticated read API, `docs/deployment.md` for VM deployment notes, and `docs/audit-debugging-platform-prd.md` for the platform's product requirements.
+The audit event schema is committed at `docs/schemas/audit-log-event.v2.schema.json`.
+See also `docs/audit-log-glossary.md` for a plain-English term guide,
+`docs/api-v1.md` for the authenticated read API, `docs/deployment.md` for VM
+deployment notes, and `docs/audit-debugging-platform-prd.md` for the platform's
+product requirements.
 
 ## Local Development
 
