@@ -15,6 +15,7 @@ from .models import (
     DeliveryObservation,
     EpochStateTransition,
     NetworkObservation,
+    PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
     UploadToken,
@@ -47,6 +48,23 @@ class UploadTokenAdmin(admin.ModelAdmin):
     )
     list_filter = ("is_active",)
     search_fields = ("name", "token_prefix")
+    readonly_fields = ("token_prefix", "token_hash", "created_at", "last_used_at")
+
+
+@admin.register(PersonalAccessToken)
+class PersonalAccessTokenAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "user",
+        "token_prefix",
+        "is_active",
+        "created_at",
+        "expires_at",
+        "last_used_at",
+    )
+    list_filter = ("is_active",)
+    search_fields = ("name", "token_prefix", "user__username")
+    autocomplete_fields = ("user",)
     readonly_fields = ("token_prefix", "token_hash", "created_at", "last_used_at")
 
 

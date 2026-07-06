@@ -6,6 +6,12 @@ urlpatterns = [
     path("healthz/", views.healthz, name="healthz"),
     path("", views.group_list, name="group-list"),
     path("profile/", views.profile, name="profile"),
+    path("profile/tokens/", views.create_access_token, name="create-access-token"),
+    path(
+        "profile/tokens/<int:pk>/revoke/",
+        views.revoke_access_token,
+        name="revoke-access-token",
+    ),
     path("uploads/", views.upload_log_list, name="upload-log-list"),
     path(
         "investigations/accounts/<str:account_ref>/",
@@ -52,6 +58,11 @@ urlpatterns = [
         name="api-group-audit-log-upload",
     ),
     path("api/v1/groups/", views.api_group_list, name="api-group-list"),
+    path(
+        "api/v1/groups/<slug:slug>/export/",
+        views.api_group_export_stream,
+        name="api-group-export-stream",
+    ),
     path("api/v1/groups/<slug:slug>/", views.api_group_detail, name="api-group-detail"),
     path(
         "api/v1/groups/<slug:slug>/delivery/",

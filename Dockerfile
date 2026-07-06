@@ -25,4 +25,11 @@ USER goggles
 
 EXPOSE 8000
 
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+# Threaded workers so a long-running streaming export (the group export endpoint)
+# occupies a thread rather than blocking a whole worker; --timeout is raised well
+# past a multi-minute stream so gunicorn does not reap it. --max-requests recycles
+# workers periodically (gracefully, after in-flight streams finish) for leak hygiene
+# now that workers are long-lived. See docs/deployment.md for the capacity model.
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", \
+     "--workers", "3", "--threads", "4", "--timeout", "300", \
+     "--max-requests", "500", "--max-requests-jitter", "50"]

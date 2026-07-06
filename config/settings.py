@@ -271,6 +271,10 @@ LOGOUT_REDIRECT_URL = "login"
 
 GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
+# Operational kill-switch for the streaming group-export endpoint, mirroring the
+# upload toggle. Lets an operator shed a resource-intensive read surface without a
+# redeploy.
+GOGGLES_EXPORTS_ENABLED = env_bool("GOGGLES_EXPORTS_ENABLED", True)
 DATA_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 FILE_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 # The upload endpoint only ever ingests a single file part, and every part at

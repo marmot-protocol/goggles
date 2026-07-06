@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+from datetime import datetime
 
 from django.conf import settings
 from django.contrib import messages
@@ -11,16 +12,26 @@ from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
 from django.db.models import Count, Max, Min, Prefetch, Q
+from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Length, Substr
-from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 
 from .analysis import (
+    EXPORT_SENSITIVITY,
+    agent_event_row,
+    agent_source_row,
     agent_state_export_for_group,
     audit_files_for_group,
     color_index,
@@ -43,10 +54,13 @@ from .models import (
     DeliveryObservation,
     EpochStateTransition,
     NetworkObservation,
+    PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
     UploadToken,
 )
+from .streaming import ExportSection, stream_ndjson
+from .token_crypto import expiry_from_days
 
 UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
 AUDIT_FILE_EVENT_PAGE_SIZE = 100
@@ -55,6 +69,7 @@ GROUP_ENGINE_PREVIEW_LIMIT = 12
 GROUP_DETAIL_TAB_EVENT_LIMIT = 100
 GROUP_PROJECTION_API_DEFAULT_LIMIT = 500
 GROUP_PROJECTION_API_MAX_LIMIT = 5_000
+GROUP_EXPORT_SCHEMA_VERSION = "goggles-group-export/v1"
 FULL_DATA_AUDIT_MODE = "full_data"
 ERROR_SEVERITY_TOKENS = (
     "error",
@@ -2156,29 +2171,29 @@ def evidence_refs_payload(events) -> list[dict]:
 
 
 def delivery_identity_index(group: AuditGroup) -> dict[str, set[str]]:
-    index = {"account_refs": set(), "pubkeys_hex": set(), "engine_ids": set()}
-    events = (
-        AuditEvent.objects.filter(group=group, parse_status=AuditEvent.STATUS_VALID)
-        .select_related("audit_file")
-        .only(
-            "account_ref",
-            "engine_id",
-            "context_source",
-            "audit_file__source_account_pubkey_hex",
-        )
+    """Distinct delivery identities (account refs, engine ids, account pubkeys)
+    across a group's valid events.
+
+    Computed with SQL ``DISTINCT`` pulls rather than a Python scan of every event:
+    the result is bounded by identity cardinality, not event count. This matters on
+    the streaming export's hot path, where materializing every event would break the
+    constant-memory guarantee. Account pubkeys come from two places — the backing
+    audit file and each event's ``context_source`` JSON — unioned here.
+    """
+    valid_events = AuditEvent.objects.filter(group=group, parse_status=AuditEvent.STATUS_VALID)
+
+    def distinct_values(queryset, field: str) -> set[str]:
+        return {value for value in queryset.values_list(field, flat=True).distinct() if value}
+
+    context_pubkeys = valid_events.annotate(
+        context_account_pubkey_hex=KeyTextTransform("account_pubkey_hex", "context_source")
     )
-    for event in events:
-        if event.account_ref:
-            index["account_refs"].add(event.account_ref)
-        if event.engine_id:
-            index["engine_ids"].add(event.engine_id)
-        if event.audit_file.source_account_pubkey_hex:
-            index["pubkeys_hex"].add(event.audit_file.source_account_pubkey_hex)
-        if isinstance(event.context_source, dict) and event.context_source.get(
-            "account_pubkey_hex"
-        ):
-            index["pubkeys_hex"].add(event.context_source["account_pubkey_hex"])
-    return index
+    return {
+        "account_refs": distinct_values(valid_events, "account_ref"),
+        "engine_ids": distinct_values(valid_events, "engine_id"),
+        "pubkeys_hex": distinct_values(valid_events, "audit_file__source_account_pubkey_hex")
+        | distinct_values(context_pubkeys, "context_account_pubkey_hex"),
+    }
 
 
 def attach_delivery_matrices(
@@ -2843,13 +2858,41 @@ def raw_text_download_filename(audit_file: AuditFile) -> str:
     return f"{stem or f'audit-file-{audit_file.pk}'}.jsonl"
 
 
+def parse_access_token_expiry(raw: str | None) -> datetime | None:
+    """Resolve an optional token expiry from user input, failing closed.
+
+    Distinguishes "not provided" (blank → no expiry, the documented default) from
+    "provided but invalid" (non-positive, too large, or unparseable → ``ValueError``).
+    A personal access token is a standing read credential, so a malformed expiry must
+    be rejected rather than silently minting a never-expiring one.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        days = int(value)
+    except ValueError:
+        raise ValueError("Token expiry must be a whole number of days.") from None
+    return expiry_from_days(days)
+
+
+def profile_context(request: HttpRequest, *, form=None, new_token: str | None = None) -> dict:
+    """Context for the profile page: the password form, the caller's own access
+    tokens, and — only immediately after minting — the one-time raw token."""
+    return {
+        "form": form if form is not None else PasswordChangeForm(request.user),
+        "access_tokens": request.user.access_tokens.order_by("-created_at"),
+        "new_token": new_token,
+    }
+
+
 @login_required
 def profile(request: HttpRequest):
-    """Let a signed-in user change their own password.
+    """Let a signed-in user change their password and manage personal access tokens.
 
-    Usernames are intentionally not editable here: the form only ever touches
-    the password of ``request.user``, so a user can never modify another
-    account or rename their own.
+    Every action here only ever touches ``request.user``'s own credentials: the
+    password form binds to ``request.user`` and the token views are owner-scoped, so
+    a user can never read, mint, or revoke another account's tokens.
     """
     if request.method == "POST":
         form = PasswordChangeForm(request.user, request.POST)
@@ -2859,9 +2902,41 @@ def profile(request: HttpRequest):
             update_session_auth_hash(request, user)
             messages.success(request, "Your password has been updated.")
             return redirect("profile")
-    else:
-        form = PasswordChangeForm(request.user)
-    return render(request, "forensics/profile.html", {"form": form})
+        return render(request, "forensics/profile.html", profile_context(request, form=form))
+    return render(request, "forensics/profile.html", profile_context(request))
+
+
+@login_required
+@require_POST
+def create_access_token(request: HttpRequest):
+    name = (request.POST.get("name") or "").strip()[:120] or "Personal access token"
+    try:
+        expires_at = parse_access_token_expiry(request.POST.get("expires_in_days"))
+    except ValueError as error:
+        messages.error(request, str(error))
+        return render(request, "forensics/profile.html", profile_context(request))
+    raw_token, _token = PersonalAccessToken.issue(name, user=request.user, expires_at=expires_at)
+    messages.success(
+        request,
+        f"Created access token “{name}”. Copy it now — it will not be shown again.",
+    )
+    # Render directly rather than redirecting so the one-time secret is never written
+    # to the session store, and mark it no-store so no cache retains the raw token.
+    response = render(
+        request, "forensics/profile.html", profile_context(request, new_token=raw_token)
+    )
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+@login_required
+@require_POST
+def revoke_access_token(request: HttpRequest, pk: int):
+    token = get_object_or_404(PersonalAccessToken, pk=pk, user=request.user)
+    token.is_active = False
+    token.save(update_fields=["is_active"])
+    messages.success(request, f"Revoked access token “{token.name}”.")
+    return redirect("profile")
 
 
 class MaxDumpSizeUploadHandler(FileUploadHandler):
@@ -2959,12 +3034,118 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
     return JsonResponse(body, status=response_status)
 
 
-def authenticate_request(request: HttpRequest) -> UploadToken | None:
-    authorization = request.headers.get("Authorization", "")
-    scheme, _, value = authorization.partition(" ")
+def bearer_value(authorization: str | None) -> str | None:
+    """Return the credential from an ``Authorization: Bearer <token>`` header."""
+    scheme, _, value = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not value:
         return None
-    return UploadToken.authenticate(value.strip())
+    return value.strip()
+
+
+def authenticate_request(request: HttpRequest) -> UploadToken | None:
+    return UploadToken.authenticate(bearer_value(request.headers.get("Authorization")))
+
+
+def authenticate_reader(request: HttpRequest) -> bool:
+    """Whether the request may read forensic data: a logged-in session or a valid
+    personal access token.
+
+    Deliberately not group-scoped — Goggles has no per-user data authorization, so
+    this only answers "is this an authenticated reader?". On the token path it
+    records ``last_used_at`` (a real write, not a pure predicate).
+    """
+    if request.user.is_authenticated:
+        return True
+    token = PersonalAccessToken.authenticate(bearer_value(request.headers.get("Authorization")))
+    if token is None:
+        return False
+    token.mark_used()
+    return True
+
+
+@require_GET
+def api_group_export_stream(request: HttpRequest, slug: str):
+    """Stream the complete forensic aggregate for one group as NDJSON.
+
+    One request, one self-contained download: a ``manifest`` line, then every
+    ``source``, ``event``, and projection row, then a terminal ``eof``. Rows stream
+    through ``QuerySet.iterator()`` so peak memory is one chunk regardless of group
+    size. Derived aggregates (timeline/messages/actions/attribution) are excluded by
+    design — see authenticated-group-export.md — and reconstructable by the consumer
+    from the raw records.
+    """
+    if not settings.GOGGLES_EXPORTS_ENABLED:
+        return JsonResponse({"error": "exports are temporarily disabled"}, status=503)
+    if not authenticate_reader(request):
+        return JsonResponse({"error": "authentication required"}, status=401)
+
+    group = get_object_or_404(AuditGroup, slug=slug)
+    # The export is unconditionally the complete group; it takes no query filters.
+    # Honoring them would mean filtering raw ``events`` too — undermining the
+    # "complete aggregate" contract the CGKA consumer depends on (every
+    # ``fork_resolution`` must be present) — and reimplementing the post-serialization
+    # severity/message-id filters that live in ``paginated_payloads``. A filter that
+    # only some sections applied is worse than none, so every section streams in full.
+    filters = default_api_filters()
+    identity_index = delivery_identity_index(group)
+
+    sections = [
+        ExportSection("source", audit_files_for_group(group), agent_source_row),
+        ExportSection(
+            "event",
+            valid_events_for_group(group, include_export_fields=True),
+            agent_event_row,
+        ),
+        ExportSection(
+            "delivery_artifact",
+            filtered_delivery_artifacts(group, filters),
+            lambda artifact: delivery_artifact_payload(artifact, identity_index),
+        ),
+        ExportSection(
+            "network_observation",
+            filtered_network_observations(group, filters),
+            network_observation_payload,
+        ),
+        ExportSection(
+            "convergence_run",
+            filtered_convergence_runs(group, filters),
+            convergence_run_payload,
+        ),
+        ExportSection(
+            "state_delta",
+            filtered_state_deltas(group, filters),
+            state_delta_payload,
+        ),
+        ExportSection(
+            "epoch_state_transition",
+            filtered_epoch_transitions(group, filters),
+            epoch_transition_payload,
+        ),
+        ExportSection(
+            "audit_data_mode_change",
+            filtered_audit_data_mode_changes(group, filters),
+            audit_data_mode_change_payload,
+        ),
+    ]
+    manifest = {
+        "schema_version": GROUP_EXPORT_SCHEMA_VERSION,
+        "generated_at": timezone.now().isoformat(),
+        "group": group_api_payload(group),
+        "classification": group_classification(group),
+        "sensitivity": EXPORT_SENSITIVITY,
+        # Derived from the sections themselves so the advertised list can never
+        # drift from what is actually streamed.
+        "sections": [section.record_type for section in sections],
+    }
+
+    response = StreamingHttpResponse(
+        stream_ndjson(manifest, sections),
+        content_type="application/x-ndjson",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{group.slug}-export.ndjson"'
+    response["Cache-Control"] = "no-store"  # sensitive payload
+    response["X-Accel-Buffering"] = "no"  # harmless; guards a future nginx front
+    return response
 
 
 def install_max_dump_size_upload_handler(request: HttpRequest) -> None:

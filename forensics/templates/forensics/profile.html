@@ -73,4 +73,91 @@
     </div>
   </form>
 </section>
+
+<section class="card profile-card">
+  <header class="card__header">
+    <span class="card__title">Personal access tokens</span>
+  </header>
+  <div class="card__body">
+    <p class="field-hint">
+      Read-only API credentials — send as <code>Authorization: Bearer &lt;token&gt;</code>,
+      e.g. to stream a group export. They can read forensic data but never upload, and stop
+      working the moment you revoke them or your account is disabled.
+    </p>
+
+    {% if new_token %}
+      <div class="field">
+        <label for="new-access-token">New token — copy it now</label>
+        <input class="input is-mono" type="text" id="new-access-token" value="{{ new_token }}"
+               readonly onclick="this.select()">
+        <p class="field-hint">This is the only time the token is shown. Store it securely.</p>
+      </div>
+    {% endif %}
+
+    <form method="post" action="{% url 'create-access-token' %}" class="profile-form" autocomplete="off">
+      {% csrf_token %}
+      <div class="field">
+        <label for="access-token-name">Token name</label>
+        <input class="input" type="text" id="access-token-name" name="name" maxlength="120"
+               placeholder="e.g. cgka pipeline" required>
+      </div>
+      <div class="field">
+        <label for="access-token-expiry">Expires in days (optional)</label>
+        <input class="input" type="number" id="access-token-expiry" name="expires_in_days"
+               min="1" placeholder="Leave blank to never expire">
+      </div>
+      <div class="profile-form__actions">
+        <button type="submit" class="btn btn--primary">Generate token</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card__body table-scroll">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Prefix</th>
+          <th>Created</th>
+          <th>Last used</th>
+          <th>Expires</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for token in access_tokens %}
+          <tr>
+            <td class="is-wrap">{{ token.name }}</td>
+            <td class="is-mono is-muted">{{ token.token_prefix }}</td>
+            <td class="is-mono is-muted">{{ token.created_at|date:"Y-m-d" }}</td>
+            <td class="is-mono is-muted">
+              {% if token.last_used_at %}{{ token.last_used_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}
+            </td>
+            <td class="is-mono is-muted">
+              {% if token.expires_at %}{{ token.expires_at|date:"Y-m-d" }}{% else %}Never{% endif %}
+            </td>
+            <td>
+              {% if token.is_active %}
+                <span class="badge badge--info">Active</span>
+              {% else %}
+                <span class="badge badge--danger">Revoked</span>
+              {% endif %}
+            </td>
+            <td class="is-right">
+              {% if token.is_active %}
+                <form method="post" action="{% url 'revoke-access-token' token.pk %}">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn--secondary btn--sm">Revoke</button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="empty">No personal access tokens yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
 {% endblock %}

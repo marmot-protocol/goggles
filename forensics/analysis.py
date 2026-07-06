@@ -59,6 +59,27 @@ EPOCH_CHANGE_RESULT_KINDS = {"group_created", "group_evolution"}
 AGENT_EXPORT_SCHEMA_VERSION = "goggles-agent-group-state/v1"
 AGENT_EXPORT_NORMALIZED_FIELDS = normalized_field_config.agent_export_normalized_fields()
 
+# What a forensic export carries versus deliberately omits. Shared verbatim by the
+# agent-state export and the streaming group export so the two never disagree about
+# the sensitivity contract of the data they emit.
+EXPORT_SENSITIVITY = {
+    "classification": "sensitive_forensic_export",
+    "contains": [
+        "engine_ids",
+        "account_refs",
+        "group_refs",
+        "message_ids",
+        "payload_digests",
+        "relay_urls",
+    ],
+    "omits": [
+        "raw_upload_bodies",
+        "bearer_tokens",
+        "source_ips",
+        "user_agents",
+    ],
+}
+
 VIZ_PALETTE_SIZE = 8
 GROUP_REF_FULL_DISPLAY_MAX = 80
 GROUP_REF_EDGE_DISPLAY_CHARS = 32
@@ -1033,23 +1054,7 @@ def agent_state_export_for_group(group, events, audit_files):
     return {
         "schema_version": AGENT_EXPORT_SCHEMA_VERSION,
         "generated_at": timezone.now().isoformat(),
-        "sensitivity": {
-            "classification": "sensitive_forensic_export",
-            "contains": [
-                "engine_ids",
-                "account_refs",
-                "group_refs",
-                "message_ids",
-                "payload_digests",
-                "relay_urls",
-            ],
-            "omits": [
-                "raw_upload_bodies",
-                "bearer_tokens",
-                "source_ips",
-                "user_agents",
-            ],
-        },
+        "sensitivity": EXPORT_SENSITIVITY,
         "group": timeline["group"],
         "summary": group_summary(group, audit_files, events=ordered),
         "sources": [agent_source_row(audit_file) for audit_file in audit_files],
