@@ -40,8 +40,8 @@ Capacity model — size the database for it:
   once, and an export can hold one for minutes. Provision Postgres `max_connections`
   (or pooler slots) for at least `workers × threads` plus headroom for background
   tasks. If a transaction-mode pooler (e.g. PgBouncer) fronts the database it breaks
-  server-side cursors; set `DISABLE_SERVER_SIDE_CURSORS=1` in that case (memory stays
-  bounded via the query `chunk_size`).
+  server-side cursors; set `GOGGLES_DISABLE_SERVER_SIDE_CURSORS=1` in that case (reads
+  fall back to client-side chunked fetches, still bounded by the query `chunk_size`).
 - **CPU / GIL.** Serializing rows to JSON is CPU-bound and holds the GIL, so
   concurrent exports within one worker do not run in parallel — throughput is roughly
   one export per worker at a time. Scale workers (and DB connections) if concurrent

@@ -2183,7 +2183,13 @@ def delivery_identity_index(group: AuditGroup) -> dict[str, set[str]]:
     valid_events = AuditEvent.objects.filter(group=group, parse_status=AuditEvent.STATUS_VALID)
 
     def distinct_values(queryset, field: str) -> set[str]:
-        return {value for value in queryset.values_list(field, flat=True).distinct() if value}
+        # order_by() clears AuditEvent's Meta.ordering; without it those columns leak
+        # into SELECT DISTINCT (id is unique), so it dedupes per row and scans every
+        # event instead of the handful of distinct identities — the exact O(all-events)
+        # cost this function exists to avoid.
+        return {
+            value for value in queryset.order_by().values_list(field, flat=True).distinct() if value
+        }
 
     context_pubkeys = valid_events.annotate(
         context_account_pubkey_hex=KeyTextTransform("account_pubkey_hex", "context_source")

@@ -5389,6 +5389,32 @@ class DeliveryIdentityIndexTests(TestCase):
             {"account_refs": set(), "engine_ids": set(), "pubkeys_hex": set()},
         )
 
+    def test_distinct_queries_do_not_leak_auditevent_ordering(self):
+        # AuditEvent has Meta.ordering; if it leaks into SELECT DISTINCT the query
+        # dedupes per row (id is unique) and scans every event, defeating the
+        # bounded-by-cardinality guarantee. order_by() must keep it out.
+        group = AuditGroup.objects.create(name="G", slug="g", group_ref=GROUP_REF)
+        audit_file = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=1,
+            raw_text="{}",
+            validation_status=AuditFile.STATUS_VALID,
+            source_account_pubkey_hex="ff" * 32,
+        )
+        audit_file.groups.add(group)
+        for seq in range(5):  # many events, a single identity
+            self._valid_event(
+                group, audit_file, seq, account_ref=ACCOUNT_ALICE, engine_id=ENGINE_ALICE
+            )
+
+        with CaptureQueriesContext(connection) as queries:
+            index = delivery_identity_index(group)
+
+        self.assertEqual(index["account_refs"], {ACCOUNT_ALICE})
+        self.assertTrue(queries.captured_queries)
+        for query in queries.captured_queries:
+            self.assertNotIn("ORDER BY", query["sql"].upper())
+
 
 class GroupExportStreamTests(TestCase):
     """The authenticated NDJSON streaming export. See authenticated-group-export.md."""
@@ -5530,6 +5556,63 @@ class GroupExportStreamTests(TestCase):
         raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
         response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
         self.assertEqual(response.status_code, 503)
+
+    def test_unknown_group_slug_returns_404(self):
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+        response = self.client.get(
+            reverse("api-group-export-stream", kwargs={"slug": "not-a-real-slug"}),
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def _seed_prefetch_heavy_rows(self, count, evidence_event):
+        """Add `count` delivery artifacts and convergence runs, each with the related
+        rows their payloads iterate (expectations/observations, candidates/rules)."""
+        start = DeliveryArtifact.objects.filter(group=self.group).count()
+        for i in range(start, start + count):
+            artifact = DeliveryArtifact.objects.create(
+                group=self.group,
+                artifact_id=f"{i:064x}",
+                artifact_kind="application_message",
+                first_seen_ms=1_700_000_000_000 + i,
+            )
+            RecipientExpectation.objects.create(
+                artifact=artifact, recipient_scope="group", evidence_event=evidence_event
+            )
+            DeliveryObservation.objects.create(
+                artifact=artifact, engine_id=ENGINE_ALICE, latest_state="transport_received"
+            )
+            run = ConvergenceRun.objects.create(
+                group=self.group,
+                run_id=f"run-{i:04x}",
+                engine_id=ENGINE_ALICE,
+                started_at_ms=1_700_000_200_000 + i,
+            )
+            ConvergenceCandidate.objects.create(
+                run=run, branch_id=f"branch-{i}", fork_epoch=i, tip_epoch=i + 1
+            )
+            ConvergenceRuleEvaluation.objects.create(run=run, rule_name="highest_weight")
+
+    def _export_query_count(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self.url)
+            list(response.streaming_content)  # force the generator to run
+        return len(queries.captured_queries)
+
+    def test_export_query_count_is_flat_in_row_count(self):
+        # Adversarial finding #1 claimed iterator() drops prefetch_related → N+1. That
+        # is false on Django 6 when chunk_size is passed (it is): prefetch is honored,
+        # so multiplying the prefetch-heavy rows must not add queries. If a future edit
+        # drops chunk_size, this turns linear and fails.
+        event = AuditEvent.objects.filter(
+            group=self.group, parse_status=AuditEvent.STATUS_VALID
+        ).first()
+        self._seed_prefetch_heavy_rows(3, event)
+        few = self._export_query_count()
+        self._seed_prefetch_heavy_rows(9, event)  # 12 total — 4× the artifacts and runs
+        many = self._export_query_count()
+        self.assertEqual(few, many)
 
     def test_mid_stream_error_yields_error_line_and_no_eof_within_a_200(self):
         # Once the manifest is sent the status is committed at 200, so a later

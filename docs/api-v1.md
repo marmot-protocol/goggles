@@ -157,6 +157,11 @@ each section is read in its own transaction, so a record appended mid-export may
 referenced by a later section but missing from an earlier one. Re-export if a
 cross-section-consistent view matters.
 
+**Revocation is point-in-time.** Authentication is checked once, before streaming
+begins. Revoking a token (or deactivating its owner) stops the *next* request; an
+export already in flight continues to completion. Incident response should not assume
+revoke is an immediate cut-off for a stream already underway.
+
 ### Delivery
 
 - `GET /api/v1/groups/{group_slug}/delivery/`
