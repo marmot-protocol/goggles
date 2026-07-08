@@ -1,9 +1,7 @@
-from datetime import timedelta
-
 from django.core.management.base import BaseCommand, CommandError, CommandParser
-from django.utils import timezone
 
 from forensics.models import UploadToken
+from forensics.token_crypto import expiry_from_days
 
 
 class Command(BaseCommand):
@@ -24,11 +22,10 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         expires_in_days = options["expires_in_days"]
-        expires_at = None
-        if expires_in_days is not None:
-            if expires_in_days <= 0:
-                raise CommandError("--expires-in-days must be a positive integer.")
-            expires_at = timezone.now() + timedelta(days=expires_in_days)
+        try:
+            expires_at = None if expires_in_days is None else expiry_from_days(expires_in_days)
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
 
         raw_token, token = UploadToken.issue(options["name"], expires_at=expires_at)
         self.stdout.write(f"Created upload token {token.name} ({token.token_prefix})")

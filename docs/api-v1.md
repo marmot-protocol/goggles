@@ -10,6 +10,15 @@ JSONL evidence.
 All read APIs require a logged-in Goggles user. Upload APIs use reusable bearer
 tokens and are documented separately in the app workflow notes.
 
+The streaming group export additionally accepts a **personal access token** — a
+read-only bearer credential a user mints from their profile page (or an operator
+mints for a service account with `manage.py create_access_token "<name>" --user
+<username>`). Send it as `Authorization: Bearer gpat_…`. A personal access token
+authorizes only the streaming group export (below) — not uploads, and not the
+session-authenticated read APIs; it is revoked by the owner, by an admin, by expiry,
+or by deactivating the owning user. Upload tokens (`goggles_…`) and personal access
+tokens (`gpat_…`) are distinct credentials and never interchangeable.
+
 The current internal deployment treats authenticated Goggles users as one shared
 internal tenant. Even so, endpoint implementations should route through
 object-level scope checks before returning group, account, engine, message,
@@ -95,6 +104,63 @@ metadata is the field-level hook for enforcing stricter access.
 Group responses include `schema_version`, group summary fields, tab counts, and
 classification metadata indicating whether full-data audit content may be
 present.
+
+### Group Export (streaming)
+
+- `GET /api/v1/groups/{slug}/export/`
+
+Streams the complete forensic aggregate for one group as a single **NDJSON**
+download (`Content-Type: application/x-ndjson`) — one JSON object per line. Rows are
+read from the database with server-side cursors, so the response is bounded in
+server memory regardless of group size and is **not paginated**. Authenticate with a
+logged-in session or a personal access token (`Authorization: Bearer gpat_…`).
+
+The export is unconditionally the complete group: it takes **no query filters** (the
+[common filters](#common-query-parameters) do not apply — applying them to only some
+sections would misrepresent the payload, and filtering raw events would break the
+completeness the export exists to provide). Filter client-side, or use the paginated
+projection endpoints. Disabled via `GOGGLES_EXPORTS_ENABLED=0` (returns `503`).
+
+Line schema:
+
+```text
+{"t":"manifest","schema_version":"goggles-group-export/v1","generated_at":"…","group":{…},"classification":{…},"sensitivity":{…},"sections":[…]}
+{"t":"source", …}                  # one per audit file
+{"t":"event", …}                   # every valid event, uncapped
+{"t":"delivery_artifact", …}
+{"t":"network_observation", …}
+{"t":"convergence_run", …}
+{"t":"state_delta", …}
+{"t":"epoch_state_transition", …}
+{"t":"audit_data_mode_change", …}
+{"t":"eof","complete":true,"counts":{"event":N, …}}
+```
+
+`event` records use the agent-state export shape; projection records use the
+projection-API shape — the export is a tagged union of the two, discriminated by the
+leading `t` on every line. Derived aggregates (`timeline`, `messages`, `actions`,
+`action_attribution`) are intentionally excluded; reconstruct them from the raw
+records (e.g. fork resolutions are `event` records with
+`event_type == "fork_resolution"`).
+
+**Fail-closed contract.** Two distinct failure surfaces:
+
+- *Before the first byte* (authentication, unknown group, kill-switch): a
+  conventional non-`200` response (`401`/`404`/`503`). Check the HTTP status first.
+- *Mid-stream*: the status is already committed at `200`, so a later error is
+  reported in-band as a final `{"t":"error","complete":false}` line with **no**
+  `eof`. A response whose last line is not `{"t":"eof",…}` is incomplete and must be
+  discarded.
+
+**Consistency.** The export is append-time-consistent, not a single atomic snapshot:
+each section is read in its own transaction, so a record appended mid-export may be
+referenced by a later section but missing from an earlier one. Re-export if a
+cross-section-consistent view matters.
+
+**Revocation is point-in-time.** Authentication is checked once, before streaming
+begins. Revoking a token (or deactivating its owner) stops the *next* request; an
+export already in flight continues to completion. Incident response should not assume
+revoke is an immediate cut-off for a stream already underway.
 
 ### Delivery
 

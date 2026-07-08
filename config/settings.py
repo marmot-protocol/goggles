@@ -247,6 +247,12 @@ DATABASES = {
 }
 if not DEBUG and DATABASES["default"]["ENGINE"] == "django.db.backends.sqlite3":
     raise ImproperlyConfigured("Production DATABASE_URL must not use SQLite.")
+# Transaction-pooling connection poolers (e.g. PgBouncer) are incompatible with
+# Postgres server-side cursors, which the streaming export relies on. Set this behind
+# such a pooler; streaming reads then fall back to client-side chunked fetches, still
+# bounded by the query chunk_size. See docs/deployment.md.
+if env_bool("GOGGLES_DISABLE_SERVER_SIDE_CURSORS", False):
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -271,6 +277,10 @@ LOGOUT_REDIRECT_URL = "login"
 
 GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
+# Operational kill-switch for the streaming group-export endpoint, mirroring the
+# upload toggle. Lets an operator shed a resource-intensive read surface without a
+# redeploy.
+GOGGLES_EXPORTS_ENABLED = env_bool("GOGGLES_EXPORTS_ENABLED", True)
 DATA_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 FILE_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
 # The upload endpoint only ever ingests a single file part, and every part at

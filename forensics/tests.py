@@ -26,6 +26,7 @@ from . import analysis as analysis_module
 from . import ingest as ingest_module
 from . import projections as projections_module
 from .analysis import (
+    EXPORT_SENSITIVITY,
     audit_files_for_group,
     display_group_ref,
     group_list_rows,
@@ -51,18 +52,24 @@ from .models import (
     DeliveryObservation,
     EpochStateTransition,
     NetworkObservation,
+    PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
     UploadToken,
 )
 from .seed_data import SCENARIO_GROUPS, build_dev_scenario, group_ref_for
+from .streaming import ExportSection, stream_ndjson
+from .token_crypto import MAX_TOKEN_EXPIRY_DAYS, expiry_from_days
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     GROUP_DETAIL_TAB_EVENT_LIMIT,
     GROUP_EPOCH_FIELDS,
+    GROUP_EXPORT_SCHEMA_VERSION,
+    GROUP_PROJECTION_API_DEFAULT_LIMIT,
     RAW_TEXT_PREVIEW_CHARS,
     audit_bytes_from_request,
     client_ip,
+    delivery_identity_index,
     group_api_payload,
     group_detail_shell_context,
     group_engine_rows,
@@ -5097,6 +5104,15 @@ class UploadTokenLifecycleTests(TestCase):
         self.assertIsNone(token.expires_at)
         self.assertIn("does not expire", out.getvalue())
 
+    def test_create_upload_token_command_rejects_over_max_expiry_cleanly(self):
+        # Shares the bounded expiry helper with the export tokens: an overflow-scale
+        # day count is a clean CommandError, not an uncaught OverflowError (PR #199).
+        with self.assertRaises(CommandError):
+            call_command(
+                "create_upload_token", "ios qa", "--expires-in-days", str(MAX_TOKEN_EXPIRY_DAYS + 1)
+            )
+        self.assertFalse(UploadToken.objects.filter(name="ios qa").exists())
+
     @override_settings(GOGGLES_UPLOADS_ENABLED=False)
     def test_global_upload_pause_rejects_authenticated_upload_without_ingesting(self):
         raw_token, token = UploadToken.issue("ios qa")
@@ -5108,6 +5124,676 @@ class UploadTokenLifecycleTests(TestCase):
         self.assertEqual(AuditFile.objects.count(), 0)
         token.refresh_from_db()
         self.assertIsNone(token.last_used_at)
+
+
+class PersonalAccessTokenTests(TestCase):
+    """The user-owned, read-only credential the streaming export accepts.
+
+    Distinct from UploadToken: self-service, read-only, and only as live as its
+    owner. See authenticated-group-export.md. The shared hashing/rekey/expiry
+    mechanics live in token_crypto and are exercised via UploadToken elsewhere;
+    these tests cover the PersonalAccessToken-specific contract.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="reader",
+            password="correct horse battery staple",
+        )
+
+    def test_issue_returns_gpat_prefixed_token_and_stores_only_the_hash(self):
+        raw_token, token = PersonalAccessToken.issue("cgka laptop", user=self.user)
+
+        self.assertTrue(raw_token.startswith("gpat_"))
+        self.assertEqual(token.user, self.user)
+        # The raw secret is shown once and never persisted; only its hash is stored.
+        secret = raw_token.split("_", 2)[2]
+        self.assertNotIn(secret, token.token_hash)
+        self.assertEqual(token.token_hash, PersonalAccessToken.objects.get(pk=token.pk).token_hash)
+
+    def test_issued_lookup_prefix_fills_the_field_without_exceeding_it(self):
+        # PR #199: the lookup prefix is 16 hex chars (64 bits), filling
+        # token_prefix's max_length=16 — wide enough that an accidental
+        # unique-collision on issuance (which does not retry) is negligible.
+        _raw_token, token = PersonalAccessToken.issue("prefix width", user=self.user)
+        field_max = PersonalAccessToken._meta.get_field("token_prefix").max_length
+        self.assertEqual(len(token.token_prefix), 16)
+        self.assertLessEqual(len(token.token_prefix), field_max)
+
+    def test_authenticate_round_trips_a_freshly_issued_token(self):
+        raw_token, token = PersonalAccessToken.issue("cgka laptop", user=self.user)
+        self.assertEqual(PersonalAccessToken.authenticate(raw_token).pk, token.pk)
+
+    def test_inactive_token_is_rejected(self):
+        raw_token, token = PersonalAccessToken.issue("revoked", user=self.user)
+        token.is_active = False
+        token.save(update_fields=["is_active"])
+        self.assertIsNone(PersonalAccessToken.authenticate(raw_token))
+
+    def test_expired_token_is_rejected(self):
+        raw_token, _token = PersonalAccessToken.issue(
+            "stale", user=self.user, expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        self.assertIsNone(PersonalAccessToken.authenticate(raw_token))
+
+    def test_token_of_deactivated_user_is_rejected(self):
+        # A token is only as live as its owner — unique to PersonalAccessToken.
+        raw_token, _token = PersonalAccessToken.issue("cgka laptop", user=self.user)
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertIsNone(PersonalAccessToken.authenticate(raw_token))
+
+    def test_upload_and_personal_tokens_never_cross_authenticate(self):
+        # Distinct type prefixes (goggles_ vs gpat_) make the two families
+        # structurally un-confusable at authenticate().
+        upload_raw, _token = UploadToken.issue("device")
+        pat_raw, _pat = PersonalAccessToken.issue("laptop", user=self.user)
+
+        self.assertIsNone(PersonalAccessToken.authenticate(upload_raw))
+        self.assertIsNone(UploadToken.authenticate(pat_raw))
+
+    def test_mark_used_records_last_used_at_without_revoking(self):
+        _raw_token, token = PersonalAccessToken.issue("cgka laptop", user=self.user)
+        self.assertIsNone(token.last_used_at)
+
+        token.mark_used()
+
+        token.refresh_from_db()
+        self.assertIsNotNone(token.last_used_at)
+        self.assertTrue(token.is_active)
+
+
+class StreamNdjsonTests(SimpleTestCase):
+    """The domain-blind NDJSON serializer: manifest-first, typed rows, and a
+    fail-closed eof/error terminator. See forensics/streaming.py."""
+
+    @staticmethod
+    def _rows(items, *, raise_at=None):
+        """A minimal QuerySet stand-in exposing just ``.iterator(chunk_size=)``."""
+
+        class _FakeRows:
+            def iterator(self, chunk_size):
+                # The serializer must always pass a chunk_size — prefetch_related
+                # querysets require it under .iterator().
+                assert chunk_size, "stream_ndjson must forward a chunk_size"
+                for index, item in enumerate(items):
+                    if raise_at is not None and index == raise_at:
+                        raise RuntimeError("db cursor died mid-stream")
+                    yield item
+
+        return _FakeRows()
+
+    def _records(self, manifest, sections):
+        return [json.loads(line) for line in stream_ndjson(manifest, sections)]
+
+    def test_manifest_first_then_typed_rows_then_eof_with_counts(self):
+        sections = [
+            ExportSection("event", self._rows([{"id": 1}, {"id": 2}]), lambda row: row),
+            ExportSection("source", self._rows([{"id": 9}]), lambda row: row),
+        ]
+
+        records = self._records({"schema_version": "goggles-group-export/v1"}, sections)
+
+        self.assertEqual(records[0]["t"], "manifest")
+        self.assertEqual(records[0]["schema_version"], "goggles-group-export/v1")
+        self.assertEqual([r["t"] for r in records[1:4]], ["event", "event", "source"])
+        self.assertEqual(
+            records[-1],
+            {"t": "eof", "complete": True, "counts": {"event": 2, "source": 1}},
+        )
+
+    def test_empty_section_still_reports_complete_with_zero_count(self):
+        records = self._records({}, [ExportSection("event", self._rows([]), lambda row: row)])
+        self.assertEqual(records[-1], {"t": "eof", "complete": True, "counts": {"event": 0}})
+
+    def test_mid_stream_error_yields_error_line_and_no_eof(self):
+        sections = [
+            ExportSection("event", self._rows([{"id": 1}, {"id": 2}], raise_at=1), lambda row: row),
+        ]
+
+        with self.assertLogs("forensics.streaming", level="ERROR"):
+            records = self._records({}, sections)
+
+        self.assertEqual(records[1], {"t": "event", "id": 1})  # the row before the failure streamed
+        self.assertEqual(records[-1], {"t": "error", "complete": False})
+        self.assertNotIn("eof", [record["t"] for record in records])
+
+    def test_t_discriminator_leads_every_line(self):
+        # No sort_keys: a consumer may route by the line's leading key.
+        lines = list(
+            stream_ndjson(
+                {"schema_version": "goggles-group-export/v1"},
+                [ExportSection("event", self._rows([{"z": 1}]), lambda row: row)],
+            )
+        )
+        for line in lines:
+            self.assertTrue(line.startswith('{"t":'), line)
+
+
+class TokenExpiryFromDaysTests(SimpleTestCase):
+    """The shared bounded expiry helper (PR #199): a positive, sane day count →
+    future datetime; non-positive, over-ceiling, or overflow-scale → ValueError
+    raised *before* any timedelta arithmetic, so it never leaks an OverflowError."""
+
+    def test_positive_days_within_bound_returns_future_datetime(self):
+        before = timezone.now()
+        self.assertGreaterEqual(expiry_from_days(7), before + timedelta(days=7))
+
+    def test_ceiling_is_allowed(self):
+        self.assertIsNotNone(expiry_from_days(MAX_TOKEN_EXPIRY_DAYS))
+
+    def test_rejects_non_positive(self):
+        for days in (0, -1):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                expiry_from_days(days)
+
+    def test_rejects_over_ceiling_and_overflow_scale_as_valueerror(self):
+        # 99_999_999_999 would raise OverflowError at timedelta(); the bound check
+        # must catch it as a ValueError first.
+        for days in (MAX_TOKEN_EXPIRY_DAYS + 1, 99_999_999_999):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                expiry_from_days(days)
+
+
+class DeliveryIdentityIndexTests(TestCase):
+    """delivery_identity_index collects distinct identities via bounded SQL, not a
+    Python scan of every event (B1 in authenticated-group-export.md). Output must
+    match the previous implementation exactly — it is shared with the delivery tab.
+    """
+
+    def _valid_event(self, group, audit_file, seq, **fields):
+        return AuditEvent.objects.create(
+            audit_file=audit_file,
+            group=group,
+            line_number=seq,
+            line_hash=f"{seq:064d}",
+            raw_line="{}",
+            parse_status=AuditEvent.STATUS_VALID,
+            event_type="transport_received",
+            group_ref=GROUP_REF,
+            seq=seq,
+            wall_time_ms=1_700_000_000_000 + seq,
+            **fields,
+        )
+
+    def test_collects_distinct_identities_from_events_files_and_context(self):
+        group = AuditGroup.objects.create(name="G", slug="g", group_ref=GROUP_REF)
+        file_with_pubkey = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=1,
+            raw_text="{}",
+            validation_status=AuditFile.STATUS_VALID,
+            source_account_pubkey_hex="ff" * 32,
+        )
+        file_with_pubkey.groups.add(group)
+        plain_file = AuditFile.objects.create(
+            file_sha256="b" * 64,
+            byte_size=1,
+            raw_text="{}",
+            validation_status=AuditFile.STATUS_VALID,
+        )
+        plain_file.groups.add(group)
+
+        # Duplicates across events collapse; the account pubkey is drawn from both
+        # the backing file and the event's context_source JSON.
+        self._valid_event(
+            group, file_with_pubkey, 1, account_ref=ACCOUNT_ALICE, engine_id=ENGINE_ALICE
+        )
+        self._valid_event(
+            group, file_with_pubkey, 2, account_ref=ACCOUNT_ALICE, engine_id=ENGINE_ALICE
+        )
+        self._valid_event(
+            group,
+            plain_file,
+            3,
+            account_ref=ACCOUNT_BOB,
+            engine_id=ENGINE_BOB,
+            context_source={"account_pubkey_hex": "cc" * 32},
+        )
+        # An event with blank identity fields contributes nothing.
+        self._valid_event(group, plain_file, 4)
+
+        index = delivery_identity_index(group)
+
+        self.assertEqual(index["account_refs"], {ACCOUNT_ALICE, ACCOUNT_BOB})
+        self.assertEqual(index["engine_ids"], {ENGINE_ALICE, ENGINE_BOB})
+        self.assertEqual(index["pubkeys_hex"], {"ff" * 32, "cc" * 32})
+
+    def test_ignores_invalid_events(self):
+        group = AuditGroup.objects.create(name="G", slug="g", group_ref=GROUP_REF)
+        audit_file = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=1,
+            raw_text="{}",
+            validation_status=AuditFile.STATUS_VALID,
+            source_account_pubkey_hex="ff" * 32,
+        )
+        audit_file.groups.add(group)
+        AuditEvent.objects.create(
+            audit_file=audit_file,
+            group=group,
+            line_number=1,
+            line_hash="1".ljust(64, "0"),
+            raw_line="{}",
+            parse_status=AuditEvent.STATUS_INVALID,
+            event_type="transport_received",
+            account_ref=ACCOUNT_ALICE,
+            engine_id=ENGINE_ALICE,
+            group_ref=GROUP_REF,
+            seq=1,
+            wall_time_ms=1,
+        )
+
+        self.assertEqual(
+            delivery_identity_index(group),
+            {"account_refs": set(), "engine_ids": set(), "pubkeys_hex": set()},
+        )
+
+    def test_distinct_queries_do_not_leak_auditevent_ordering(self):
+        # AuditEvent has Meta.ordering; if it leaks into SELECT DISTINCT the query
+        # dedupes per row (id is unique) and scans every event, defeating the
+        # bounded-by-cardinality guarantee. order_by() must keep it out.
+        group = AuditGroup.objects.create(name="G", slug="g", group_ref=GROUP_REF)
+        audit_file = AuditFile.objects.create(
+            file_sha256="a" * 64,
+            byte_size=1,
+            raw_text="{}",
+            validation_status=AuditFile.STATUS_VALID,
+            source_account_pubkey_hex="ff" * 32,
+        )
+        audit_file.groups.add(group)
+        for seq in range(5):  # many events, a single identity
+            self._valid_event(
+                group, audit_file, seq, account_ref=ACCOUNT_ALICE, engine_id=ENGINE_ALICE
+            )
+
+        with CaptureQueriesContext(connection) as queries:
+            index = delivery_identity_index(group)
+
+        self.assertEqual(index["account_refs"], {ACCOUNT_ALICE})
+        self.assertTrue(queries.captured_queries)
+        for query in queries.captured_queries:
+            self.assertNotIn("ORDER BY", query["sql"].upper())
+
+
+class GroupExportStreamTests(TestCase):
+    """The authenticated NDJSON streaming export. See authenticated-group-export.md."""
+
+    def setUp(self):
+        ingest_audit_log_bytes(dump_bytes=representative_audit_log().encode("utf-8"))
+        self.group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.url = reverse("api-group-export-stream", kwargs={"slug": self.group.slug})
+
+    @staticmethod
+    def _records(response):
+        body = b"".join(response.streaming_content).decode("utf-8")
+        return [json.loads(line) for line in body.splitlines() if line]
+
+    def test_requires_authentication(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_invalid_bearer_token(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Bearer gpat_deadbeef_nope")
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_expired_personal_access_token(self):
+        raw_token, _token = PersonalAccessToken.issue(
+            "stale", user=self.user, expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_upload_token_cannot_read_the_export(self):
+        # Least privilege: an upload credential can never read forensic data.
+        raw_token, _token = UploadToken.issue("device")
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_streams_with_personal_access_token_and_records_last_used(self):
+        raw_token, token = PersonalAccessToken.issue("cgka", user=self.user)
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/x-ndjson")
+        self.assertIn("attachment", response["Content-Disposition"])
+        self.assertEqual(response["Cache-Control"], "no-store")
+        records = self._records(response)
+        self.assertEqual(records[0]["t"], "manifest")
+        self.assertEqual(records[-1]["t"], "eof")
+        self.assertTrue(records[-1]["complete"])
+        token.refresh_from_db()
+        self.assertIsNotNone(token.last_used_at)
+
+    def test_streams_with_logged_in_session(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        records = self._records(self.client.get(self.url))
+
+        self.assertEqual(records[0]["t"], "manifest")
+        self.assertEqual(records[-1]["t"], "eof")
+
+    def test_manifest_advertises_sections_and_eof_counts_are_accurate(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        records = self._records(self.client.get(self.url))
+
+        manifest, eof = records[0], records[-1]
+        self.assertEqual(manifest["schema_version"], GROUP_EXPORT_SCHEMA_VERSION)
+        self.assertEqual(manifest["sensitivity"], EXPORT_SENSITIVITY)
+        # The export is unconditionally complete: it advertises no filter contract.
+        self.assertNotIn("filters", manifest)
+
+        # Advertised sections are exactly the record types the stream can emit,
+        # and eof.counts match the rows actually streamed.
+        body_records = records[1:-1]
+        for record_type, count in eof["counts"].items():
+            self.assertIn(record_type, manifest["sections"])
+            self.assertEqual(sum(1 for record in body_records if record["t"] == record_type), count)
+        # The representative log yields at least its source file and its events.
+        self.assertGreaterEqual(eof["counts"]["source"], 1)
+        self.assertGreaterEqual(eof["counts"]["event"], 1)
+
+    def test_streams_every_row_past_the_projection_page_cap(self):
+        # The paginated projections API caps a section at GROUP_PROJECTION_API_DEFAULT_LIMIT
+        # (500). The export must stream every row — this is its reason to exist.
+        over_cap = GROUP_PROJECTION_API_DEFAULT_LIMIT + 1
+        evidence_event = AuditEvent.objects.filter(
+            group=self.group, parse_status=AuditEvent.STATUS_VALID
+        ).first()
+        StateDelta.objects.bulk_create(
+            [
+                StateDelta(
+                    group=self.group,
+                    audit_event=evidence_event,
+                    epoch=i,
+                    change_kind=f"state-marker-{i:04d}",
+                    wall_time_ms=1_700_000_300_000 + i,
+                )
+                for i in range(over_cap)
+            ]
+        )
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        records = self._records(self.client.get(self.url))
+
+        self.assertGreaterEqual(records[-1]["counts"]["state_delta"], over_cap)
+
+    def test_query_filters_are_ignored_export_is_always_complete(self):
+        # Regression (PR #199): the manifest advertised filters that only some
+        # sections honored — projections were filtered while events/sources were not,
+        # and severity/convergence message_id were dropped entirely. The export now
+        # ignores query filters: the same complete group whether or not they are sent.
+        alice_event = AuditEvent.objects.filter(
+            group=self.group, parse_status=AuditEvent.STATUS_VALID, engine_id=ENGINE_ALICE
+        ).first()
+        StateDelta.objects.create(
+            group=self.group,
+            audit_event=alice_event,
+            epoch=0,
+            change_kind="group_renamed",
+            wall_time_ms=1_700_000_300_000,
+        )
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        unfiltered = self._records(self.client.get(self.url))
+        # A real engine filter that only projections honored would drop the state_delta
+        # above (its event is ENGINE_ALICE), leaving events untouched — the old split.
+        filtered = self._records(
+            self.client.get(self.url, {"engine_id": "ff" * 16, "severity": "error"})
+        )
+
+        self.assertNotIn("filters", unfiltered[0])
+        self.assertEqual(unfiltered[-1]["counts"], filtered[-1]["counts"])
+        self.assertGreaterEqual(unfiltered[-1]["counts"]["state_delta"], 1)
+
+    @override_settings(GOGGLES_EXPORTS_ENABLED=False)
+    def test_disabled_export_returns_503(self):
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 503)
+
+    def test_unknown_group_slug_returns_404(self):
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+        response = self.client.get(
+            reverse("api-group-export-stream", kwargs={"slug": "not-a-real-slug"}),
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def _seed_prefetch_heavy_rows(self, count, evidence_event):
+        """Add `count` delivery artifacts and convergence runs, each with the related
+        rows their payloads iterate (expectations/observations, candidates/rules)."""
+        start = DeliveryArtifact.objects.filter(group=self.group).count()
+        for i in range(start, start + count):
+            artifact = DeliveryArtifact.objects.create(
+                group=self.group,
+                artifact_id=f"{i:064x}",
+                artifact_kind="application_message",
+                first_seen_ms=1_700_000_000_000 + i,
+            )
+            RecipientExpectation.objects.create(
+                artifact=artifact, recipient_scope="group", evidence_event=evidence_event
+            )
+            DeliveryObservation.objects.create(
+                artifact=artifact, engine_id=ENGINE_ALICE, latest_state="transport_received"
+            )
+            run = ConvergenceRun.objects.create(
+                group=self.group,
+                run_id=f"run-{i:04x}",
+                engine_id=ENGINE_ALICE,
+                started_at_ms=1_700_000_200_000 + i,
+            )
+            ConvergenceCandidate.objects.create(
+                run=run, branch_id=f"branch-{i}", fork_epoch=i, tip_epoch=i + 1
+            )
+            ConvergenceRuleEvaluation.objects.create(run=run, rule_name="highest_weight")
+
+    def _export_query_count(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self.url)
+            list(response.streaming_content)  # force the generator to run
+        return len(queries.captured_queries)
+
+    def test_export_query_count_is_flat_in_row_count(self):
+        # Adversarial finding #1 claimed iterator() drops prefetch_related → N+1. That
+        # is false on Django 6 when chunk_size is passed (it is): prefetch is honored,
+        # so multiplying the prefetch-heavy rows must not add queries. If a future edit
+        # drops chunk_size, this turns linear and fails.
+        event = AuditEvent.objects.filter(
+            group=self.group, parse_status=AuditEvent.STATUS_VALID
+        ).first()
+        self._seed_prefetch_heavy_rows(3, event)
+        few = self._export_query_count()
+        self._seed_prefetch_heavy_rows(9, event)  # 12 total — 4× the artifacts and runs
+        many = self._export_query_count()
+        self.assertEqual(few, many)
+
+    def test_mid_stream_error_yields_error_line_and_no_eof_within_a_200(self):
+        # Once the manifest is sent the status is committed at 200, so a later
+        # failure can only be signalled in-band: an error line and no eof (M4).
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        with mock.patch(
+            "forensics.views.agent_event_row",
+            side_effect=RuntimeError("db cursor died mid-stream"),
+        ):
+            with self.assertLogs("forensics.streaming", level="ERROR"):
+                response = self.client.get(self.url)
+                records = self._records(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(records[0]["t"], "manifest")
+        # Rows emitted before the failure still streamed (sources precede events).
+        self.assertTrue(any(record["t"] == "source" for record in records))
+        self.assertEqual(records[-1], {"t": "error", "complete": False})
+        self.assertNotIn("eof", {record["t"] for record in records})
+
+
+class ProfileAccessTokenTests(TestCase):
+    """Self-service personal access tokens on the profile page — strictly
+    owner-scoped: a user can only see, mint, and revoke their own."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.other = User.objects.create_user(
+            username="other", password="correct horse battery staple"
+        )
+        self.client.login(username="reader", password="correct horse battery staple")
+
+    def test_profile_lists_only_the_callers_tokens(self):
+        _raw, mine = PersonalAccessToken.issue("mine-laptop", user=self.user)
+        PersonalAccessToken.issue("their-laptop", user=self.other)
+
+        response = self.client.get(reverse("profile"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "mine-laptop")
+        self.assertNotContains(response, "their-laptop")
+        self.assertEqual(list(response.context["access_tokens"]), [mine])
+
+    def test_create_token_shows_secret_once_and_owns_it(self):
+        response = self.client.post(reverse("create-access-token"), {"name": "cgka pipeline"})
+
+        self.assertEqual(response.status_code, 200)
+        # The page shows the raw secret once, so it must not be cached anywhere.
+        self.assertEqual(response["Cache-Control"], "no-store")
+        token = PersonalAccessToken.objects.get(user=self.user, name="cgka pipeline")
+        raw_token = response.context["new_token"]
+        self.assertTrue(raw_token.startswith("gpat_"))
+        self.assertContains(response, raw_token)  # shown exactly once, in the page
+        self.assertEqual(PersonalAccessToken.authenticate(raw_token).pk, token.pk)
+
+    def test_create_token_honors_optional_expiry(self):
+        before = timezone.now()
+        self.client.post(reverse("create-access-token"), {"name": "temp", "expires_in_days": "7"})
+        token = PersonalAccessToken.objects.get(user=self.user, name="temp")
+        self.assertIsNotNone(token.expires_at)
+        self.assertGreaterEqual(token.expires_at, before + timedelta(days=7))
+
+    def test_create_token_defaults_to_no_expiry(self):
+        self.client.post(reverse("create-access-token"), {"name": "forever"})
+        token = PersonalAccessToken.objects.get(user=self.user, name="forever")
+        self.assertIsNone(token.expires_at)
+
+    def test_create_token_rejects_invalid_expiry_and_mints_nothing(self):
+        # Regression (PR #199): a crafted POST bypasses the input's min=1, so a
+        # non-positive, unparseable, or absurdly large expiry must be rejected — never
+        # silently minting a permanent read credential, and never crashing on the
+        # OverflowError a huge day count would otherwise raise. Blank still means "never
+        # expires" (tested above).
+        for bad_value in ("0", "-5", "abc", "99999999999"):
+            with self.subTest(expires_in_days=bad_value):
+                response = self.client.post(
+                    reverse("create-access-token"),
+                    {"name": "sneaky", "expires_in_days": bad_value},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(
+                    PersonalAccessToken.objects.filter(user=self.user, name="sneaky").exists()
+                )
+
+    def test_revoke_deactivates_own_token(self):
+        _raw, token = PersonalAccessToken.issue("mine", user=self.user)
+
+        response = self.client.post(reverse("revoke-access-token", kwargs={"pk": token.pk}))
+
+        self.assertRedirects(response, reverse("profile"))
+        token.refresh_from_db()
+        self.assertFalse(token.is_active)
+
+    def test_cannot_revoke_another_users_token(self):
+        _raw, victim = PersonalAccessToken.issue("theirs", user=self.other)
+
+        response = self.client.post(reverse("revoke-access-token", kwargs={"pk": victim.pk}))
+
+        self.assertEqual(response.status_code, 404)
+        victim.refresh_from_db()
+        self.assertTrue(victim.is_active)
+
+    def test_token_endpoints_require_login(self):
+        self.client.logout()
+
+        response = self.client.post(reverse("create-access-token"), {"name": "x"})
+
+        self.assertEqual(response.status_code, 302)  # redirect to login
+        self.assertEqual(PersonalAccessToken.objects.count(), 0)
+
+    def test_password_change_still_works_after_refactor(self):
+        response = self.client.post(
+            reverse("profile"),
+            {
+                "old_password": "correct horse battery staple",
+                "new_password1": "a-fresh-passphrase-9271",
+                "new_password2": "a-fresh-passphrase-9271",
+            },
+        )
+
+        self.assertRedirects(response, reverse("profile"))
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("a-fresh-passphrase-9271"))
+
+
+class CreateAccessTokenCommandTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="svc-cgka", password="correct horse battery staple"
+        )
+
+    def test_creates_read_token_owned_by_named_user(self):
+        out = StringIO()
+        call_command("create_access_token", "cgka pipeline", "--user", "svc-cgka", stdout=out)
+
+        token = PersonalAccessToken.objects.get(name="cgka pipeline")
+        self.assertEqual(token.user, self.user)
+        self.assertIsNone(token.expires_at)
+        raw_token = out.getvalue().strip().splitlines()[-1]
+        self.assertTrue(raw_token.startswith("gpat_"))
+        self.assertEqual(PersonalAccessToken.authenticate(raw_token).pk, token.pk)
+
+    def test_expiry_flag_sets_expires_at(self):
+        out = StringIO()
+        before = timezone.now()
+        call_command(
+            "create_access_token",
+            "temp",
+            "--user",
+            "svc-cgka",
+            "--expires-in-days",
+            "7",
+            stdout=out,
+        )
+        token = PersonalAccessToken.objects.get(name="temp")
+        self.assertGreaterEqual(token.expires_at, before + timedelta(days=7))
+
+    def test_unknown_user_errors(self):
+        with self.assertRaises(CommandError):
+            call_command("create_access_token", "x", "--user", "nobody")
+
+    def test_non_positive_expiry_errors(self):
+        with self.assertRaises(CommandError):
+            call_command("create_access_token", "x", "--user", "svc-cgka", "--expires-in-days", "0")
+
+    def test_over_max_expiry_errors_cleanly(self):
+        # A day count that would overflow timedelta/datetime is rejected as a clean
+        # CommandError, not an uncaught OverflowError (PR #199).
+        with self.assertRaises(CommandError):
+            call_command(
+                "create_access_token",
+                "x",
+                "--user",
+                "svc-cgka",
+                "--expires-in-days",
+                str(MAX_TOKEN_EXPIRY_DAYS + 1),
+            )
+        self.assertFalse(PersonalAccessToken.objects.filter(name="x").exists())
 
 
 class PurgeAuditDataCommandTests(TestCase):

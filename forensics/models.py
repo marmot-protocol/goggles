@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
-import secrets
 from datetime import datetime
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import models
 from django.utils import timezone
+
+from . import token_crypto
 
 
 class AuditGroup(models.Model):
@@ -51,78 +50,90 @@ class UploadToken(models.Model):
 
     @classmethod
     def issue(cls, name: str, expires_at: datetime | None = None) -> tuple[str, UploadToken]:
-        prefix = secrets.token_hex(4)
-        secret = secrets.token_urlsafe(32)
-        raw_token = f"{cls.TOKEN_PREFIX}_{prefix}_{secret}"
+        raw_token, lookup_prefix, secret = token_crypto.generate_raw_token(cls.TOKEN_PREFIX)
         token = cls.objects.create(
             name=name,
-            token_prefix=prefix,
-            token_hash=cls.hash_secret(secret),
+            token_prefix=lookup_prefix,
+            token_hash=token_crypto.hash_secret(secret),
             expires_at=expires_at,
         )
         return raw_token, token
 
     @classmethod
     def hash_secret(cls, secret: str, *, key: str | None = None) -> str:
-        # Keyed on GOGGLES_TOKEN_HASH_KEY (a dedicated, independently
-        # rotatable secret) rather than SECRET_KEY, so rotating the Django
-        # signing key does not invalidate every issued upload token. The
-        # setting falls back to SECRET_KEY when unset, preserving existing
-        # hashes for deployments that have not provisioned a dedicated key.
-        hash_key = key or settings.GOGGLES_TOKEN_HASH_KEY
-        return hmac.new(
-            hash_key.encode("utf-8"), secret.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-
-    @classmethod
-    def legacy_hash_keys(cls) -> tuple[str, ...]:
-        """Return fallback keys for one-way lazy migration of legacy hashes.
-
-        Before GOGGLES_TOKEN_HASH_KEY existed, token hashes were keyed on
-        SECRET_KEY. During the first dedicated-key cutover, an active token can
-        be authenticated against that legacy hash and then rekeyed to the
-        dedicated setting.
-        """
-        if settings.SECRET_KEY and settings.SECRET_KEY != settings.GOGGLES_TOKEN_HASH_KEY:
-            return (settings.SECRET_KEY,)
-        return ()
+        return token_crypto.hash_secret(secret, key=key)
 
     def is_expired(self, *, at: datetime | None = None) -> bool:
-        if self.expires_at is None:
-            return False
-        return (at or timezone.now()) >= self.expires_at
+        return token_crypto.is_expired(self, at=at)
 
     @classmethod
     def authenticate(cls, raw_token: str | None) -> UploadToken | None:
-        if not raw_token:
-            return None
-        parts = raw_token.split("_", 2)
-        if len(parts) != 3 or parts[0] != cls.TOKEN_PREFIX:
-            return None
-        _, prefix, secret = parts
-        try:
-            token = cls.objects.get(token_prefix=prefix, is_active=True)
-        except cls.DoesNotExist:
-            return None
+        return token_crypto.authenticate(cls, raw_token, cls.TOKEN_PREFIX)
 
-        current_hash = cls.hash_secret(secret)
-        matched_legacy_key = False
-        if not hmac.compare_digest(token.token_hash, current_hash):
-            for legacy_key in cls.legacy_hash_keys():
-                legacy_hash = cls.hash_secret(secret, key=legacy_key)
-                if hmac.compare_digest(token.token_hash, legacy_hash):
-                    matched_legacy_key = True
-                    break
-            else:
-                return None
+    def mark_used(self) -> None:
+        self.last_used_at = timezone.now()
+        self.save(update_fields=["last_used_at"])
 
-        if token.is_expired():
+
+class PersonalAccessToken(models.Model):
+    """A user-owned, read-only API credential, self-service from the profile page.
+
+    Distinct from :class:`UploadToken`: that authorizes a device to *upload*; this
+    authorizes a person to *read/export*. The two never overlap — separate tables
+    and separate raw-token type prefixes, enforced at ``authenticate``.
+    """
+
+    TOKEN_PREFIX = "gpat"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="access_tokens",
+    )
+    name = models.CharField(max_length=120)
+    token_prefix = models.CharField(max_length=16, unique=True)
+    token_hash = models.CharField(max_length=128)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Optional expiry. Null means the token never expires.",
+    )
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["user", "name", "token_prefix"]
+
+    def __str__(self) -> str:
+        state = "active" if self.is_active else "disabled"
+        return f"{self.name} ({self.token_prefix}, {state})"
+
+    @classmethod
+    def issue(
+        cls, name: str, *, user, expires_at: datetime | None = None
+    ) -> tuple[str, PersonalAccessToken]:
+        raw_token, lookup_prefix, secret = token_crypto.generate_raw_token(cls.TOKEN_PREFIX)
+        token = cls.objects.create(
+            user=user,
+            name=name,
+            token_prefix=lookup_prefix,
+            token_hash=token_crypto.hash_secret(secret),
+            expires_at=expires_at,
+        )
+        return raw_token, token
+
+    def is_expired(self, *, at: datetime | None = None) -> bool:
+        return token_crypto.is_expired(self, at=at)
+
+    @classmethod
+    def authenticate(cls, raw_token: str | None) -> PersonalAccessToken | None:
+        token = token_crypto.authenticate(cls, raw_token, cls.TOKEN_PREFIX)
+        # A token is only as live as its owner: deactivating a user immediately
+        # revokes their tokens. This check is model-specific (UploadToken has no
+        # owner), so it lives here rather than in the shared helper.
+        if token is not None and not token.user.is_active:
             return None
-
-        if matched_legacy_key:
-            token.token_hash = current_hash
-            token.save(update_fields=["token_hash"])
-
         return token
 
     def mark_used(self) -> None:
