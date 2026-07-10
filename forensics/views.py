@@ -67,8 +67,8 @@ AUDIT_FILE_EVENT_PAGE_SIZE = 100
 RAW_TEXT_PREVIEW_CHARS = 32 * 1024
 GROUP_ENGINE_PREVIEW_LIMIT = 12
 GROUP_DETAIL_TAB_EVENT_LIMIT = 100
-GROUP_PROJECTION_API_DEFAULT_LIMIT = 500
-GROUP_PROJECTION_API_MAX_LIMIT = 5_000
+GROUP_PROJECTION_API_DEFAULT_LIMIT = 100
+GROUP_PROJECTION_API_MAX_LIMIT = 500
 GROUP_EXPORT_SCHEMA_VERSION = "goggles-group-export/v1"
 FULL_DATA_AUDIT_MODE = "full_data"
 ERROR_SEVERITY_TOKENS = (
@@ -104,6 +104,43 @@ GROUP_DETAIL_TAB_TEMPLATES = {
     "evidence": "forensics/partials/group_evidence.html",
     "exports": "forensics/partials/group_exports.html",
 }
+
+# Event list/projection responses render normalized summaries and evidence
+# references, never the verbatim line or parsed source object. Keep the heavy
+# evidence columns out of every bulk queryset; the single-event evidence API is
+# the intentionally narrow exception.
+HEAVY_EVENT_FIELDS = {
+    "raw_line",
+    "raw_event",
+    "raw_kind",
+    "raw_context",
+    "context_human_action",
+    "context_transport",
+    "context_engine",
+    "context_group",
+    "context_convergence",
+    "context_source",
+}
+EVENT_ROW_FIELDS = tuple(
+    field.name
+    for field in AuditEvent._meta.local_concrete_fields
+    if field.name not in HEAVY_EVENT_FIELDS
+)
+EVIDENCE_REF_EVENT_FIELDS = (
+    "id",
+    "audit_file_id",
+    "line_number",
+    "line_hash",
+    "schema_version",
+    "audit_data_mode",
+    "event_type",
+    "wall_time_ms",
+)
+
+
+def evidence_ref_event_queryset(*extra_fields: str):
+    fields = tuple(dict.fromkeys((*EVIDENCE_REF_EVENT_FIELDS, *extra_fields)))
+    return AuditEvent.objects.only(*fields)
 
 
 def healthz(_request: HttpRequest):
@@ -376,7 +413,7 @@ def engine_source_values(group: AuditGroup) -> dict[str, dict[str, list[str]]]:
             "audit_file__source_account_npub",
         )
     )
-    for event in events:
+    for event in events.iterator(chunk_size=2_000):
         engine_values = values_by_engine.setdefault(
             event.engine_id,
             {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
@@ -504,6 +541,7 @@ def group_overview_context(group: AuditGroup) -> dict:
             "other",
             action_filters,
         ),
+        "action_events_limited": action_groups.truncated,
     }
 
 
@@ -528,10 +566,11 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
     if tab == "overview":
         return {"group": group, "overview": group_overview_context(group)}
     if tab == "evidence":
-        audit_files = list(audit_files_for_group(group))
+        audit_files, audit_files_limited = limited_tab_events(audit_files_for_group(group))
         return {
             "group": group,
             "audit_files": file_rows_for_group(audit_files, group),
+            "audit_files_limited": audit_files_limited,
             "recent_events": recent_evidence_rows(group),
             "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
         }
@@ -552,8 +591,8 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
         }
     if tab == "network":
         observations, has_more = limited_tab_events(
-            NetworkObservation.objects.filter(group=group)
-            .select_related("artifact", "audit_event")
+            network_observation_queryset()
+            .filter(group=group)
             .order_by("wall_time_ms", "engine_id", "id")
         )
         return {
@@ -564,8 +603,8 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
         }
     if tab == "convergence":
         runs, has_more = limited_tab_events(
-            ConvergenceRun.objects.filter(group=group)
-            .prefetch_related("candidates", "rule_evaluations", "evidence_events")
+            convergence_run_queryset()
+            .filter(group=group)
             .order_by("started_at_ms", "engine_id", "run_id")
         )
         attach_decisive_rules(runs)
@@ -576,11 +615,9 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
             "tab_event_limit": GROUP_DETAIL_TAB_EVENT_LIMIT,
         }
     if tab == "state":
-        deltas, deltas_has_more = limited_tab_events(
-            StateDelta.objects.filter(group=group).select_related("audit_event")
-        )
+        deltas, deltas_has_more = limited_tab_events(state_delta_queryset().filter(group=group))
         transitions, transitions_has_more = limited_tab_events(
-            EpochStateTransition.objects.filter(group=group).select_related("audit_event")
+            epoch_transition_queryset().filter(group=group)
         )
         return {
             "group": group,
@@ -595,7 +632,9 @@ def group_tab_context(group: AuditGroup, tab: str) -> dict:
             "group": group,
             "summary": group_summary_header_context(group)["summary"],
             "classification": group_classification(group),
-            "saved_reports": list(group.analysis_runs.select_related("created_by")[:20]),
+            "saved_reports": list(
+                group.analysis_runs.select_related("created_by").defer("report_json")[:20]
+            ),
         }
     raise Http404("unknown group detail tab")
 
@@ -668,7 +707,7 @@ def attach_decisive_rules(runs: list[ConvergenceRun]) -> None:
 def recent_evidence_rows(group: AuditGroup) -> list[dict]:
     events = list(
         AuditEvent.objects.filter(group=group)
-        .select_related("audit_file")
+        .only(*EVENT_ROW_FIELDS)
         .order_by("-wall_time_ms", "-id")[:GROUP_DETAIL_TAB_EVENT_LIMIT]
     )
     rows = []
@@ -683,6 +722,16 @@ def recent_evidence_rows(group: AuditGroup) -> list[dict]:
 @login_required
 def group_agent_export(request: HttpRequest, slug: str):
     group = get_object_or_404(AuditGroup, slug=slug)
+    event_count = valid_events_for_group(group).count()
+    if event_count > settings.GOGGLES_AGENT_EXPORT_MAX_EVENTS:
+        return JsonResponse(
+            {
+                "error": "group too large for synchronous export",
+                "event_count": event_count,
+                "max_events": settings.GOGGLES_AGENT_EXPORT_MAX_EVENTS,
+            },
+            status=413,
+        )
     audit_files = list(audit_files_for_group(group))
     events = list(valid_events_for_group(group, include_export_fields=True))
     pretty = request.GET.get("pretty", "").lower() in {"1", "true", "yes"}
@@ -1202,7 +1251,10 @@ def api_engine_groups(request: HttpRequest, engine_id: str):
 @login_required
 def api_event_evidence(request: HttpRequest, event_id: int):
     event = get_object_or_404(
-        AuditEvent.objects.select_related("audit_file", "group"),
+        AuditEvent.objects.select_related("audit_file", "group").defer(
+            "audit_file__raw_text",
+            "audit_file__user_agent",
+        ),
         pk=event_id,
     )
     return JsonResponse(
@@ -1724,15 +1776,27 @@ def audit_data_mode_change_payload_severity(payload: dict) -> str:
 
 
 def delivery_artifact_queryset():
+    observation_evidence = evidence_ref_event_queryset(
+        "context_source",
+        "audit_file__source_account_pubkey_hex",
+    ).select_related("audit_file")
+    expectation_evidence = evidence_ref_event_queryset(
+        "engine_id",
+        "account_ref",
+        "context_source",
+    )
     return DeliveryArtifact.objects.prefetch_related(
-        Prefetch("evidence_events", queryset=AuditEvent.objects.select_related("audit_file")),
+        Prefetch("evidence_events", queryset=evidence_ref_event_queryset()),
         "engine_observations",
         Prefetch(
             "engine_observations__evidence_events",
-            queryset=AuditEvent.objects.select_related("audit_file"),
+            queryset=observation_evidence,
         ),
         "recipient_expectations",
-        "recipient_expectations__evidence_event",
+        Prefetch(
+            "recipient_expectations__evidence_event",
+            queryset=expectation_evidence,
+        ),
     )
 
 
@@ -1768,7 +1832,12 @@ def apply_delivery_artifact_filters(artifacts, filters: dict):
 
 
 def network_observation_queryset():
-    return NetworkObservation.objects.select_related("artifact", "audit_event", "group")
+    return NetworkObservation.objects.prefetch_related(
+        Prefetch(
+            "audit_event",
+            queryset=evidence_ref_event_queryset("audit_data_mode"),
+        )
+    )
 
 
 def filtered_network_observations(group: AuditGroup, filters: dict):
@@ -1792,7 +1861,7 @@ def filtered_network_observations(group: AuditGroup, filters: dict):
 
 def convergence_run_queryset():
     return ConvergenceRun.objects.prefetch_related(
-        "evidence_events",
+        Prefetch("evidence_events", queryset=evidence_ref_event_queryset()),
         "candidates",
         "rule_evaluations",
     )
@@ -1849,7 +1918,9 @@ def convergence_payload_matches_filters(payload: dict, filters: dict) -> bool:
 
 
 def state_delta_queryset():
-    return StateDelta.objects.select_related("audit_event", "group")
+    return StateDelta.objects.prefetch_related(
+        Prefetch("audit_event", queryset=evidence_ref_event_queryset())
+    )
 
 
 def filtered_state_deltas(group: AuditGroup, filters: dict):
@@ -1879,7 +1950,9 @@ def filtered_state_deltas(group: AuditGroup, filters: dict):
 
 
 def epoch_transition_queryset():
-    return EpochStateTransition.objects.select_related("audit_event", "group")
+    return EpochStateTransition.objects.prefetch_related(
+        Prefetch("audit_event", queryset=evidence_ref_event_queryset())
+    )
 
 
 def filtered_epoch_transitions(group: AuditGroup, filters: dict):
@@ -1908,7 +1981,19 @@ def filtered_epoch_transitions(group: AuditGroup, filters: dict):
 
 
 def audit_data_mode_change_queryset(group: AuditGroup):
-    return valid_group_event_queryset(group).filter(event_type="audit_data_mode_changed")
+    return (
+        valid_group_event_queryset(group)
+        .filter(event_type="audit_data_mode_changed")
+        .only(
+            *EVIDENCE_REF_EVENT_FIELDS,
+            "engine_id",
+            "account_ref",
+            "recorder_session_id",
+            "outcome",
+            "reason",
+            "raw_kind",
+        )
+    )
 
 
 def filtered_audit_data_mode_changes(group: AuditGroup, filters: dict):
@@ -1925,11 +2010,28 @@ def filtered_audit_data_mode_changes(group: AuditGroup, filters: dict):
         events = events.filter(wall_time_ms__gte=filters["from_ms"])
     if filters["to_ms"] is not None:
         events = events.filter(wall_time_ms__lte=filters["to_ms"])
-    return events.select_related("audit_file", "group")
+    return events.only(
+        *EVIDENCE_REF_EVENT_FIELDS,
+        "engine_id",
+        "account_ref",
+        "recorder_session_id",
+        "outcome",
+        "reason",
+        "raw_kind",
+    )
 
 
 def evidence_event_queryset(group: AuditGroup):
-    return AuditEvent.objects.filter(group=group).select_related("audit_file", "group")
+    return (
+        AuditEvent.objects.filter(group=group)
+        .select_related("audit_file")
+        .only(
+            *EVENT_ROW_FIELDS,
+            "audit_file__source_name",
+            "audit_file__validation_status",
+            "audit_file__file_sha256",
+        )
+    )
 
 
 def filtered_evidence_events(group: AuditGroup, filters: dict):
@@ -1966,7 +2068,7 @@ def action_event_queryset(group: AuditGroup):
     return (
         valid_group_event_queryset(group)
         .exclude(human_action_action="")
-        .select_related("audit_file", "group")
+        .only(*EVENT_ROW_FIELDS)
         .order_by("wall_time_ms", "engine_id", "line_number", "id")
     )
 
@@ -2001,8 +2103,26 @@ ACTION_ATTRIBUTION_PAGE_KEYS = {
 }
 
 
-def action_groups_for_api(group: AuditGroup, filters: dict) -> list[dict]:
-    events = list(filtered_action_events(group, filters))
+class ActionGroupCollection(list[dict]):
+    def __init__(self, values=(), *, truncated: bool = False):
+        super().__init__(values)
+        self.truncated = truncated
+
+
+def action_groups_for_api(group: AuditGroup, filters: dict) -> ActionGroupCollection:
+    max_events = settings.GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST
+    # Pull the newest bounded window, then restore chronological order for the
+    # existing grouping semantics. This prevents a single group overview/API
+    # request from materializing an unbounded action history.
+    events = list(
+        filtered_action_events(group, filters).order_by(
+            "-wall_time_ms", "-engine_id", "-line_number", "-id"
+        )[: max_events + 1]
+    )
+    truncated = len(events) > max_events
+    if truncated:
+        events = events[:max_events]
+    events.reverse()
     if filters["message_id"]:
         events = [
             event for event in events if filters["message_id"] in action_event_message_ids(event)
@@ -2018,7 +2138,7 @@ def action_groups_for_api(group: AuditGroup, filters: dict) -> list[dict]:
             for action_group in groups
             if action_attribution_payload_severity(action_group) == filters["severity"]
         ]
-    return groups
+    return ActionGroupCollection(groups, truncated=truncated)
 
 
 def action_origin_counts(group: AuditGroup) -> list[dict]:
@@ -2056,7 +2176,14 @@ def attribution_pagination_payload(action_groups: list[dict], filters: dict) -> 
     for kind, page_key in ACTION_ATTRIBUTION_PAGE_KEYS.items():
         total = len([row for row in action_groups if row["attribution_kind"] == kind])
         returned = min(max(total - offset, 0), limit)
-        payload[page_key] = pagination_payload(limit, offset, returned, total > offset + limit)
+        payload[page_key] = pagination_payload(
+            limit,
+            offset,
+            returned,
+            total > offset + limit or getattr(action_groups, "truncated", False),
+        )
+    payload["scan_truncated"] = getattr(action_groups, "truncated", False)
+    payload["scan_limit"] = settings.GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST
     return payload
 
 
@@ -3178,14 +3305,13 @@ def read_upload_bytes(upload) -> bytes:
     if upload_size is not None and upload_size > max_dump_bytes:
         raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
 
-    chunks = []
-    total_bytes = 0
-    for chunk in upload.chunks():
-        total_bytes += len(chunk)
-        if total_bytes > max_dump_bytes:
-            raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
-        chunks.append(chunk)
-    return b"".join(chunks)
+    # Multipart uploads larger than FILE_UPLOAD_MAX_MEMORY_SIZE have already
+    # spooled to disk. Read at most one byte beyond the accepted limit instead
+    # of retaining a chunk list and then allocating a second full-size join.
+    data = upload.read(max_dump_bytes + 1)
+    if len(data) > max_dump_bytes:
+        raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
+    return data
 
 
 def source_metadata_from_request(request: HttpRequest) -> dict[str, str]:

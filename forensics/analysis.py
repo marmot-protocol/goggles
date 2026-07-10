@@ -128,6 +128,11 @@ def audit_files_for_group(group):
     # both the groups (M2M) and events relations.
     return (
         AuditFile.objects.filter(groups=group)
+        # ``raw_text`` can be tens of MiB and none of the group metadata views
+        # consume it. Loading it here made every overview/evidence/export
+        # metadata query retain the full body of every related upload. The raw
+        # body remains available through the dedicated detail/download paths.
+        .defer("raw_text", "user_agent")
         .annotate(
             group_event_count=Count("events", filter=Q(events__group=group), distinct=True),
         )

@@ -126,6 +126,18 @@ DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=0
 DJANGO_SECURE_HSTS_PRELOAD=0
 DATABASE_URL=postgres://goggles:replace-with-long-random-database-password@db:5432/goggles
 GOGGLES_MAX_DUMP_BYTES=52428800
+GOGGLES_MAX_DUMP_RECORDS=50000
+GOGGLES_MAX_JSONL_LINE_BYTES=2097152
+GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST=50000
+GOGGLES_AGENT_EXPORT_MAX_EVENTS=50000
+GOGGLES_FILE_UPLOAD_MEMORY_BYTES=1048576
+GOGGLES_UPLOADS_ENABLED=1
+GOGGLES_WEB_MEMORY_LIMIT=16g
+GOGGLES_WEB_WORKERS=3
+GOGGLES_WEB_THREADS=4
+GOGGLES_WEB_TIMEOUT_SECONDS=300
+GOGGLES_WEB_MAX_REQUESTS=500
+GOGGLES_WEB_MAX_REQUESTS_JITTER=50
 GLITCHTIP_DSN=https://d550950965a64eb689f5e289416faa42@glitch.ipf.dev/1
 GLITCHTIP_SECURITY_ENDPOINT=https://glitch.ipf.dev/api/1/security/?glitchtip_key=d550950965a64eb689f5e289416faa42
 GLITCHTIP_ENVIRONMENT=production
@@ -285,7 +297,17 @@ docker compose exec web python manage.py shell -c "from forensics.models import 
 
 - Audit logs preserve raw engine ids, group refs, message ids, digests, payload metadata, raw lines, raw uploaded text, user agents, and source IPs; protect the database and backups accordingly.
 - Brain disk encryption is the expected at-rest protection for v1.
-- Upload size defaults to 50 MiB via `GOGGLES_MAX_DUMP_BYTES`.
+- Upload size defaults to 50 MiB via `GOGGLES_MAX_DUMP_BYTES`. Processing is
+  additionally bounded to 50,000 non-empty records and 2 MiB per JSONL line;
+  multipart bodies spool to disk after 1 MiB. Over-complex uploads are retained
+  as one quarantined raw artifact instead of being expanded into per-line ORM
+  objects.
+- Projection APIs default to 100 rows and cap requests at 500. Action-history
+  scans and synchronous agent exports have separate 50,000-event safety caps.
+- The Compose web service defaults to a configurable 16 GiB no-swap cgroup
+  limit (`GOGGLES_WEB_MEMORY_LIMIT`) and recycles Gunicorn workers after a
+  jittered request budget. Keep those host-protection limits in place even if
+  application limits are raised.
 - Purge stored audit data without removing users or upload tokens with
   `manage.py purge_audit_data`. Run it with `--dry-run` first, then
   `--confirm-delete-audit-data` to perform a deployment cutover. Rebuild the

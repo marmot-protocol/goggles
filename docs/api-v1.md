@@ -44,7 +44,7 @@ Projection endpoints support these filters where the field applies:
 - `epoch`
 - `from_ms`
 - `to_ms`
-- `limit`: defaults to `500`, capped at `5000`
+- `limit`: defaults to `100`, capped at `500`
 - `offset`: defaults to `0`
 
 Paginated responses include:
@@ -52,7 +52,7 @@ Paginated responses include:
 ```json
 {
   "pagination": {
-    "limit": 500,
+    "limit": 100,
     "offset": 0,
     "returned": 10,
     "has_more": false,
@@ -67,6 +67,10 @@ Action attribution endpoints also support:
 
 - `origin`: for example `local_user`, `system`, or `observed_group_event`
 - `action`: the normalized human-action name, such as `send_message`
+
+Action pagination includes `scan_truncated` and `scan_limit`. If
+`scan_truncated` is true, Goggles bounded the request to the newest safe action
+window; use narrower filters rather than requesting an unbounded group history.
 
 ## Sensitivity Metadata
 

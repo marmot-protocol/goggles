@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.models import Case, IntegerField, Value, When
@@ -128,6 +129,10 @@ class ParsedLine:
     errors: list[str]
 
 
+class AuditLogComplexityError(ValueError):
+    """The upload is byte-bounded but too complex to materialize safely."""
+
+
 def iter_jsonl_record_lines(raw_text: str) -> Iterator[str]:
     """Yield JSONL records split only on the LF record delimiter.
 
@@ -190,11 +195,37 @@ def ingest_audit_log_bytes(
         )
 
     file_sha256 = hashlib.sha256(dump_bytes).hexdigest()
-    existing = AuditFile.objects.filter(file_sha256=file_sha256).first()
+    existing = (
+        AuditFile.objects.defer("raw_text", "user_agent").filter(file_sha256=file_sha256).first()
+    )
     if existing is not None:
         return IngestionResult(audit_file=existing, created=False)
 
-    parsed_lines = parse_jsonl(raw_text)
+    try:
+        parsed_lines = parse_jsonl(raw_text)
+    except AuditLogComplexityError as exc:
+        return save_invalid_upload(
+            fallback_group_slug=fallback_group_slug,
+            fallback_group_name=fallback_group_name,
+            upload_token=upload_token,
+            uploaded_by=uploaded_by,
+            source_ip=source_ip,
+            user_agent=user_agent,
+            source_name=source_name,
+            source_account_label=source_account_label,
+            source_device_label=source_device_label,
+            source_device_id=source_device_id,
+            source_device_name=source_device_name,
+            source_platform=source_platform,
+            source_app_version=source_app_version,
+            source_upload_trigger=source_upload_trigger,
+            source_account_pubkey_hex=source_account_pubkey_hex,
+            source_account_npub=source_account_npub,
+            content_type=content_type,
+            dump_bytes=dump_bytes,
+            raw_text=raw_text,
+            error=f"audit log exceeds safe processing limits: {exc}",
+        )
     metadata = file_metadata(parsed_lines)
     # Account identity is sourced from the JSONL body (source_context), not from
     # upload headers. Backfill the per-file account fields so file-level views
@@ -257,7 +288,7 @@ def ingest_audit_log_bytes(
             refresh_group_rollups(locked_group_ids)
             return IngestionResult(audit_file=audit_file, created=True)
     except IntegrityError:
-        audit_file = AuditFile.objects.get(file_sha256=file_sha256)
+        audit_file = AuditFile.objects.defer("raw_text", "user_agent").get(file_sha256=file_sha256)
         return IngestionResult(audit_file=audit_file, created=False)
     except Exception as exc:
         # Defense-in-depth: any *other* failure while creating events (e.g. a
@@ -323,7 +354,9 @@ def save_invalid_upload(
     error: str,
 ) -> IngestionResult:
     file_sha256 = hashlib.sha256(dump_bytes).hexdigest()
-    existing = AuditFile.objects.filter(file_sha256=file_sha256).first()
+    existing = (
+        AuditFile.objects.defer("raw_text", "user_agent").filter(file_sha256=file_sha256).first()
+    )
     if existing is not None:
         return IngestionResult(audit_file=existing, created=False)
     fallback_group = group_for_slug(fallback_group_slug, fallback_group_name)
@@ -367,7 +400,7 @@ def save_invalid_upload(
                 AuditGroup.objects.filter(id=fallback_group.id).update(updated_at=timezone.now())
             return IngestionResult(audit_file=audit_file, created=True)
     except IntegrityError:
-        audit_file = AuditFile.objects.get(file_sha256=file_sha256)
+        audit_file = AuditFile.objects.defer("raw_text", "user_agent").get(file_sha256=file_sha256)
         return IngestionResult(audit_file=audit_file, created=False)
 
 
@@ -377,6 +410,21 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
         raw_line = raw_line.strip()
         if not raw_line:
             continue
+        if len(parsed_lines) >= settings.GOGGLES_MAX_DUMP_RECORDS:
+            raise AuditLogComplexityError(
+                f"record count exceeds maximum of {settings.GOGGLES_MAX_DUMP_RECORDS}"
+            )
+        # UTF-8 can use more than one byte per character. Avoid encoding an
+        # already-obviously-oversized line, then enforce the exact byte ceiling
+        # for non-ASCII input before json.loads expands it into Python objects.
+        if (
+            len(raw_line) > settings.GOGGLES_MAX_JSONL_LINE_BYTES
+            or len(raw_line.encode("utf-8")) > settings.GOGGLES_MAX_JSONL_LINE_BYTES
+        ):
+            raise AuditLogComplexityError(
+                f"line {line_number} exceeds maximum of "
+                f"{settings.GOGGLES_MAX_JSONL_LINE_BYTES} UTF-8 bytes"
+            )
         data = None
         errors = []
         try:

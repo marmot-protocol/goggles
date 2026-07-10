@@ -95,6 +95,21 @@ OTHER_MSG_ID = "33" * 32
 DIGEST_A = "aa" * 32
 DIGEST_B = "bb" * 32
 
+HEAVY_BULK_SELECT_COLUMNS = (
+    '"forensics_auditfile"."raw_text"',
+    '"forensics_auditevent"."raw_line"',
+    '"forensics_auditevent"."raw_event"',
+)
+
+
+def heavy_bulk_selects(captured_queries):
+    return [
+        query["sql"]
+        for query in captured_queries
+        if query["sql"].lstrip().upper().startswith("SELECT")
+        and any(column in query["sql"] for column in HEAVY_BULK_SELECT_COLUMNS)
+    ]
+
 
 def audit_event(
     seq,
@@ -1617,16 +1632,18 @@ class AuditLogIngestionTests(TestCase):
 
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
-        api_response = self.client.get(
-            reverse("api-group-projections", kwargs={"slug": group.slug}),
-            {"engine_id": ENGINE_ALICE},
-        )
+        with CaptureQueriesContext(connection) as projection_api_queries:
+            api_response = self.client.get(
+                reverse("api-group-projections", kwargs={"slug": group.slug}),
+                {"engine_id": ENGINE_ALICE},
+            )
 
         self.assertEqual(api_response.status_code, 200)
         payload = api_response.json()
+        self.assertEqual(heavy_bulk_selects(projection_api_queries.captured_queries), [])
         self.assertEqual(payload["schema_version"], "goggles-audit-projections/v1")
         self.assertEqual(payload["filters"]["engine_id"], ENGINE_ALICE)
-        self.assertEqual(payload["pagination"]["delivery_artifacts"]["limit"], 500)
+        self.assertEqual(payload["pagination"]["delivery_artifacts"]["limit"], 100)
         self.assertEqual(
             payload["delivery_artifacts"][0]["decoded_payload"]["text"], "hello from Alice"
         )
@@ -2491,6 +2508,44 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(bad_event.parse_status, "invalid")
         self.assertEqual(bad_event.raw_line, "{not-json}")
         self.assertIn("JSON", bad_event.validation_error)
+
+    @override_settings(GOGGLES_MAX_DUMP_RECORDS=1)
+    def test_record_limit_quarantines_raw_upload_before_object_expansion(self):
+        raw_token, _token = UploadToken.issue("bounded parser")
+        body = representative_audit_log()
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("record count exceeds maximum of 1", response.json()["error"])
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.raw_text, body)
+        self.assertEqual(audit_file.events.count(), 1)
+        self.assertEqual(audit_file.events.get().raw_line, body)
+
+    def test_line_byte_limit_quarantines_raw_upload_before_json_loads(self):
+        raw_token, _token = UploadToken.issue("bounded parser")
+        body = jsonl(audit_event_v2(0, kind={"type": "recorder_started", "recorder": "mdk"}))
+        byte_limit = len(body.rstrip("\n").encode("utf-8")) - 1
+
+        with self.settings(GOGGLES_MAX_JSONL_LINE_BYTES=byte_limit):
+            response = self.client.post(
+                reverse("api-audit-log-upload"),
+                data=body,
+                content_type="application/x-ndjson",
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(f"exceeds maximum of {byte_limit} UTF-8 bytes", response.json()["error"])
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.raw_text, body)
+        self.assertEqual(audit_file.events.count(), 1)
 
     def test_invalid_utf8_group_upload_links_file_to_fallback_group(self):
         raw_token, _token = UploadToken.issue("ios test client")
@@ -4482,6 +4537,17 @@ class IncrementalProjectionIngestTests(TestCase):
             source_name=f"append-{seq}.jsonl",
         )
 
+    def test_projection_queries_never_select_verbatim_evidence_columns(self):
+        with CaptureQueriesContext(connection) as captured:
+            result = self._upload_message_event(0, MSG_ID)
+
+        self.assertTrue(result.created)
+        self.assertEqual(
+            heavy_bulk_selects(captured.captured_queries),
+            [],
+            "projection ingestion must not hydrate raw upload or raw event bodies",
+        )
+
     def test_small_append_does_not_clear_and_reproject_whole_group(self):
         # Seed a group with several prior messages -> several projection rows.
         prior_msg_ids = [f"{byte:02x}" * 32 for byte in range(0xA0, 0xA5)]
@@ -5015,6 +5081,30 @@ class HumanActionGroupingTests(TestCase):
         # The genuine first-seen 0 is preserved, not dropped or overwritten.
         self.assertEqual(action_groups[0]["target_count"], 0)
 
+    @override_settings(GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST=1)
+    def test_action_api_reports_when_history_scan_is_safely_truncated(self):
+        ingest_body(
+            jsonl(
+                audit_event(0, wall_time_ms=T0, context={"human_action": self._human_action()}),
+                audit_event(
+                    1,
+                    wall_time_ms=T0 + 1000,
+                    context={"human_action": self._human_action("rename_group")},
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(reverse("api-group-actions", kwargs={"slug": group.slug}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["pagination"]["scan_truncated"])
+        self.assertEqual(response.json()["pagination"]["scan_limit"], 1)
+        self.assertEqual(heavy_bulk_selects(captured.captured_queries), [])
+
 
 class UploadTokenLifecycleTests(TestCase):
     """Lock in the documented upload-token lifecycle: reusable by default,
@@ -5500,7 +5590,7 @@ class GroupExportStreamTests(TestCase):
 
     def test_streams_every_row_past_the_projection_page_cap(self):
         # The paginated projections API caps a section at GROUP_PROJECTION_API_DEFAULT_LIMIT
-        # (500). The export must stream every row — this is its reason to exist.
+        # (100). The export must stream every row — this is its reason to exist.
         over_cap = GROUP_PROJECTION_API_DEFAULT_LIMIT + 1
         evidence_event = AuditEvent.objects.filter(
             group=self.group, parse_status=AuditEvent.STATUS_VALID
@@ -6088,39 +6178,63 @@ class DashboardTests(TestCase):
         self.assertNotContains(response, 'id="timeline-data"')
         self.assertNotContains(response, MSG_ID)
 
-        delivery_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
-        )
+        with CaptureQueriesContext(connection) as tab_queries:
+            delivery_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
+            )
+            network_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
+            )
+            convergence_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
+            )
+            state_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
+            )
         self.assertContains(delivery_response, "Message artifacts")
         self.assertContains(delivery_response, MSG_ID[:16])
         self.assertContains(delivery_response, "hello from Alice")
 
-        network_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
-        )
         self.assertContains(network_response, "Transport observations")
         self.assertContains(network_response, "wss://relay.example")
 
-        convergence_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "convergence"})
-        )
         self.assertContains(convergence_response, "Convergence runs")
         self.assertContains(convergence_response, "branch-a")
         self.assertContains(convergence_response, "highest_weight")
 
-        state_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "state"})
-        )
         self.assertContains(state_response, "Group state deltas")
         self.assertContains(state_response, "text value")
         self.assertNotContains(state_response, "Launch room")
         self.assertContains(state_response, "Epoch state transitions")
+        self.assertEqual(heavy_bulk_selects(tab_queries.captured_queries), [])
 
         evidence_response = self.client.get(
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
         )
         self.assertContains(evidence_response, "Audit files")
         self.assertContains(evidence_response, "Recent evidence rows")
+
+        with CaptureQueriesContext(connection) as evidence_api_queries:
+            evidence_api_response = self.client.get(
+                reverse("api-group-evidence", kwargs={"slug": group.slug})
+            )
+        self.assertEqual(evidence_api_response.status_code, 200)
+        self.assertTrue(evidence_api_response.json()["evidence"])
+        self.assertEqual(heavy_bulk_selects(evidence_api_queries.captured_queries), [])
+
+        event_id = evidence_api_response.json()["evidence"][0]["evidence_ref"]["event_id"]
+        with CaptureQueriesContext(connection) as event_api_queries:
+            event_api_response = self.client.get(
+                reverse("api-event-evidence", kwargs={"event_id": event_id})
+            )
+        self.assertEqual(event_api_response.status_code, 200)
+        self.assertIn("raw_line", event_api_response.json()["event"])
+        self.assertFalse(
+            any(
+                '"forensics_auditfile"."raw_text"' in query["sql"]
+                for query in event_api_queries.captured_queries
+            )
+        )
 
     def test_group_detail_tabs_cap_large_group_rows(self):
         tab_limit = GROUP_DETAIL_TAB_EVENT_LIMIT
@@ -6162,12 +6276,14 @@ class DashboardTests(TestCase):
                 artifact_kind="application_message",
                 first_seen_ms=1_700_000_000_000 + i,
             )
-            DeliveryObservation.objects.create(
+            artifact.evidence_events.add(evidence_event)
+            observation = DeliveryObservation.objects.create(
                 artifact=artifact,
                 engine_id=ENGINE_ALICE,
                 latest_state=f"delivery-marker-{i:03d}",
                 first_seen_ms=1_700_000_000_000 + i,
             )
+            observation.evidence_events.add(evidence_event)
             NetworkObservation.objects.create(
                 group=group,
                 artifact=artifact,
@@ -6209,9 +6325,10 @@ class DashboardTests(TestCase):
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
-        delivery_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
-        )
+        with CaptureQueriesContext(connection) as delivery_queries:
+            delivery_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "delivery"})
+            )
         network_response = self.client.get(
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "network"})
         )
@@ -6223,6 +6340,7 @@ class DashboardTests(TestCase):
         )
 
         self.assertEqual(delivery_response.status_code, 200)
+        self.assertEqual(heavy_bulk_selects(delivery_queries.captured_queries), [])
         self.assertEqual(len(delivery_response.context["artifacts"]), tab_limit)
         self.assertContains(delivery_response, f"Showing first {tab_limit} message artifacts")
         self.assertContains(delivery_response, "delivery-marker-000")
@@ -6388,16 +6506,19 @@ class DashboardTests(TestCase):
         User.objects.create_user(username="analyst", password="correct horse battery staple")
         self.client.login(username="analyst", password="correct horse battery staple")
 
-        response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
+        with CaptureQueriesContext(connection) as shell_queries:
+            response = self.client.get(reverse("group-detail", kwargs={"slug": group.slug}))
 
         self.assertEqual(response.status_code, 200)
         self.assertLess(len(response.content), 250_000)
         self.assertNotContains(response, "RAW-LINE-MARKER-2999")
         self.assertNotContains(response, 'id="timeline-data"')
+        self.assertEqual(heavy_bulk_selects(shell_queries.captured_queries), [])
 
-        evidence_response = self.client.get(
-            reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
-        )
+        with CaptureQueriesContext(connection) as evidence_queries:
+            evidence_response = self.client.get(
+                reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
+            )
 
         self.assertEqual(evidence_response.status_code, 200)
         self.assertLess(len(evidence_response.content), 250_000)
@@ -6405,6 +6526,7 @@ class DashboardTests(TestCase):
             len(evidence_response.context["recent_events"]),
             GROUP_DETAIL_TAB_EVENT_LIMIT,
         )
+        self.assertEqual(heavy_bulk_selects(evidence_queries.captured_queries), [])
 
 
 class AuditFileDetailViewTests(TestCase):
@@ -8083,6 +8205,18 @@ class GroupDetailTimelineViewTests(TestCase):
         self.assertNotIn("raw_line", payload["events"][0])
         self.assertIn("raw_upload_bodies", payload["sensitivity"]["omits"])
 
+    @override_settings(GOGGLES_AGENT_EXPORT_MAX_EVENTS=1)
+    def test_group_agent_export_rejects_oversized_synchronous_build(self):
+        ingest_body(representative_audit_log())
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": GROUP_REF}))
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["event_count"], 2)
+        self.assertEqual(response.json()["max_events"], 1)
+
     def test_group_detail_fetches_events_with_bounded_queries(self):
         ingest_body(representative_audit_log(engine_id=ENGINE_ALICE))
         ingest_body(representative_audit_log(engine_id=ENGINE_BOB))
@@ -8418,6 +8552,18 @@ class AuditFileAdminTests(TestCase):
             hasattr(forensics_admin, "AuditEventInline"),
             "The unbounded AuditEventInline must not exist (goggles#34).",
         )
+
+    def test_admin_changelists_do_not_select_verbatim_evidence_columns(self):
+        audit_file = self.make_audit_file(3, source_name="large")
+        AuditFile.objects.filter(pk=audit_file.pk).update(raw_text="x" * 5_000_000)
+
+        with CaptureQueriesContext(connection) as captured:
+            file_response = self.client.get(reverse("admin:forensics_auditfile_changelist"))
+            event_response = self.client.get(reverse("admin:forensics_auditevent_changelist"))
+
+        self.assertEqual(file_response.status_code, 200)
+        self.assertEqual(event_response.status_code, 200)
+        self.assertEqual(heavy_bulk_selects(captured.captured_queries), [])
 
     def test_change_page_query_count_is_bounded_regardless_of_events(self):
         small = self.make_audit_file(2)

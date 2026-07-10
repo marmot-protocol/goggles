@@ -54,3 +54,28 @@ Capacity model — size the database for it:
 The edge proxy (Caddy) streams `reverse_proxy` responses by default, so no proxy
 change is required; `nginx` serves only static assets and is not in the export
 request path.
+
+## Memory-pressure deployment
+
+The performance hardening release does **not** require purging audit data.
+Deploy it with uploads paused so no old worker continues a high-memory ingest:
+
+1. Set `GOGGLES_UPLOADS_ENABLED=0` in the production environment.
+2. Recreate the web service so the changed environment and Compose resource
+   limits take effect: `docker compose up -d --build --force-recreate web`.
+3. Confirm the container has the expected 16 GiB memory/no-swap boundary (or
+   the value set in `GOGGLES_WEB_MEMORY_LIMIT`) with
+   `docker inspect goggles-web-1` and wait for the health check.
+4. Exercise an authenticated group overview, delivery tab, evidence tab, and a
+   representative upload while watching `docker stats`.
+5. Set `GOGGLES_UPLOADS_ENABLED=1` and recreate the web service again.
+
+Do not use `purge_audit_data` for this deployment. The query changes avoid
+hydrating stored raw bodies without changing their schema or deleting evidence.
+
+The Compose service keeps three threaded workers by default, recycles each
+after a jittered 500-request budget, and constrains the whole web container to
+a configurable 16 GiB default (`GOGGLES_WEB_MEMORY_LIMIT`) with no additional
+swap. During an incident, set `GOGGLES_WEB_WORKERS=1` before the recreate to
+prevent concurrent amplification; restore the measured production worker count
+only after memory remains stable.

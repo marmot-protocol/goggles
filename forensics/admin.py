@@ -97,6 +97,12 @@ class AuditFileAdmin(admin.ModelAdmin):
         "events_link",
     )
 
+    def get_queryset(self, request):
+        # Admin changelists/autocomplete render metadata only. Keep the complete
+        # upload body out of those page-sized query results; the change-page
+        # preview intentionally resolves the one deferred body it displays.
+        return super().get_queryset(request).defer("raw_text", "user_agent")
+
     @admin.display(description="Raw text (preview)")
     def raw_text_preview(self, obj):
         """Bounded, read-only preview of the uploaded JSONL.
@@ -168,6 +174,18 @@ class AuditEventAdmin(admin.ModelAdmin):
     autocomplete_fields = ("audit_file", "group")
     show_full_result_count = False
 
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .defer(
+                "raw_line",
+                "raw_event",
+                "raw_kind",
+                "raw_context",
+            )
+        )
+
     def lookup_allowed(self, lookup, value, request):
         if lookup == "audit_file__id__exact":
             return True
@@ -180,6 +198,9 @@ class AnalysisRunAdmin(admin.ModelAdmin):
     search_fields = ("title", "notes", "group__group_ref")
     autocomplete_fields = ("group", "created_by")
     readonly_fields = ("created_at",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).defer("report_json")
 
 
 @admin.register(DeliveryArtifact)
