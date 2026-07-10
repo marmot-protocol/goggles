@@ -54,6 +54,53 @@ INFERRED_CONVERGENCE_TERMINAL_EPOCH_STATES = {
     "unrecoverable",
 }
 
+# Projection work must never hydrate the verbatim per-line JSON or the parent
+# AuditFile row. In particular, ``select_related("audit_file")`` repeats the
+# complete AuditFile.raw_text once for every event in the SQL result: a 50 MiB
+# upload with 1,000 events becomes roughly 50 GiB before projection even starts.
+# Keep this list explicit so projection helpers can use normal model attributes
+# without triggering deferred-field queries while the heavy evidence columns
+# remain outside the worker heap.
+PROJECTION_EVENT_FIELDS = (
+    "id",
+    "audit_file_id",
+    "group_id",
+    "line_number",
+    "wall_time_ms",
+    "engine_id",
+    "account_ref",
+    "audit_data_mode",
+    "event_type",
+    "context_convergence",
+    "context_transport",
+    "human_action_message_ids",
+    "msg_id",
+    "outbound_msg_id",
+    "outbound_welcome_msg_ids",
+    "invalidated_msg_id",
+    "raw_kind",
+    "relay_urls",
+    "accepted_relay_urls",
+    "failed_relays",
+    "required_acks",
+    "met_required_acks",
+    "epoch",
+    "pending_epoch",
+    "payload_len",
+    "payload_digest",
+    "outcome",
+    "outcome_kind",
+    "reason",
+    "new_state",
+    "pending_kind",
+    "result_kind",
+    "selected_branch_id",
+    "selected_fork_epoch",
+    "selected_tip_epoch",
+    "current_tip_epoch",
+    "max_rewind_commits",
+)
+
 
 @dataclass
 class ProjectionState:
@@ -98,7 +145,7 @@ def project_file_events(audit_file: AuditFile, group_ids: list[int]) -> None:
         AuditGroup.objects.select_for_update().filter(id__in=group_ids).order_by("id")
     )
     events = list(
-        AuditEvent.objects.select_related("audit_file")
+        AuditEvent.objects.only(*PROJECTION_EVENT_FIELDS)
         .filter(
             structural_quarantine_exclusion(),
             audit_file=audit_file,
@@ -168,7 +215,7 @@ def groups_with_out_of_order_convergence_backfill(
             "context_convergence",
         )
     )
-    for event in stored:
+    for event in stored.iterator(chunk_size=2_000):
         if event.group_id in backfilled:
             continue
         if not event_may_need_inferred_convergence_state(event):
@@ -242,12 +289,23 @@ def run_is_active_inferred(run: ConvergenceRun) -> bool:
     # Only the run's most recent evidence row decides whether it is still open,
     # so fetch just that row instead of loading the whole evidence set. NULL
     # ``wall_time_ms`` sorts last to match the projection ordering above.
-    last_event = run.evidence_events.order_by(
-        F("wall_time_ms").asc(nulls_last=True),
-        "engine_id",
-        "line_number",
-        "id",
-    ).last()
+    last_event = (
+        run.evidence_events.only(
+            "id",
+            "event_type",
+            "new_state",
+            "wall_time_ms",
+            "engine_id",
+            "line_number",
+        )
+        .order_by(
+            F("wall_time_ms").asc(nulls_last=True),
+            "engine_id",
+            "line_number",
+            "id",
+        )
+        .last()
+    )
     if last_event is None:
         return True
     return not inferred_convergence_event_is_terminal(last_event, run.phase)
@@ -266,7 +324,7 @@ def rebuild_locked_group_projections(group: AuditGroup) -> None:
     """
     clear_group_projections(group)
     events = (
-        AuditEvent.objects.select_related("audit_file")
+        AuditEvent.objects.only(*PROJECTION_EVENT_FIELDS)
         .filter(
             structural_quarantine_exclusion(),
             group=group,
@@ -275,7 +333,7 @@ def rebuild_locked_group_projections(group: AuditGroup) -> None:
         .order_by("wall_time_ms", "engine_id", "line_number", "id")
     )
     state = ProjectionState(active_inferred_convergence_runs={})
-    for event in events:
+    for event in events.iterator(chunk_size=500):
         project_event(event, state)
 
 
@@ -465,7 +523,7 @@ def project_network_observation(
     wire = wire_for_event(event, kind)
     message_id = artifact.artifact_id if artifact else str(kind.get("msg_id") or event.msg_id or "")
     NetworkObservation.objects.create(
-        group=event.group,
+        group_id=event.group_id,
         artifact=artifact,
         audit_event=event,
         direction=network_direction(event.event_type),
@@ -575,7 +633,7 @@ def project_convergence(event: AuditEvent, state: ProjectionState | None = None)
         if state:
             state.active_inferred_convergence_runs.pop(inferred_convergence_key(event), None)
         run, _created = ConvergenceRun.objects.get_or_create(
-            group=event.group,
+            group_id=event.group_id,
             engine_id=event.engine_id,
             run_id=run_id,
             defaults={"account_ref": event.account_ref, "inferred": False},
@@ -600,7 +658,7 @@ def inferred_convergence_run_for_event(
     if active is not None:
         return active
     run = ConvergenceRun.objects.create(
-        group=event.group,
+        group_id=event.group_id,
         engine_id=event.engine_id,
         run_id=f"inferred-{event.engine_id}-{event.id}",
         account_ref=event.account_ref,
@@ -730,7 +788,7 @@ def project_convergence_decision(run: ConvergenceRun, kind: dict[str, Any]) -> N
 def project_state_delta(event: AuditEvent) -> None:
     kind = event.raw_kind if isinstance(event.raw_kind, dict) else {}
     StateDelta.objects.create(
-        group=event.group,
+        group_id=event.group_id,
         audit_event=event,
         epoch=event.epoch,
         change_kind=str(kind.get("change_kind") or event.outcome_kind or ""),
@@ -750,7 +808,7 @@ def project_state_delta(event: AuditEvent) -> None:
 
 def project_epoch_transition(event: AuditEvent) -> None:
     EpochStateTransition.objects.create(
-        group=event.group,
+        group_id=event.group_id,
         audit_event=event,
         engine_id=event.engine_id,
         account_ref=event.account_ref,

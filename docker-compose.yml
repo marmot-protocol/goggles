@@ -34,6 +34,14 @@ services:
     build: .
     init: true
     restart: unless-stopped
+    # Keep a pathological request inside the Goggles cgroup instead of letting
+    # it exhaust host RAM and swap. Equal memory/swap limits disable additional
+    # swap allocation for this container.
+    mem_limit: ${GOGGLES_WEB_MEMORY_LIMIT:-16g}
+    memswap_limit: ${GOGGLES_WEB_MEMORY_LIMIT:-16g}
+    mem_swappiness: 0
+    cpus: ${GOGGLES_WEB_CPUS:-2.0}
+    pids_limit: ${GOGGLES_WEB_PIDS_LIMIT:-256}
     env_file: ${GOGGLES_ENV_FILE:-.env}
     depends_on:
       db:
@@ -45,9 +53,18 @@ services:
     command: >
       sh -c "python manage.py migrate --noinput &&
              python manage.py collectstatic --noinput &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000
-             --workers 3 --threads 4 --timeout 300
-             --max-requests 500 --max-requests-jitter 50"
+             exec gunicorn config.wsgi:application
+             --bind 0.0.0.0:8000
+             --workers $${GOGGLES_WEB_WORKERS:-3}
+             --threads $${GOGGLES_WEB_THREADS:-4}
+             --timeout $${GOGGLES_WEB_TIMEOUT_SECONDS:-300}
+             --max-requests $${GOGGLES_WEB_MAX_REQUESTS:-500}
+             --max-requests-jitter $${GOGGLES_WEB_MAX_REQUESTS_JITTER:-50}"
+    logging:
+      driver: json-file
+      options:
+        max-size: ${GOGGLES_WEB_LOG_MAX_SIZE:-20m}
+        max-file: ${GOGGLES_WEB_LOG_MAX_FILES:-5}
     healthcheck:
       test:
         [

@@ -78,6 +78,9 @@
     <span class="is-muted">user intent separated from engine/system stamps</span>
   </header>
   <div class="card__body table-scroll">
+    {% if overview.action_events_limited %}
+      <p class="notice">Action attribution is limited to the newest safe processing window. Use narrower filters in the JSON API.</p>
+    {% endif %}
     <div class="metric-grid metric-grid--compact">
       {% for row in overview.action_origin_counts %}
         <div class="metric">

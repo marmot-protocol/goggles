@@ -1,6 +1,9 @@
 <section class="card card--flush">
   <header class="card__header"><span class="card__title">Audit files</span></header>
   <div class="card__body table-scroll">
+    {% if audit_files_limited %}
+      <p class="notice">Showing the first {{ tab_event_limit }} audit files.</p>
+    {% endif %}
     {% if audit_files %}
       <table class="data-table">
         <thead>

@@ -276,19 +276,38 @@ LOGIN_REDIRECT_URL = "group-list"
 LOGOUT_REDIRECT_URL = "login"
 
 GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
+GOGGLES_MAX_DUMP_RECORDS = int(os.environ.get("GOGGLES_MAX_DUMP_RECORDS", 50_000))
+GOGGLES_MAX_JSONL_LINE_BYTES = int(os.environ.get("GOGGLES_MAX_JSONL_LINE_BYTES", 2 * 1024 * 1024))
+GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
+    os.environ.get("GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST", 50_000)
+)
+GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 50_000))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
 # Operational kill-switch for the streaming group-export endpoint, mirroring the
 # upload toggle. Lets an operator shed a resource-intensive read surface without a
 # redeploy.
 GOGGLES_EXPORTS_ENABLED = env_bool("GOGGLES_EXPORTS_ENABLED", True)
 DATA_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
-FILE_UPLOAD_MAX_MEMORY_SIZE = GOGGLES_MAX_DUMP_BYTES
+FILE_UPLOAD_MAX_MEMORY_SIZE = min(
+    GOGGLES_MAX_DUMP_BYTES,
+    int(os.environ.get("GOGGLES_FILE_UPLOAD_MEMORY_BYTES", 1024 * 1024)),
+)
+for setting_name in (
+    "GOGGLES_MAX_DUMP_BYTES",
+    "GOGGLES_MAX_DUMP_RECORDS",
+    "GOGGLES_MAX_JSONL_LINE_BYTES",
+    "GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST",
+    "GOGGLES_AGENT_EXPORT_MAX_EVENTS",
+    "FILE_UPLOAD_MAX_MEMORY_SIZE",
+):
+    if globals()[setting_name] <= 0:
+        raise ImproperlyConfigured(f"{setting_name} must be a positive integer.")
 # The upload endpoint only ever ingests a single file part, and every part at
-# or under FILE_UPLOAD_MAX_MEMORY_SIZE is buffered in RAM. Capping the number
-# of files at 1 stops a multipart request from accumulating many sub-threshold
-# parts (each passing the per-file size check) into multiple gigabytes of
-# resident memory. MaxDumpSizeUploadHandler additionally bounds the cumulative
-# bytes across parts as defense in depth.
+# or under FILE_UPLOAD_MAX_MEMORY_SIZE is buffered in RAM. Keep that threshold
+# much smaller than the accepted dump size so normal multipart uploads spool to
+# a temporary file before ingestion. Capping the number of files at 1 stops a
+# multipart request from accumulating many sub-threshold parts, while
+# MaxDumpSizeUploadHandler additionally bounds cumulative bytes across parts.
 DATA_UPLOAD_MAX_NUMBER_FILES = 1
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

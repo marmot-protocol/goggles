@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.db.models.functions import Length, Substr
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.http import urlencode
@@ -97,6 +98,12 @@ class AuditFileAdmin(admin.ModelAdmin):
         "events_link",
     )
 
+    def get_queryset(self, request):
+        # Admin changelists/autocomplete render metadata only. Keep the complete
+        # upload body out of those page-sized query results; the change-page
+        # preview intentionally resolves the one deferred body it displays.
+        return super().get_queryset(request).defer("raw_text", "user_agent")
+
     @admin.display(description="Raw text (preview)")
     def raw_text_preview(self, obj):
         """Bounded, read-only preview of the uploaded JSONL.
@@ -167,6 +174,78 @@ class AuditEventAdmin(admin.ModelAdmin):
     )
     autocomplete_fields = ("audit_file", "group")
     show_full_result_count = False
+    # Raw evidence is immutable forensic input and can be as large as the
+    # complete quarantined upload. Keep it out of Django's generated form and
+    # expose one bounded line preview plus an intentional link to the complete
+    # evidence response.
+    exclude = (
+        "raw_line",
+        "raw_event",
+        "raw_kind",
+        "raw_context",
+        "context_human_action",
+        "context_transport",
+        "context_engine",
+        "context_group",
+        "context_convergence",
+        "context_source",
+    )
+    readonly_fields = ("raw_line_preview", "evidence_link")
+
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .defer(
+                "raw_line",
+                "raw_event",
+                "raw_kind",
+                "raw_context",
+                "context_human_action",
+                "context_transport",
+                "context_engine",
+                "context_group",
+                "context_convergence",
+                "context_source",
+            )
+        )
+
+    @admin.display(description="Raw line (preview)")
+    def raw_line_preview(self, obj):
+        if obj is None or obj.pk is None:
+            return "\u2014"
+        # Slice in SQL: resolving the deferred TextField first would still pull
+        # a quarantined 50 MiB upload into the worker merely to render 2,000
+        # characters of it.
+        row = (
+            AuditEvent.objects.filter(pk=obj.pk)
+            .annotate(
+                preview=Substr("raw_line", 1, RAW_TEXT_PREVIEW_CHARS),
+                total_chars=Length("raw_line"),
+            )
+            .values("preview", "total_chars")
+            .get()
+        )
+        preview = row["preview"] or ""
+        total_chars = row["total_chars"] or 0
+        notice = (
+            f"Showing first {RAW_TEXT_PREVIEW_CHARS} of {total_chars} characters."
+            if total_chars > RAW_TEXT_PREVIEW_CHARS
+            else f"{total_chars} characters."
+        )
+        return format_html(
+            '<p><em>{}</em></p><pre style="max-height: 24em; overflow: auto; '
+            'white-space: pre-wrap;">{}</pre>',
+            notice,
+            preview,
+        )
+
+    @admin.display(description="Complete evidence")
+    def evidence_link(self, obj):
+        if obj is None or obj.pk is None:
+            return "\u2014"
+        url = reverse("api-event-evidence", kwargs={"event_id": obj.pk})
+        return format_html('<a href="{}">Open JSON evidence</a>', url)
 
     def lookup_allowed(self, lookup, value, request):
         if lookup == "audit_file__id__exact":
@@ -180,6 +259,9 @@ class AnalysisRunAdmin(admin.ModelAdmin):
     search_fields = ("title", "notes", "group__group_ref")
     autocomplete_fields = ("group", "created_by")
     readonly_fields = ("created_at",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).defer("report_json")
 
 
 @admin.register(DeliveryArtifact)

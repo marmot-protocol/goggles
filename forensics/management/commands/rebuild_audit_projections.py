@@ -100,7 +100,7 @@ def groups_from_audit_file_ids(audit_file_ids: list[int]) -> list[AuditGroup]:
     seen_group_ids = set()
     for audit_file_id in audit_file_ids:
         try:
-            audit_file = AuditFile.objects.get(id=audit_file_id)
+            audit_file = AuditFile.objects.defer("raw_text", "user_agent").get(id=audit_file_id)
         except AuditFile.DoesNotExist as exc:
             raise CommandError("No audit file matched one of the requested ids.") from exc
         group_ids = set(audit_file.groups.values_list("id", flat=True))
