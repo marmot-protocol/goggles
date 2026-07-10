@@ -47,6 +47,10 @@ Projection endpoints support these filters where the field applies:
 - `limit`: defaults to `100`, capped at `500`
 - `offset`: defaults to `0`
 
+Compatibility note: releases before the memory-pressure hardening defaulted to
+500 rows and allowed up to 5,000. API consumers that relied on those larger
+pages must now follow `has_more` and advance `offset` in batches of at most 500.
+
 Paginated responses include:
 
 ```json

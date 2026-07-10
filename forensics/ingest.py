@@ -407,16 +407,10 @@ def save_invalid_upload(
 def parse_jsonl(raw_text: str) -> list[ParsedLine]:
     parsed_lines = []
     for line_number, raw_line in enumerate(iter_jsonl_record_lines(raw_text), start=1):
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        if len(parsed_lines) >= settings.GOGGLES_MAX_DUMP_RECORDS:
-            raise AuditLogComplexityError(
-                f"record count exceeds maximum of {settings.GOGGLES_MAX_DUMP_RECORDS}"
-            )
         # UTF-8 can use more than one byte per character. Avoid encoding an
-        # already-obviously-oversized line, then enforce the exact byte ceiling
-        # for non-ASCII input before json.loads expands it into Python objects.
+        # already-obviously-oversized line, then enforce the exact byte ceiling.
+        # Check before stripping/skipping so a whitespace-only line cannot
+        # bypass the per-record allocation bound.
         if (
             len(raw_line) > settings.GOGGLES_MAX_JSONL_LINE_BYTES
             or len(raw_line.encode("utf-8")) > settings.GOGGLES_MAX_JSONL_LINE_BYTES
@@ -424,6 +418,13 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
             raise AuditLogComplexityError(
                 f"line {line_number} exceeds maximum of "
                 f"{settings.GOGGLES_MAX_JSONL_LINE_BYTES} UTF-8 bytes"
+            )
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        if len(parsed_lines) >= settings.GOGGLES_MAX_DUMP_RECORDS:
+            raise AuditLogComplexityError(
+                f"record count exceeds maximum of {settings.GOGGLES_MAX_DUMP_RECORDS}"
             )
         data = None
         errors = []

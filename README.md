@@ -132,7 +132,12 @@ GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST=50000
 GOGGLES_AGENT_EXPORT_MAX_EVENTS=50000
 GOGGLES_FILE_UPLOAD_MEMORY_BYTES=1048576
 GOGGLES_UPLOADS_ENABLED=1
+GOGGLES_EXPORTS_ENABLED=1
 GOGGLES_WEB_MEMORY_LIMIT=16g
+GOGGLES_WEB_CPUS=2.0
+GOGGLES_WEB_PIDS_LIMIT=256
+GOGGLES_WEB_LOG_MAX_SIZE=20m
+GOGGLES_WEB_LOG_MAX_FILES=5
 GOGGLES_WEB_WORKERS=3
 GOGGLES_WEB_THREADS=4
 GOGGLES_WEB_TIMEOUT_SECONDS=300
@@ -145,6 +150,18 @@ GLITCHTIP_TRACES_SAMPLE_RATE=0.05
 POSTGRES_DB=goggles
 POSTGRES_USER=goggles
 POSTGRES_PASSWORD=replace-with-long-random-database-password
+```
+
+Compose reads container resource and logging limits while it parses the Compose
+file, before a service's `env_file` is applied. The default `.env` works for
+both purposes automatically. When using a custom file, supply it through both
+mechanisms so values such as `GOGGLES_WEB_MEMORY_LIMIT` are not silently left at
+their defaults:
+
+```sh
+export GOGGLES_ENV_FILE=/absolute/path/to/goggles.env
+docker compose --env-file "$GOGGLES_ENV_FILE" config
+docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build
 ```
 
 `GLITCHTIP_DSN` enables server-side exception reporting and 5% performance

@@ -95,19 +95,34 @@ OTHER_MSG_ID = "33" * 32
 DIGEST_A = "aa" * 32
 DIGEST_B = "bb" * 32
 
+HEAVY_EVENT_SELECT_COLUMNS = {
+    field: f'"forensics_auditevent"."{field}"'
+    for field in (
+        "raw_line",
+        "raw_event",
+        "raw_kind",
+        "raw_context",
+        "context_human_action",
+        "context_transport",
+        "context_engine",
+        "context_group",
+        "context_convergence",
+        "context_source",
+    )
+}
 HEAVY_BULK_SELECT_COLUMNS = (
     '"forensics_auditfile"."raw_text"',
-    '"forensics_auditevent"."raw_line"',
-    '"forensics_auditevent"."raw_event"',
+    *HEAVY_EVENT_SELECT_COLUMNS.values(),
 )
 
 
-def heavy_bulk_selects(captured_queries):
+def heavy_bulk_selects(captured_queries, *, allowed_columns=()):
+    prohibited_columns = set(HEAVY_BULK_SELECT_COLUMNS) - set(allowed_columns)
     return [
         query["sql"]
         for query in captured_queries
         if query["sql"].lstrip().upper().startswith("SELECT")
-        and any(column in query["sql"] for column in HEAVY_BULK_SELECT_COLUMNS)
+        and any(column in query["sql"] for column in prohibited_columns)
     ]
 
 
@@ -1640,7 +1655,16 @@ class AuditLogIngestionTests(TestCase):
 
         self.assertEqual(api_response.status_code, 200)
         payload = api_response.json()
-        self.assertEqual(heavy_bulk_selects(projection_api_queries.captured_queries), [])
+        self.assertEqual(
+            heavy_bulk_selects(
+                projection_api_queries.captured_queries,
+                allowed_columns=(
+                    HEAVY_EVENT_SELECT_COLUMNS["raw_kind"],
+                    HEAVY_EVENT_SELECT_COLUMNS["context_source"],
+                ),
+            ),
+            [],
+        )
         self.assertEqual(payload["schema_version"], "goggles-audit-projections/v1")
         self.assertEqual(payload["filters"]["engine_id"], ENGINE_ALICE)
         self.assertEqual(payload["pagination"]["delivery_artifacts"]["limit"], 100)
@@ -2546,6 +2570,24 @@ class AuditLogIngestionTests(TestCase):
         audit_file = AuditFile.objects.get()
         self.assertEqual(audit_file.raw_text, body)
         self.assertEqual(audit_file.events.count(), 1)
+
+    @override_settings(GOGGLES_MAX_JSONL_LINE_BYTES=32)
+    def test_whitespace_only_line_still_obeys_line_byte_limit(self):
+        raw_token, _token = UploadToken.issue("bounded parser")
+        body = (" " * 33) + "\n"
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("line 1 exceeds maximum of 32 UTF-8 bytes", response.json()["error"])
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.raw_text, body)
+        self.assertEqual(audit_file.events.get().raw_line, body)
 
     def test_invalid_utf8_group_upload_links_file_to_fallback_group(self):
         raw_token, _token = UploadToken.issue("ios test client")
@@ -4543,7 +4585,14 @@ class IncrementalProjectionIngestTests(TestCase):
 
         self.assertTrue(result.created)
         self.assertEqual(
-            heavy_bulk_selects(captured.captured_queries),
+            heavy_bulk_selects(
+                captured.captured_queries,
+                allowed_columns=(
+                    HEAVY_EVENT_SELECT_COLUMNS["raw_kind"],
+                    HEAVY_EVENT_SELECT_COLUMNS["context_transport"],
+                    HEAVY_EVENT_SELECT_COLUMNS["context_convergence"],
+                ),
+            ),
             [],
             "projection ingestion must not hydrate raw upload or raw event bodies",
         )
@@ -6206,7 +6255,13 @@ class DashboardTests(TestCase):
         self.assertContains(state_response, "text value")
         self.assertNotContains(state_response, "Launch room")
         self.assertContains(state_response, "Epoch state transitions")
-        self.assertEqual(heavy_bulk_selects(tab_queries.captured_queries), [])
+        self.assertEqual(
+            heavy_bulk_selects(
+                tab_queries.captured_queries,
+                allowed_columns=(HEAVY_EVENT_SELECT_COLUMNS["context_source"],),
+            ),
+            [],
+        )
 
         evidence_response = self.client.get(
             reverse("group-tab", kwargs={"slug": group.slug, "tab": "evidence"})
@@ -6340,7 +6395,13 @@ class DashboardTests(TestCase):
         )
 
         self.assertEqual(delivery_response.status_code, 200)
-        self.assertEqual(heavy_bulk_selects(delivery_queries.captured_queries), [])
+        self.assertEqual(
+            heavy_bulk_selects(
+                delivery_queries.captured_queries,
+                allowed_columns=(HEAVY_EVENT_SELECT_COLUMNS["context_source"],),
+            ),
+            [],
+        )
         self.assertEqual(len(delivery_response.context["artifacts"]), tab_limit)
         self.assertContains(delivery_response, f"Showing first {tab_limit} message artifacts")
         self.assertContains(delivery_response, "delivery-marker-000")
@@ -6513,7 +6574,16 @@ class DashboardTests(TestCase):
         self.assertLess(len(response.content), 250_000)
         self.assertNotContains(response, "RAW-LINE-MARKER-2999")
         self.assertNotContains(response, 'id="timeline-data"')
-        self.assertEqual(heavy_bulk_selects(shell_queries.captured_queries), [])
+        self.assertEqual(
+            heavy_bulk_selects(
+                shell_queries.captured_queries,
+                allowed_columns=(
+                    HEAVY_EVENT_SELECT_COLUMNS["raw_kind"],
+                    HEAVY_EVENT_SELECT_COLUMNS["context_source"],
+                ),
+            ),
+            [],
+        )
 
         with CaptureQueriesContext(connection) as evidence_queries:
             evidence_response = self.client.get(
@@ -8676,6 +8746,35 @@ class AuditFileAdminTests(TestCase):
         self.assertNotIn("audit_file", AuditEventAdmin.list_filter)
         self.assertIn("audit_file", AuditEventAdmin.autocomplete_fields)
         self.assertIn("group", AuditEventAdmin.autocomplete_fields)
+
+    def test_audit_event_change_page_bounds_raw_evidence(self):
+        from .admin import AuditEventAdmin
+
+        audit_file = self.make_audit_file(1)
+        event = audit_file.events.get()
+        trailing_marker = "TRAILING-RAW-LINE-MARKER"
+        AuditEvent.objects.filter(pk=event.pk).update(
+            raw_line="FIRST-RAW-LINE-MARKER" + ("x" * 2_000_000) + trailing_marker,
+            raw_event={"oversized": "y" * 2_000_000},
+            raw_kind={"oversized": "z" * 500_000},
+            raw_context={"oversized": "q" * 500_000},
+        )
+
+        response = self.client.get(reverse("admin:forensics_auditevent_change", args=[event.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(len(response.content), 200_000)
+        self.assertContains(response, "Raw line (preview)")
+        self.assertContains(response, "FIRST-RAW-LINE-MARKER")
+        self.assertNotContains(response, trailing_marker)
+        self.assertContains(response, "Open JSON evidence")
+        self.assertContains(
+            response,
+            reverse("api-event-evidence", kwargs={"event_id": event.pk}),
+        )
+        for field in HEAVY_EVENT_SELECT_COLUMNS:
+            self.assertIn(field, AuditEventAdmin.exclude)
+            self.assertNotContains(response, f'name="{field}"')
 
     # --- raw_text bounding (goggles#34, adversarial review follow-up) -------
     #

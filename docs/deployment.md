@@ -60,15 +60,29 @@ request path.
 The performance hardening release does **not** require purging audit data.
 Deploy it with uploads paused so no old worker continues a high-memory ingest:
 
+Set the Compose environment source once before running the commands below. This
+explicit `--env-file` is required for Compose-time resource and logging limits;
+the service-level `env_file` alone only populates the container environment.
+
+```sh
+export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
+```
+
 1. Set `GOGGLES_UPLOADS_ENABLED=0` in the production environment.
 2. Recreate the web service so the changed environment and Compose resource
-   limits take effect: `docker compose up -d --build --force-recreate web`.
+   limits take effect:
+   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web`.
 3. Confirm the container has the expected 16 GiB memory/no-swap boundary (or
-   the value set in `GOGGLES_WEB_MEMORY_LIMIT`) with
-   `docker inspect goggles-web-1` and wait for the health check.
-4. Exercise an authenticated group overview, delivery tab, evidence tab, and a
-   representative upload while watching `docker stats`.
-5. Set `GOGGLES_UPLOADS_ENABLED=1` and recreate the web service again.
+   the value set in `GOGGLES_WEB_MEMORY_LIMIT`) by resolving the actual Compose
+   container rather than assuming a project-specific name:
+   `web_container_id="$(docker compose --env-file "$GOGGLES_ENV_FILE" ps -q web)"; test -n "$web_container_id"; docker inspect "$web_container_id"`.
+   Wait for the health check to pass.
+4. While uploads remain paused, exercise an authenticated group overview,
+   delivery tab, and evidence tab while watching `docker stats`.
+5. Set `GOGGLES_UPLOADS_ENABLED=1` and recreate the web service again with the
+   same `--env-file` command from step 2.
+6. Perform a representative upload while watching `docker stats`, then recheck
+   the group overview, delivery tab, and evidence tab.
 
 Do not use `purge_audit_data` for this deployment. The query changes avoid
 hydrating stored raw bodies without changing their schema or deleting evidence.
@@ -76,6 +90,7 @@ hydrating stored raw bodies without changing their schema or deleting evidence.
 The Compose service keeps three threaded workers by default, recycles each
 after a jittered 500-request budget, and constrains the whole web container to
 a configurable 16 GiB default (`GOGGLES_WEB_MEMORY_LIMIT`) with no additional
-swap. During an incident, set `GOGGLES_WEB_WORKERS=1` before the recreate to
-prevent concurrent amplification; restore the measured production worker count
-only after memory remains stable.
+swap. CPU, PID, and Docker log rotation limits are configurable through the
+adjacent `GOGGLES_WEB_*` settings. During an incident, set
+`GOGGLES_WEB_WORKERS=1` before the recreate to prevent concurrent amplification;
+restore the measured production worker count only after memory remains stable.

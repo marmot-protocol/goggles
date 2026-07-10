@@ -1835,7 +1835,7 @@ def network_observation_queryset():
     return NetworkObservation.objects.prefetch_related(
         Prefetch(
             "audit_event",
-            queryset=evidence_ref_event_queryset("audit_data_mode"),
+            queryset=evidence_ref_event_queryset(),
         )
     )
 
@@ -2128,6 +2128,9 @@ def action_groups_for_api(group: AuditGroup, filters: dict) -> ActionGroupCollec
             event for event in events if filters["message_id"] in action_event_message_ids(event)
         ]
     event_by_id = {event.id: event for event in events}
+    # A truncated window can bisect one operation_id group. In that case the
+    # request-level scan_truncated flag is authoritative and each affected
+    # group's event_count describes only its in-window evidence.
     groups = [
         action_group_payload(action_group, event_by_id)
         for action_group in human_action_groups_for_group(events)
