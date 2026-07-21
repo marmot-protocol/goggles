@@ -50,16 +50,13 @@ services:
       - static-assets:/app/staticfiles
     ports:
       - "127.0.0.1:8000:8000"
-    command: >
-      sh -c "python manage.py migrate --noinput &&
-             python manage.py collectstatic --noinput &&
-             exec gunicorn config.wsgi:application
-             --bind 0.0.0.0:8000
-             --workers $${GOGGLES_WEB_WORKERS:-3}
-             --threads $${GOGGLES_WEB_THREADS:-4}
-             --timeout $${GOGGLES_WEB_TIMEOUT_SECONDS:-300}
-             --max-requests $${GOGGLES_WEB_MAX_REQUESTS:-500}
-             --max-requests-jitter $${GOGGLES_WEB_MAX_REQUESTS_JITTER:-50}"
+    command:
+      - sh
+      - -c
+      - >-
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${GOGGLES_WEB_WORKERS:-3} --threads $${GOGGLES_WEB_THREADS:-4} --timeout $${GOGGLES_WEB_TIMEOUT_SECONDS:-300} --max-requests $${GOGGLES_WEB_MAX_REQUESTS:-500} --max-requests-jitter $${GOGGLES_WEB_MAX_REQUESTS_JITTER:-50}
     logging:
       driver: json-file
       options:
