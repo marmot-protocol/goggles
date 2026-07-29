@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from django.core.signing import BadSignature, Signer
+from django.core import signing
+from django.core.signing import BadSignature
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-CURSOR_SIGNER = Signer(salt="goggles-groups-v1-cursor")
+CURSOR_SALT = "goggles-groups-v1-cursor"
 
 
 class InvalidGroupListCursor(ValueError):
@@ -45,14 +45,16 @@ def encode_group_list_cursor(
         "s": slug,
         "a": updated_since.isoformat() if updated_since is not None else None,
     }
-    return CURSOR_SIGNER.sign(json.dumps(payload, separators=(",", ":")))
+    return signing.dumps(payload, salt=CURSOR_SALT, compress=True)
 
 
 def decode_group_list_cursor(raw_cursor: str) -> GroupListCursor:
     if not raw_cursor:
         raise InvalidGroupListCursor("cursor is required")
     try:
-        payload = json.loads(CURSOR_SIGNER.unsign(raw_cursor))
+        payload = signing.loads(raw_cursor, salt=CURSOR_SALT)
+        if not isinstance(payload, dict):
+            raise InvalidGroupListCursor("cursor payload is invalid")
         watermark = _parse_cursor_timestamp(payload.get("w"))
         updated_at = _parse_cursor_timestamp(payload.get("u"))
         slug = payload.get("s")
@@ -65,7 +67,9 @@ def decode_group_list_cursor(raw_cursor: str) -> GroupListCursor:
             slug=slug,
             updated_since=updated_since,
         )
-    except (BadSignature, TypeError, json.JSONDecodeError, ValueError) as exc:
+    except InvalidGroupListCursor:
+        raise
+    except (BadSignature, TypeError, ValueError) as exc:
         raise InvalidGroupListCursor("cursor is invalid") from exc
 
 

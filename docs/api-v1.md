@@ -153,7 +153,7 @@ Paginated responses include:
 }
 ```
 
-Polling contract:
+#### Polling contract
 
 1. Start each poll without `cursor`. Read `polling_watermark` from the first
    response and keep it for the whole traversal. Use it only to bound that

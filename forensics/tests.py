@@ -5938,6 +5938,19 @@ class GroupListApiTests(TestCase):
         self.assertIn("next_cursor", payload["pagination"])
         self.assertIn("polling_watermark", payload)
 
+    def test_cursor_does_not_expose_group_slug(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "1"},
+        )
+
+        cursor = response.json()["pagination"]["next_cursor"]
+        self.assertNotIn(slugs[0], cursor)
+
     def test_updated_since_filters_groups_for_polling(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
         stale = AuditGroup.objects.create(
@@ -6169,14 +6182,9 @@ class GroupListPollingCommitRaceTests(TransactionTestCase):
     def _postgres_connection(self):
         import psycopg
 
-        settings = connection.settings_dict
-        return psycopg.connect(
-            host=settings["HOST"],
-            port=settings["PORT"],
-            dbname=settings["NAME"],
-            user=settings["USER"],
-            password=settings["PASSWORD"],
-        )
+        params = connection.get_connection_params()
+        params.setdefault("connect_timeout", 10)
+        return psycopg.connect(**params)
 
     def test_delayed_upload_commit_is_discovered_by_full_rescan_not_incremental_watermark(self):
         auth = {"HTTP_AUTHORIZATION": f"Bearer {self.raw_token}"}
@@ -6188,6 +6196,22 @@ class GroupListPollingCommitRaceTests(TransactionTestCase):
         try:
             with pg_conn.transaction():
                 with pg_conn.cursor() as cursor:
+                    self.assertEqual(
+                        [
+                            field.column
+                            for field in AuditGroup._meta.concrete_fields
+                            if not field.primary_key
+                        ],
+                        [
+                            "name",
+                            "slug",
+                            "group_ref",
+                            "divergent_message_count",
+                            "notes",
+                            "created_at",
+                            "updated_at",
+                        ],
+                    )
                     cursor.execute(
                         """
                         INSERT INTO forensics_auditgroup (
