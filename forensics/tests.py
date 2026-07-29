@@ -5908,10 +5908,10 @@ class GroupListApiTests(TestCase):
 
         payload = response.json()
         self.assertEqual(payload["pagination"]["limit"], 1)
-        self.assertEqual(payload["pagination"]["offset"], 0)
         self.assertEqual(payload["pagination"]["returned"], 1)
         self.assertIn("has_more", payload["pagination"])
-        self.assertIn("next_offset", payload["pagination"])
+        self.assertIn("next_cursor", payload["pagination"])
+        self.assertIn("polling_watermark", payload)
 
     def test_updated_since_filters_groups_for_polling(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
@@ -5966,10 +5966,129 @@ class GroupListApiTests(TestCase):
             self.client.get(
                 self.url,
                 HTTP_AUTHORIZATION=f"Bearer {raw_token}",
-                data={"limit": "2", "offset": "0"},
+                data={"limit": "2"},
             )
 
         self.assertEqual(len(wrapped_rows.call_args.args[0]), 2)
+
+    def _create_ordered_pagination_groups(self, count: int = 4):
+        base = timezone.now()
+        AuditGroup.objects.all().delete()
+        slugs = []
+        for index in range(count):
+            slug = f"{index:02d}" * 32
+            group = AuditGroup.objects.create(
+                name=f"Group {index}",
+                slug=slug,
+                group_ref=slug,
+            )
+            AuditGroup.objects.filter(pk=group.pk).update(updated_at=base - timedelta(hours=index))
+            slugs.append(slug)
+        return slugs
+
+    def test_deleting_earlier_group_between_pages_does_not_skip_later_groups(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = self._create_ordered_pagination_groups()
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        self.assertEqual([group["slug"] for group in page1.json()["groups"]], slugs[:2])
+
+        AuditGroup.objects.filter(slug=slugs[0]).delete()
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={
+                "limit": "2",
+                "cursor": page1.json()["pagination"]["next_cursor"],
+            },
+        )
+        self.assertEqual(page2.status_code, 200)
+        self.assertEqual(
+            [group["slug"] for group in page2.json()["groups"]],
+            slugs[2:],
+        )
+
+    def test_cursor_keeps_updated_since_filter_across_pages(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = self._create_ordered_pagination_groups()
+        newest_group = AuditGroup.objects.get(slug=slugs[0])
+        updated_since = newest_group.updated_at - timedelta(hours=2, minutes=30)
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "updated_since": updated_since.isoformat()},
+        )
+        self.assertEqual(page1.status_code, 200)
+        self.assertEqual([group["slug"] for group in page1.json()["groups"]], slugs[:2])
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={
+                "limit": "2",
+                "cursor": page1.json()["pagination"]["next_cursor"],
+            },
+        )
+        self.assertEqual(page2.status_code, 200)
+        self.assertEqual(
+            [group["slug"] for group in page2.json()["groups"]],
+            [slugs[2]],
+        )
+        self.assertEqual(page2.json()["updated_since"], updated_since.isoformat())
+
+    def test_group_updated_after_polling_watermark_appears_on_next_poll(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = self._create_ordered_pagination_groups()
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        page1_payload = page1.json()
+        polling_watermark = page1_payload["polling_watermark"]
+        next_cursor = page1_payload["pagination"]["next_cursor"]
+
+        AuditGroup.objects.filter(slug=slugs[2]).update(updated_at=timezone.now())
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "cursor": next_cursor},
+        )
+        self.assertEqual(page2.status_code, 200)
+        page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+        self.assertNotIn(slugs[2], page2_slugs)
+        self.assertEqual(page2_slugs, [slugs[3]])
+        self.assertFalse(page2.json()["pagination"]["has_more"])
+
+        next_poll = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": polling_watermark},
+        )
+        self.assertEqual(next_poll.status_code, 200)
+        self.assertIn(slugs[2], [group["slug"] for group in next_poll.json()["groups"]])
+
+    def test_rejects_invalid_or_tampered_cursor(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        for cursor in ("not-a-cursor", "tampered:cursor:value"):
+            response = self.client.get(
+                self.url,
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+                data={"cursor": cursor},
+            )
+            self.assertEqual(response.status_code, 400, cursor)
+            self.assertEqual(response.json(), {"error": "invalid cursor"})
 
 
 class ProfileAccessTokenTests(TestCase):

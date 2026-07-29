@@ -45,6 +45,11 @@ from .analysis import (
     structural_quarantine_exclusion,
     valid_events_for_group,
 )
+from .group_list_cursor import (
+    InvalidGroupListCursor,
+    decode_group_list_cursor,
+    encode_group_list_cursor,
+)
 from .ingest import ingest_audit_log_bytes
 from .models import (
     AnalysisRun,
@@ -871,22 +876,46 @@ def api_group_list(request: HttpRequest):
         return JsonResponse({"error": "authentication required"}, status=401)
 
     filters = group_list_api_filters(request)
+    limit = filters["limit"]
+    cursor_raw = filters["cursor"]
+    try:
+        if cursor_raw:
+            cursor = decode_group_list_cursor(cursor_raw)
+            polling_watermark = cursor.watermark
+            keyset_filter = cursor.keyset_filter()
+            updated_since = cursor.updated_since
+        else:
+            polling_watermark = timezone.now()
+            keyset_filter = Q()
+            updated_since = filters["updated_since"]
+    except InvalidGroupListCursor:
+        return JsonResponse({"error": "invalid cursor"}, status=400)
+
     queryset = readable_groups_queryset(reader).order_by("-updated_at", "slug")
-    updated_since = filters["updated_since"]
+    queryset = queryset.filter(updated_at__lte=polling_watermark)
     if updated_since is not None:
         queryset = queryset.filter(updated_at__gt=updated_since)
+    queryset = queryset.filter(keyset_filter)
 
-    limit = filters["limit"]
-    offset = filters["offset"]
-    page_candidates = list(queryset[offset : offset + limit + 1])
+    page_candidates = list(queryset[: limit + 1])
     page_groups = page_candidates[:limit]
     groups = group_list_rows(page_groups)
     has_more = len(page_candidates) > limit
+    next_cursor = None
+    if has_more and page_groups:
+        last_group = page_groups[-1]
+        next_cursor = encode_group_list_cursor(
+            watermark=polling_watermark,
+            updated_at=last_group.updated_at,
+            slug=last_group.slug,
+            updated_since=updated_since,
+        )
     return JsonResponse(
         {
             "schema_version": "goggles-groups/v1",
             "groups": [group_list_api_payload(group) for group in groups],
-            "pagination": pagination_payload(limit, offset, len(groups), has_more),
+            "pagination": group_list_pagination_payload(limit, len(groups), has_more, next_cursor),
+            "polling_watermark": polling_watermark.isoformat(),
             **group_list_change_detection_payload(filters, updated_since),
         },
         json_dumps_params={"separators": (",", ":")},
@@ -1432,7 +1461,7 @@ def group_list_api_filters(request: HttpRequest) -> dict:
     limit = min(max(limit, 1), GROUP_LIST_API_MAX_LIMIT)
     return {
         "limit": limit,
-        "offset": bounded_nonnegative_int(request.GET.get("offset")),
+        "cursor": (request.GET.get("cursor") or "").strip(),
         "updated_since": parse_group_list_updated_since(request.GET.get("updated_since")),
     }
 
@@ -1744,6 +1773,20 @@ def pagination_payload(limit: int, offset: int, returned: int, has_more: bool) -
         "returned": returned,
         "has_more": has_more,
         "next_offset": offset + returned if has_more else None,
+    }
+
+
+def group_list_pagination_payload(
+    limit: int,
+    returned: int,
+    has_more: bool,
+    next_cursor: str | None,
+) -> dict:
+    return {
+        "limit": limit,
+        "returned": returned,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
     }
 
 

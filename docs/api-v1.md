@@ -122,17 +122,48 @@ appear on the next poll without manual slug configuration.
 Query parameters:
 
 - `limit`: defaults to `100`, capped at `500`
-- `offset`: defaults to `0`
+- `cursor`: optional opaque continuation token from a previous page's
+  `pagination.next_cursor`. Omit on the first page of a poll.
 - `updated_since`: optional ISO-8601 timestamp; when set, only groups with
   `updated_at` strictly after this value are returned. The response echoes the
   applied filter as `updated_since`.
 
-Results are ordered by `(updated_at desc, slug asc)` so polling with
-`updated_since` is stable. Paginated responses include the common pagination
-object (see [Common Query Parameters](#common-query-parameters)). Follow
-`next_offset` until `has_more` is false before advancing the poller's watermark to
-the greatest returned `updated_at`. On the next poll, an empty `groups` array means
-no group metadata changed and no full exports need to be downloaded.
+Results are ordered by `(updated_at desc, slug asc)`. The first page of each poll
+fixes a server `polling_watermark` timestamp; every page in that traversal
+reuses the same watermark and only includes groups with `updated_at` at or before
+it. Groups created or updated after the watermark are deferred to the next poll
+rather than skipped or reordered mid-traversal.
+
+Paginated responses include:
+
+```json
+{
+  "pagination": {
+    "limit": 100,
+    "returned": 10,
+    "has_more": true,
+    "next_cursor": "…"
+  },
+  "polling_watermark": "2026-07-29T09:00:00+00:00"
+}
+```
+
+Polling contract:
+
+1. Start each poll without `cursor`. Read `polling_watermark` from the first
+   response and keep it for the whole traversal.
+2. Follow `pagination.next_cursor` until `has_more` is `false`. Each cursor is
+   bound to that poll's watermark and original `updated_since` filter, so only
+   `cursor` and the desired `limit` need to be sent on continuation requests.
+   Tampered or foreign cursors return `400` `{"error":"invalid cursor"}`.
+3. After the traversal completes, set the next poll's `updated_since` to the
+   completed traversal's `polling_watermark` (or a later client watermark you
+   already track). An empty `groups` array on the next poll means no group
+   metadata changed and no full exports need to be downloaded.
+
+Projection endpoints still use numeric `offset` pagination (see
+[Common Query Parameters](#common-query-parameters)); only the group index uses
+cursor pagination.
 
 Group responses include `schema_version`, group summary fields, tab counts, and
 classification metadata indicating whether full-data audit content may be
