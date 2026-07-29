@@ -22,13 +22,13 @@ class InvalidGroupListCursor(ValueError):
 class GroupListCursor:
     watermark: datetime
     updated_at: datetime
-    slug: str
+    group_id: int
     updated_since: datetime | None
 
     def keyset_filter(self) -> Q:
         return Q(updated_at__lt=self.updated_at) | Q(
             updated_at=self.updated_at,
-            slug__gt=self.slug,
+            pk__gt=self.group_id,
         )
 
 
@@ -36,13 +36,13 @@ def encode_group_list_cursor(
     *,
     watermark: datetime,
     updated_at: datetime,
-    slug: str,
+    group_id: int,
     updated_since: datetime | None,
 ) -> str:
     payload = {
         "w": watermark.isoformat(),
         "u": updated_at.isoformat(),
-        "s": slug,
+        "i": group_id,
         "a": updated_since.isoformat() if updated_since is not None else None,
     }
     return signing.dumps(payload, salt=CURSOR_SALT, compress=True)
@@ -57,14 +57,14 @@ def decode_group_list_cursor(raw_cursor: str) -> GroupListCursor:
             raise InvalidGroupListCursor("cursor payload is invalid")
         watermark = _parse_cursor_timestamp(payload.get("w"))
         updated_at = _parse_cursor_timestamp(payload.get("u"))
-        slug = payload.get("s")
+        group_id = payload.get("i")
         updated_since = _parse_optional_cursor_timestamp(payload.get("a"))
-        if not isinstance(slug, str) or not slug:
-            raise InvalidGroupListCursor("cursor slug is invalid")
+        if not isinstance(group_id, int) or group_id <= 0:
+            raise InvalidGroupListCursor("cursor group id is invalid")
         return GroupListCursor(
             watermark=watermark,
             updated_at=updated_at,
-            slug=slug,
+            group_id=group_id,
             updated_since=updated_since,
         )
     except InvalidGroupListCursor:

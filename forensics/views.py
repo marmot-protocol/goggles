@@ -891,7 +891,7 @@ def api_group_list(request: HttpRequest):
     except InvalidGroupListCursor:
         return JsonResponse({"error": "invalid cursor"}, status=400)
 
-    queryset = readable_groups_queryset(reader).order_by("-updated_at", "slug")
+    queryset = readable_groups_queryset(reader).order_by("-updated_at", "pk")
     queryset = queryset.filter(updated_at__lte=polling_watermark)
     if updated_since is not None:
         queryset = queryset.filter(updated_at__gt=updated_since)
@@ -907,7 +907,7 @@ def api_group_list(request: HttpRequest):
         next_cursor = encode_group_list_cursor(
             watermark=polling_watermark,
             updated_at=last_group.updated_at,
-            slug=last_group.slug,
+            group_id=last_group.pk,
             updated_since=updated_since,
         )
     return JsonResponse(

@@ -1,8 +1,10 @@
+import base64
 import contextlib
 import hashlib
 import json
 import os
 import unittest
+import zlib
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -118,6 +120,19 @@ def create_ordered_pagination_groups(count: int = 4):
         AuditGroup.objects.filter(pk=group.pk).update(updated_at=base - timedelta(hours=index))
         slugs.append(slug)
     return slugs
+
+
+def decode_group_list_cursor_payload_without_secret(cursor: str) -> dict:
+    """Decode the client-visible signed cursor payload without SECRET_KEY."""
+    encoded = cursor.split(":")[0]
+    compressed = encoded.startswith(".")
+    if compressed:
+        encoded = encoded[1:]
+    pad = b"=" * (-len(encoded) % 4)
+    data = base64.urlsafe_b64decode(encoded.encode("ascii") + pad)
+    if compressed:
+        data = zlib.decompress(data)
+    return json.loads(data.decode("latin-1"))
 
 
 HEAVY_EVENT_SELECT_COLUMNS = {
@@ -5941,6 +5956,7 @@ class GroupListApiTests(TestCase):
     def test_cursor_does_not_expose_group_slug(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
         slugs = create_ordered_pagination_groups()
+        exposed_slug = slugs[0]
 
         response = self.client.get(
             self.url,
@@ -5949,7 +5965,10 @@ class GroupListApiTests(TestCase):
         )
 
         cursor = response.json()["pagination"]["next_cursor"]
-        self.assertNotIn(slugs[0], cursor)
+        payload = decode_group_list_cursor_payload_without_secret(cursor)
+        self.assertNotIn(exposed_slug, cursor)
+        self.assertNotIn(exposed_slug, json.dumps(payload))
+        self.assertNotIn(exposed_slug, payload.values())
 
     def test_updated_since_filters_groups_for_polling(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)

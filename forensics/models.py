@@ -22,7 +22,7 @@ class AuditGroup(models.Model):
     class Meta:
         ordering = ["-updated_at", "-created_at"]
         indexes = [
-            models.Index(fields=["-updated_at", "slug"]),
+            models.Index(fields=["-updated_at", "id"]),
         ]
 
     def __str__(self) -> str:

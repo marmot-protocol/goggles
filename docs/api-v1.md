@@ -130,11 +130,12 @@ Query parameters:
   it does not guarantee every group that became visible since your last poll (see
   [Polling contract](#polling-contract)).
 
-Results are ordered by `(updated_at desc, slug asc)`. The first page of each poll
-fixes a server `polling_watermark` timestamp; every page in that traversal
-reuses the same watermark and only includes groups with `updated_at` at or before
-it. Groups that are still uncommitted, or that commit after the watermark is
-captured, can require a later full index poll. The watermark is **not** a
+Results are ordered by `updated_at desc` with a stable internal tie-breaker. The
+first page of each poll fixes a server `polling_watermark` timestamp; every page
+in that traversal reuses the same watermark and only includes groups with
+`updated_at` at or before it. Groups that are still uncommitted, or that commit
+after the watermark is captured, can require a later full index poll. The
+watermark is **not** a
 commit-safe upper bound on `updated_at`: a group can commit after page 1 with
 `updated_at` at or before the watermark and still be invisible to both the
 remaining pages and a subsequent `updated_since=polling_watermark` poll.

@@ -12,6 +12,6 @@ class Migration(migrations.Migration):
     operations = [
         migrations.AddIndex(
             model_name='auditgroup',
-            index=models.Index(fields=['-updated_at', 'slug'], name='forensics_a_updated_408b26_idx'),
+            index=models.Index(fields=['-updated_at', 'id'], name='forensics_a_updated_8f04c0_idx'),
         ),
     ]
