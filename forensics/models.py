@@ -21,6 +21,9 @@ class AuditGroup(models.Model):
 
     class Meta:
         ordering = ["-updated_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["-updated_at", "slug"]),
+        ]
 
     def __str__(self) -> str:
         return self.name

@@ -7,24 +7,30 @@ JSONL evidence.
 
 ## Authentication
 
-All read APIs require a logged-in Goggles user. Upload APIs use reusable bearer
-tokens and are documented separately in the app workflow notes.
+Most read APIs require a logged-in Goggles user session. The group index and
+streaming group export additionally accept a **personal access token** bearer
+credential. Send it as `Authorization: Bearer gpat_…`. On those bearer-enabled
+endpoints, missing, malformed, invalid, inactive, expired, or owner-deactivated
+credentials return `401` JSON — never an HTML login redirect.
 
-The streaming group export additionally accepts a **personal access token** — a
-read-only bearer credential a user mints from their profile page (or an operator
-mints for a service account with `manage.py create_access_token "<name>" --user
-<username>`). Send it as `Authorization: Bearer gpat_…`. A personal access token
-authorizes only the streaming group export (below) — not uploads, and not the
-session-authenticated read APIs; it is revoked by the owner, by an admin, by expiry,
-or by deactivating the owning user. Upload tokens (`goggles_…`) and personal access
-tokens (`gpat_…`) are distinct credentials and never interchangeable.
+Upload APIs use reusable upload bearer tokens (`goggles_…`) and are documented
+separately in the app workflow notes. Upload tokens never authorize read APIs.
+
+Personal access tokens are read-only credentials a user mints from their profile
+page (or an operator mints for a service account with
+`manage.py create_access_token "<name>" --user <username>`). They authorize the
+group list (`GET /api/v1/groups/`) and the streaming group export
+(`GET /api/v1/groups/{slug}/export/`) — not uploads or the other
+session-authenticated projection APIs. A token is revoked by the owner, by an
+admin, by expiry, or by deactivating the owning user. Upload tokens and
+personal access tokens are distinct credentials and never interchangeable.
 
 The current internal deployment treats authenticated Goggles users as one shared
-internal tenant. Even so, endpoint implementations should route through
-object-level scope checks before returning group, account, engine, message,
-report, or evidence data. If Goggles later adds tenant or account isolation,
-unauthorized resources should use the same not-found style behavior as unknown
-resources so callers cannot enumerate data outside their scope.
+internal tenant. Even so, endpoint implementations route through a shared
+object-level readable-group scope before returning group data. If Goggles later
+adds tenant or account isolation, unauthorized groups are omitted from the list
+and exports for unknown slugs return `404`, indistinguishable from a missing
+group, so callers cannot enumerate data outside their scope.
 
 Responses must not expose bearer tokens, upload secrets, source IPs, or user
 agents. Derived projection responses carry pointer-only evidence refs. Raw event
@@ -108,6 +114,25 @@ metadata is the field-level hook for enforcing stricter access.
 - `GET /api/v1/groups/{group_slug}/`
 - `GET /api/v1/accounts/{account_ref}/groups/`
 - `GET /api/v1/engines/{engine_id}/groups/`
+
+`GET /api/v1/groups/` accepts a logged-in session or a personal access token.
+It returns metadata for every group the reader may export. Newly-created groups
+appear on the next poll without manual slug configuration.
+
+Query parameters:
+
+- `limit`: defaults to `100`, capped at `500`
+- `offset`: defaults to `0`
+- `updated_since`: optional ISO-8601 timestamp; when set, only groups with
+  `updated_at` strictly after this value are returned. The response echoes the
+  applied filter as `updated_since`.
+
+Results are ordered by `(updated_at desc, slug asc)` so polling with
+`updated_since` is stable. Paginated responses include the common pagination
+object (see [Common Query Parameters](#common-query-parameters)). Follow
+`next_offset` until `has_more` is false before advancing the poller's watermark to
+the greatest returned `updated_at`. On the next poll, an empty `groups` array means
+no group metadata changed and no full exports need to be downloaded.
 
 Group responses include `schema_version`, group summary fields, tab counts, and
 classification metadata indicating whether full-data audit content may be

@@ -37,10 +37,10 @@ Upload bearer tokens are long-lived, reusable credentials, not one-time codes:
 ## Personal access token lifecycle
 
 Personal access tokens (`PersonalAccessToken`, raw prefix `gpat_`) are the
-**read-only** counterpart to upload tokens. They authenticate reads — currently the
-streaming group export (`GET /api/v1/groups/<slug>/export/`) — never uploads. They
-are a distinct model and credential from `UploadToken`; the two are never
-interchangeable.
+**read-only** counterpart to upload tokens. They authenticate the group index and
+streaming group export (`GET /api/v1/groups/` and
+`GET /api/v1/groups/<slug>/export/`) — never uploads. They are a distinct model and
+credential from `UploadToken`; the two are never interchangeable.
 
 - A user mints and revokes their own from the profile page; the raw token is shown
   exactly once and only its hash is stored.

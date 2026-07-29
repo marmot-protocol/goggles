@@ -5774,6 +5774,204 @@ class GroupExportStreamTests(TestCase):
         self.assertNotIn("eof", {record["t"] for record in records})
 
 
+class GroupListApiTests(TestCase):
+    """GET /api/v1/groups/ — readable group enumeration for sessions and PATs."""
+
+    def setUp(self):
+        ingest_audit_log_bytes(dump_bytes=representative_audit_log().encode("utf-8"))
+        self.group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.url = reverse("api-group-list")
+
+    def test_lists_readable_groups_with_personal_access_token(self):
+        raw_token, token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-groups/v1")
+        slugs = [group["slug"] for group in payload["groups"]]
+        self.assertIn(self.group.slug, slugs)
+        token.refresh_from_db()
+        self.assertIsNotNone(token.last_used_at)
+
+    def test_requires_authentication_returns_401_json_not_redirect(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_invalid_bearer_token(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Bearer gpat_deadbeef_nope")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_expired_personal_access_token(self):
+        raw_token, _token = PersonalAccessToken.issue(
+            "stale", user=self.user, expires_at=timezone.now() - timedelta(seconds=1)
+        )
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_malformed_authorization_scheme(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Token gpat_not_bearer")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_inactive_personal_access_token(self):
+        raw_token, token = PersonalAccessToken.issue("revoked", user=self.user)
+        token.is_active = False
+        token.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_personal_access_token_of_deactivated_owner(self):
+        raw_token, _token = PersonalAccessToken.issue("orphaned", user=self.user)
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_upload_token_cannot_list_groups(self):
+        raw_token, _token = UploadToken.issue("device")
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_lists_with_logged_in_session(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(self.group.slug, slugs)
+
+    def test_denied_group_is_omitted_from_list_and_export_returns_404(self):
+        other = AuditGroup.objects.create(
+            name="Out of scope",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        export_url = reverse("api-group-export-stream", kwargs={"slug": other.slug})
+
+        def scoped_queryset(reader):
+            self.assertEqual(reader.user, self.user)
+            return AuditGroup.objects.filter(slug=self.group.slug)
+
+        with mock.patch("forensics.views.readable_groups_queryset", side_effect=scoped_queryset):
+            list_response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+            export_response = self.client.get(export_url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(list_response.status_code, 200)
+        slugs = [group["slug"] for group in list_response.json()["groups"]]
+        self.assertEqual(slugs, [self.group.slug])
+        self.assertEqual(export_response.status_code, 404)
+
+    def test_newly_created_group_appears_without_manual_slug_configuration(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        new_group = AuditGroup.objects.create(
+            name="Fresh group",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(new_group.slug, slugs)
+
+    def test_response_includes_bounded_pagination_metadata(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "1"},
+        )
+
+        payload = response.json()
+        self.assertEqual(payload["pagination"]["limit"], 1)
+        self.assertEqual(payload["pagination"]["offset"], 0)
+        self.assertEqual(payload["pagination"]["returned"], 1)
+        self.assertIn("has_more", payload["pagination"])
+        self.assertIn("next_offset", payload["pagination"])
+
+    def test_updated_since_filters_groups_for_polling(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        stale = AuditGroup.objects.create(
+            name="Stale",
+            slug="aa" * 32,
+            group_ref="aa" * 32,
+        )
+        AuditGroup.objects.filter(pk=stale.pk).update(updated_at=timezone.now() - timedelta(days=2))
+        stale.refresh_from_db()
+        fresh = AuditGroup.objects.create(
+            name="Fresh",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+        since = (timezone.now() - timedelta(hours=1)).isoformat()
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": since},
+        )
+
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(fresh.slug, slugs)
+        self.assertNotIn(stale.slug, slugs)
+        self.assertIn(self.group.slug, slugs)
+
+    def test_updated_since_returns_empty_index_when_nothing_changed(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        after_all_updates = (timezone.now() + timedelta(seconds=1)).isoformat()
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": after_all_updates},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["groups"], [])
+        self.assertFalse(response.json()["pagination"]["has_more"])
+
+    def test_group_list_enrichment_is_bounded_to_the_requested_page(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        for index in range(3):
+            AuditGroup.objects.create(
+                name=f"Extra {index}",
+                slug=f"{index:02d}" * 32,
+                group_ref=f"{index:02d}" * 32,
+            )
+        with mock.patch("forensics.views.group_list_rows", wraps=group_list_rows) as wrapped_rows:
+            self.client.get(
+                self.url,
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+                data={"limit": "2", "offset": "0"},
+            )
+
+        self.assertEqual(len(wrapped_rows.call_args.args[0]), 2)
+
+
 class ProfileAccessTokenTests(TestCase):
     """Self-service personal access tokens on the profile page — strictly
     owner-scoped: a user can only see, mint, and revoke their own."""
