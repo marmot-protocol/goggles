@@ -2,7 +2,8 @@ import contextlib
 import hashlib
 import json
 import os
-from datetime import timedelta
+import unittest
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,7 +16,13 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
-from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.test import (
+    RequestFactory,
+    SimpleTestCase,
+    TestCase,
+    TransactionTestCase,
+    override_settings,
+)
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -90,10 +97,28 @@ ACCOUNT_ALICE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ACCOUNT_BOB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 GROUP_REF = "11" * 32
 OTHER_GROUP_REF = "44" * 32
+DELAYED_COMMIT_GROUP_REF = "55" * 32
 MSG_ID = "22" * 32
 OTHER_MSG_ID = "33" * 32
 DIGEST_A = "aa" * 32
 DIGEST_B = "bb" * 32
+
+
+def create_ordered_pagination_groups(count: int = 4):
+    base = timezone.now()
+    AuditGroup.objects.all().delete()
+    slugs = []
+    for index in range(count):
+        slug = f"{index:02d}" * 32
+        group = AuditGroup.objects.create(
+            name=f"Group {index}",
+            slug=slug,
+            group_ref=slug,
+        )
+        AuditGroup.objects.filter(pk=group.pk).update(updated_at=base - timedelta(hours=index))
+        slugs.append(slug)
+    return slugs
+
 
 HEAVY_EVENT_SELECT_COLUMNS = {
     field: f'"forensics_auditevent"."{field}"'
@@ -5971,24 +5996,9 @@ class GroupListApiTests(TestCase):
 
         self.assertEqual(len(wrapped_rows.call_args.args[0]), 2)
 
-    def _create_ordered_pagination_groups(self, count: int = 4):
-        base = timezone.now()
-        AuditGroup.objects.all().delete()
-        slugs = []
-        for index in range(count):
-            slug = f"{index:02d}" * 32
-            group = AuditGroup.objects.create(
-                name=f"Group {index}",
-                slug=slug,
-                group_ref=slug,
-            )
-            AuditGroup.objects.filter(pk=group.pk).update(updated_at=base - timedelta(hours=index))
-            slugs.append(slug)
-        return slugs
-
     def test_deleting_earlier_group_between_pages_does_not_skip_later_groups(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
-        slugs = self._create_ordered_pagination_groups()
+        slugs = create_ordered_pagination_groups()
 
         page1 = self.client.get(
             self.url,
@@ -6016,7 +6026,7 @@ class GroupListApiTests(TestCase):
 
     def test_cursor_keeps_updated_since_filter_across_pages(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
-        slugs = self._create_ordered_pagination_groups()
+        slugs = create_ordered_pagination_groups()
         newest_group = AuditGroup.objects.get(slug=slugs[0])
         updated_since = newest_group.updated_at - timedelta(hours=2, minutes=30)
 
@@ -6045,7 +6055,7 @@ class GroupListApiTests(TestCase):
 
     def test_group_updated_after_polling_watermark_appears_on_next_poll(self):
         raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
-        slugs = self._create_ordered_pagination_groups()
+        slugs = create_ordered_pagination_groups()
 
         page1 = self.client.get(
             self.url,
@@ -6089,6 +6099,150 @@ class GroupListApiTests(TestCase):
             )
             self.assertEqual(response.status_code, 400, cursor)
             self.assertEqual(response.json(), {"error": "invalid cursor"})
+
+    def test_pre_watermark_group_missed_by_incremental_poll_needs_full_rescan(self):
+        """Groups that become visible after page 1 with updated_at <= watermark are
+        excluded from page 2 and from updated_since=polling_watermark; only a full
+        index rescan discovers them."""
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+        base = AuditGroup.objects.get(slug=slugs[0]).updated_at
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        page1_payload = page1.json()
+        polling_watermark = page1_payload["polling_watermark"]
+        next_cursor = page1_payload["pagination"]["next_cursor"]
+
+        delayed = AuditGroup.objects.create(
+            name="Delayed commit",
+            slug=DELAYED_COMMIT_GROUP_REF,
+            group_ref=DELAYED_COMMIT_GROUP_REF,
+        )
+        AuditGroup.objects.filter(pk=delayed.pk).update(
+            updated_at=base - timedelta(minutes=30),
+        )
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "cursor": next_cursor},
+        )
+        self.assertEqual(page2.status_code, 200)
+        page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+        self.assertNotIn(DELAYED_COMMIT_GROUP_REF, page2_slugs)
+        self.assertEqual(page2_slugs, slugs[2:])
+
+        incremental = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": polling_watermark},
+        )
+        self.assertEqual(incremental.status_code, 200)
+        incremental_slugs = [group["slug"] for group in incremental.json()["groups"]]
+        self.assertNotIn(DELAYED_COMMIT_GROUP_REF, incremental_slugs)
+
+        full_rescan = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(full_rescan.status_code, 200)
+        rescan_slugs = [group["slug"] for group in full_rescan.json()["groups"]]
+        self.assertIn(DELAYED_COMMIT_GROUP_REF, rescan_slugs)
+
+
+@unittest.skipUnless(connection.vendor == "postgresql", "requires PostgreSQL")
+class GroupListPollingCommitRaceTests(TransactionTestCase):
+    """Real commit-order race: updated_at is assigned before upload commit."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        self.url = reverse("api-group-list")
+        self.slugs = create_ordered_pagination_groups()
+        self.base = AuditGroup.objects.get(slug=self.slugs[0]).updated_at
+        self.delayed_updated_at = self.base - timedelta(minutes=30)
+
+    def _postgres_connection(self):
+        import psycopg
+
+        settings = connection.settings_dict
+        return psycopg.connect(
+            host=settings["HOST"],
+            port=settings["PORT"],
+            dbname=settings["NAME"],
+            user=settings["USER"],
+            password=settings["PASSWORD"],
+        )
+
+    def test_delayed_upload_commit_is_discovered_by_full_rescan_not_incremental_watermark(self):
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {self.raw_token}"}
+        delayed_slug = DELAYED_COMMIT_GROUP_REF
+        delayed_name = "Delayed upload commit"
+        now = timezone.now()
+
+        pg_conn = self._postgres_connection()
+        try:
+            with pg_conn.transaction():
+                with pg_conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO forensics_auditgroup (
+                            name, slug, group_ref, divergent_message_count, notes,
+                            created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, 0, '', %s, %s)
+                        """,
+                        (
+                            delayed_name,
+                            delayed_slug,
+                            delayed_slug,
+                            now,
+                            self.delayed_updated_at,
+                        ),
+                    )
+
+                page1 = self.client.get(self.url, data={"limit": "2"}, **auth)
+                self.assertEqual(page1.status_code, 200)
+                page1_payload = page1.json()
+                polling_watermark = page1_payload["polling_watermark"]
+                next_cursor = page1_payload["pagination"]["next_cursor"]
+                self.assertLess(
+                    self.delayed_updated_at,
+                    datetime.fromisoformat(polling_watermark),
+                )
+                page1_slugs = [group["slug"] for group in page1_payload["groups"]]
+                self.assertEqual(page1_slugs, self.slugs[:2])
+                self.assertNotIn(delayed_slug, page1_slugs)
+
+            page2 = self.client.get(
+                self.url,
+                data={"limit": "2", "cursor": next_cursor},
+                **auth,
+            )
+            self.assertEqual(page2.status_code, 200)
+            page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+            self.assertNotIn(delayed_slug, page2_slugs)
+            self.assertEqual(page2_slugs, self.slugs[2:])
+
+            incremental = self.client.get(
+                self.url,
+                data={"updated_since": polling_watermark},
+                **auth,
+            )
+            self.assertEqual(incremental.status_code, 200)
+            incremental_slugs = [group["slug"] for group in incremental.json()["groups"]]
+            self.assertNotIn(delayed_slug, incremental_slugs)
+
+            full_rescan = self.client.get(self.url, **auth)
+            self.assertEqual(full_rescan.status_code, 200)
+            rescan_slugs = [group["slug"] for group in full_rescan.json()["groups"]]
+            self.assertIn(delayed_slug, rescan_slugs)
+        finally:
+            pg_conn.close()
 
 
 class ProfileAccessTokenTests(TestCase):

@@ -126,13 +126,18 @@ Query parameters:
   `pagination.next_cursor`. Omit on the first page of a poll.
 - `updated_since`: optional ISO-8601 timestamp; when set, only groups with
   `updated_at` strictly after this value are returned. The response echoes the
-  applied filter as `updated_since`.
+  applied filter as `updated_since`. This is a **best-effort** change hint only:
+  it does not guarantee every group that became visible since your last poll (see
+  [Polling contract](#polling-contract)).
 
 Results are ordered by `(updated_at desc, slug asc)`. The first page of each poll
 fixes a server `polling_watermark` timestamp; every page in that traversal
 reuses the same watermark and only includes groups with `updated_at` at or before
-it. Groups created or updated after the watermark are deferred to the next poll
-rather than skipped or reordered mid-traversal.
+it. Groups that are still uncommitted, or that commit after the watermark is
+captured, can require a later full index poll. The watermark is **not** a
+commit-safe upper bound on `updated_at`: a group can commit after page 1 with
+`updated_at` at or before the watermark and still be invisible to both the
+remaining pages and a subsequent `updated_since=polling_watermark` poll.
 
 Paginated responses include:
 
@@ -151,15 +156,24 @@ Paginated responses include:
 Polling contract:
 
 1. Start each poll without `cursor`. Read `polling_watermark` from the first
-   response and keep it for the whole traversal.
+   response and keep it for the whole traversal. Use it only to bound that
+   traversal; do not treat it as a commit-safe cursor for change detection.
 2. Follow `pagination.next_cursor` until `has_more` is `false`. Each cursor is
    bound to that poll's watermark and original `updated_since` filter, so only
    `cursor` and the desired `limit` need to be sent on continuation requests.
    Tampered or foreign cursors return `400` `{"error":"invalid cursor"}`.
-3. After the traversal completes, set the next poll's `updated_since` to the
-   completed traversal's `polling_watermark` (or a later client watermark you
-   already track). An empty `groups` array on the next poll means no group
-   metadata changed and no full exports need to be downloaded.
+3. After completing a traversal, you may set `updated_since` to the maximum
+   `updated_at` among groups you actually received to skip unchanged groups on
+   the next incremental poll. This is an optimization only: uploads assign
+   `updated_at` before commit, so a group can appear after your traversal with
+   `updated_at` at or before your `updated_since` bound and be omitted from
+   incremental polls.
+4. For **eventual completeness**, periodically run a full index poll (omit
+   `updated_since` and `cursor`) and deduplicate by `slug`. A finite overlap
+   window alone does not guarantee discovery of arbitrarily delayed commits.
+   An empty `groups` array on an incremental poll means no group has
+   `updated_at` strictly after your `updated_since` bound; it does **not** prove
+   the index is unchanged.
 
 Projection endpoints still use numeric `offset` pagination (see
 [Common Query Parameters](#common-query-parameters)); only the group index uses
