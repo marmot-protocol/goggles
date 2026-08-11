@@ -3670,6 +3670,33 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(groups_for_audit_file(audit_file), [fallback_group])
         self.assertEqual(list(audit_files_for_group(fallback_group)), [audit_file])
 
+    def test_schema_defined_peeler_outcomes_ingest_as_valid(self):
+        outcomes = ("invalid_signature", "wrong_recipient")
+        body = jsonl(
+            *[
+                audit_event_v2(
+                    seq,
+                    kind={
+                        "type": "peeler_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome": outcome,
+                        "fallback_snapshot_used": False,
+                    },
+                )
+                for seq, outcome in enumerate(outcomes)
+            ]
+        )
+
+        result = ingest_audit_log_bytes(dump_bytes=body.encode("utf-8"))
+
+        self.assertEqual(result.audit_file.validation_status, AuditFile.STATUS_VALID)
+        self.assertEqual(result.audit_file.valid_event_count, 2)
+        self.assertEqual(result.audit_file.invalid_event_count, 0)
+        events = list(result.audit_file.events.order_by("seq"))
+        self.assertEqual([event.outcome for event in events], list(outcomes))
+        self.assertTrue(all(event.parse_status == AuditEvent.STATUS_VALID for event in events))
+        self.assertTrue(all(event.validation_error == "" for event in events))
+
     def test_all_supported_audit_kind_variants_are_normalized(self):
         raw_token, _token = UploadToken.issue("ios test client")
         cases = [
@@ -4980,7 +5007,9 @@ class ValidateAuditSchemaCommandTests(TestCase):
 
 
 class EpochStallBackfillLifecycleTests(TestCase):
-    fixture_path = Path("fixtures/epoch-stall-backfill-lifecycle.jsonl")
+    fixture_path = (
+        Path(__file__).resolve().parent.parent / "fixtures" / "epoch-stall-backfill-lifecycle.jsonl"
+    )
 
     def fixture_events(self) -> list[dict]:
         return [
@@ -5037,6 +5066,23 @@ class EpochStallBackfillLifecycleTests(TestCase):
         for event_type, expected in expected_by_type.items():
             with self.subTest(event_type=event_type):
                 exported = exported_by_type[event_type]
+                self.assertEqual(
+                    set(exported),
+                    {
+                        "id",
+                        "source",
+                        "schema_version",
+                        "seq",
+                        "wall_time_ms",
+                        "account_ref",
+                        "engine_id",
+                        "group_ref",
+                        "event_type",
+                        "context",
+                        "kind",
+                        "normalized",
+                    },
+                )
                 self.assertEqual(exported["context"], expected["context"])
                 self.assertEqual(exported["kind"], expected["kind"])
                 self.assertEqual(exported["group_ref"], expected.get("group_ref", ""))

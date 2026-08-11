@@ -71,7 +71,7 @@ convergence run, state change, and evidence line.
 | `decoded_app_event` | Application-protocol details extracted from decoded content, such as app event kind, content, author pubkey, tags, client message id, reply/thread ids, attachments, or raw app event data. |
 | Attachment metadata | Optional decoded-app-event metadata about attachments, such as content type, file name, byte length, digest, and app-specific metadata. |
 | Peeler | The layer that tries to unwrap, decrypt, or peel incoming transport/application envelopes. |
-| Peeler outcome | Result of peeling: `success`, `decrypt_failed`, `stale_epoch`, `malformed`, or `other`. |
+| Peeler outcome | Result of peeling: `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `invalid_signature`, `wrong_recipient`, or `other`. |
 | Rejection | Event explaining why a message/artifact was rejected by processing. |
 | Message state | Processing state for an artifact, such as failed, deferred, invalidated, or other MDK-defined states. |
 
