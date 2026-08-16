@@ -1,5 +1,18 @@
 # Goggles Deployment Notes
 
+## Audit Evidence Retention
+
+The web container prunes aged audit evidence on every startup (migrations, then
+`prune_audit_data`, then `collectstatic` and gunicorn — see
+`docker-compose.yml`). Retention defaults to 14 days and is configurable via
+`GOGGLES_AUDIT_RETENTION_DAYS`; uploads (and their events) older than the window
+are deleted and the affected groups' projections are rebuilt from surviving
+evidence. On Postgres, a successful prune also runs `VACUUM ANALYZE` scoped to
+the file and event tables so deleted `raw_text` rows actually free disk space;
+no-op startups skip the VACUUM. Preview what would be pruned with
+`uv run python manage.py prune_audit_data --dry-run`, or override the window for
+a one-off run with `uv run python manage.py prune_audit_data --retention-days N`.
+
 ## Audit Redesign Cutover
 
 The audit-log redesign does not require dropping the whole database. Keep the

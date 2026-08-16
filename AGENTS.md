@@ -55,6 +55,12 @@ interchangeable.
 
 ## Guardrails
 
+- `prune_audit_data` enforces audit evidence retention (default 14 days,
+  `GOGGLES_AUDIT_RETENTION_DAYS`) by deleting aged uploads and events, then
+  rebuilding the touched groups' projections. The web container runs it on every
+  startup in `docker-compose.yml`, so every deploy/restart prunes. It is distinct
+  from `purge_audit_data`, which wipes *all* audit data but still requires
+  `--confirm-delete-audit-data`.
 - Keep upload and forensic behavior grounded in the JSONL schema and existing
   ingestion tests.
 - Preserve raw audit-log text and line-level evidence unless a task explicitly

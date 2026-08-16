@@ -55,6 +55,7 @@ services:
       - -c
       - >-
         python manage.py migrate --noinput &&
+        python manage.py prune_audit_data &&
         python manage.py collectstatic --noinput &&
         exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${GOGGLES_WEB_WORKERS:-3} --threads $${GOGGLES_WEB_THREADS:-4} --timeout $${GOGGLES_WEB_TIMEOUT_SECONDS:-300} --max-requests $${GOGGLES_WEB_MAX_REQUESTS:-500} --max-requests-jitter $${GOGGLES_WEB_MAX_REQUESTS_JITTER:-50}
     logging:

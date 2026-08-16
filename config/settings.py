@@ -283,6 +283,11 @@ GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
 )
 GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 50_000))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
+# How long raw audit evidence (uploaded files and their events) is kept. The
+# prune_audit_data management command — run by the web container at startup —
+# deletes evidence older than this window and rebuilds the affected groups'
+# projections. Set to a large positive value to lengthen retention.
+GOGGLES_AUDIT_RETENTION_DAYS = int(os.environ.get("GOGGLES_AUDIT_RETENTION_DAYS", 14))
 # Operational kill-switch for the streaming group-export endpoint, mirroring the
 # upload toggle. Lets an operator shed a resource-intensive read surface without a
 # redeploy.
@@ -298,6 +303,7 @@ for setting_name in (
     "GOGGLES_MAX_JSONL_LINE_BYTES",
     "GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST",
     "GOGGLES_AGENT_EXPORT_MAX_EVENTS",
+    "GOGGLES_AUDIT_RETENTION_DAYS",
     "FILE_UPLOAD_MAX_MEMORY_SIZE",
 ):
     if globals()[setting_name] <= 0:

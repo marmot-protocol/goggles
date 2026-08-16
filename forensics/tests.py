@@ -40,6 +40,7 @@ from .ingest import (
     group_ref_max_length,
     ingest_audit_log_bytes,
 )
+from .management.commands.prune_audit_data import VACUUM_TABLES, vacuum_audit_data
 from .models import (
     AnalysisRun,
     AuditEvent,
@@ -6005,6 +6006,104 @@ class PurgeAuditDataCommandTests(TestCase):
         self.assertEqual(AnalysisRun.objects.count(), 0)
         self.assertTrue(User.objects.filter(pk=user.pk).exists())
         self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
+
+
+class PruneAuditDataCommandTests(TestCase):
+    def ingest_paired_evidence(self):
+        """One group holding a 20-day-old upload and a fresh upload."""
+        _raw_token, token = UploadToken.issue("ios qa")
+        old_file = ingest_audit_log_bytes(
+            dump_bytes=representative_audit_log(engine_id=ENGINE_ALICE).encode("utf-8"),
+            upload_token=token,
+        ).audit_file
+        recent_file = ingest_audit_log_bytes(
+            dump_bytes=representative_audit_log(engine_id=ENGINE_BOB).encode("utf-8"),
+            upload_token=token,
+        ).audit_file
+        AuditFile.objects.filter(pk=old_file.pk).update(
+            created_at=timezone.now() - timedelta(days=20)
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        return old_file, recent_file, group
+
+    def test_prunes_stale_evidence_rebuilds_and_keeps_fresh_group(self):
+        old_file, recent_file, group = self.ingest_paired_evidence()
+        out = StringIO()
+
+        call_command("prune_audit_data", stdout=out)
+
+        self.assertIn("rebuilt projections for", out.getvalue())
+        self.assertFalse(AuditFile.objects.filter(pk=old_file.pk).exists())
+        self.assertTrue(AuditFile.objects.filter(pk=recent_file.pk).exists())
+        self.assertQuerySetEqual(
+            AuditEvent.objects.all(),
+            AuditEvent.objects.filter(audit_file=recent_file),
+            ordered=False,
+        )
+        # The group survives and its projections re-derive from retained evidence.
+        self.assertTrue(AuditGroup.objects.filter(pk=group.pk).exists())
+        self.assertTrue(NetworkObservation.objects.filter(group=group).exists())
+
+    def test_dry_run_reports_and_deletes_nothing(self):
+        old_file, _recent_file, _group = self.ingest_paired_evidence()
+
+        call_command("prune_audit_data", "--dry-run", stdout=StringIO())
+
+        self.assertTrue(AuditFile.objects.filter(pk=old_file.pk).exists())
+
+    def test_retention_days_override_spans_both_files(self):
+        old_file, recent_file, _group = self.ingest_paired_evidence()
+
+        call_command("prune_audit_data", "--retention-days", "21", stdout=StringIO())
+
+        self.assertTrue(AuditFile.objects.filter(pk=old_file.pk).exists())
+        self.assertTrue(AuditFile.objects.filter(pk=recent_file.pk).exists())
+
+    def test_retention_days_zero_is_rejected(self):
+        with self.assertRaises(CommandError):
+            call_command("prune_audit_data", "--retention-days", "0", stdout=StringIO())
+
+    def test_retention_default_uses_setting(self):
+        with override_settings(GOGGLES_AUDIT_RETENTION_DAYS=21):
+            old_file, _recent_file, _group = self.ingest_paired_evidence()
+
+            call_command("prune_audit_data", stdout=StringIO())
+
+            self.assertTrue(AuditFile.objects.filter(pk=old_file.pk).exists())
+
+    def test_nothing_to_prune_reports_cleanly(self):
+        _raw_token, token = UploadToken.issue("ios qa")
+        ingest_audit_log_bytes(
+            dump_bytes=representative_audit_log().encode("utf-8"),
+            upload_token=token,
+        )
+
+        call_command("prune_audit_data", stdout=StringIO())
+
+        self.assertEqual(AuditFile.objects.count(), 1)
+
+    def test_vacuum_runs_only_on_postgres(self):
+        stale_connection = mock.MagicMock()
+        stale_connection.vendor = "postgresql"
+        cursor = stale_connection.cursor.return_value.__enter__.return_value
+
+        with mock.patch(
+            "forensics.management.commands.prune_audit_data.connection", stale_connection
+        ):
+            vacuum_audit_data()
+            stale_connection.cursor.return_value.__enter__.assert_called()
+            cursor.execute.assert_has_calls(
+                [mock.call(f"VACUUM ANALYZE {table}") for table in VACUUM_TABLES]
+            )
+
+        sqlite_connection = mock.MagicMock()
+        sqlite_connection.vendor = "sqlite"
+
+        with mock.patch(
+            "forensics.management.commands.prune_audit_data.connection", sqlite_connection
+        ):
+            vacuum_audit_data()
+            sqlite_connection.cursor.assert_not_called()
 
 
 class DashboardTests(TestCase):
