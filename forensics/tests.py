@@ -3671,6 +3671,33 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(groups_for_audit_file(audit_file), [fallback_group])
         self.assertEqual(list(audit_files_for_group(fallback_group)), [audit_file])
 
+    def test_schema_defined_peeler_outcomes_ingest_as_valid(self):
+        outcomes = ("invalid_signature", "wrong_recipient")
+        body = jsonl(
+            *[
+                audit_event_v2(
+                    seq,
+                    kind={
+                        "type": "peeler_outcome",
+                        "msg_id": MSG_ID,
+                        "outcome": outcome,
+                        "fallback_snapshot_used": False,
+                    },
+                )
+                for seq, outcome in enumerate(outcomes)
+            ]
+        )
+
+        result = ingest_audit_log_bytes(dump_bytes=body.encode("utf-8"))
+
+        self.assertEqual(result.audit_file.validation_status, AuditFile.STATUS_VALID)
+        self.assertEqual(result.audit_file.valid_event_count, 2)
+        self.assertEqual(result.audit_file.invalid_event_count, 0)
+        events = list(result.audit_file.events.order_by("seq"))
+        self.assertEqual([event.outcome for event in events], list(outcomes))
+        self.assertTrue(all(event.parse_status == AuditEvent.STATUS_VALID for event in events))
+        self.assertTrue(all(event.validation_error == "" for event in events))
+
     def test_all_supported_audit_kind_variants_are_normalized(self):
         raw_token, _token = UploadToken.issue("ios test client")
         cases = [
@@ -4978,6 +5005,92 @@ class ValidateAuditSchemaCommandTests(TestCase):
         self.assertIn("missing required property", stderr.getvalue())
         self.assertIn("epoch", stderr.getvalue())
         self.assertNotIn("committed", stderr.getvalue())
+
+
+class EpochStallBackfillLifecycleTests(TestCase):
+    fixture_path = (
+        Path(__file__).resolve().parent.parent / "fixtures" / "epoch-stall-backfill-lifecycle.jsonl"
+    )
+
+    def fixture_events(self) -> list[dict]:
+        return [
+            json.loads(line) for line in self.fixture_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_canonical_schema_accepts_all_five_lifecycle_rows(self):
+        output = StringIO()
+
+        call_command("validate_audit_schema", str(self.fixture_path), stdout=output)
+
+        self.assertIn("Schema validation passed for 5 event(s)", output.getvalue())
+
+    def test_ingest_and_agent_export_preserve_lifecycle_evidence(self):
+        expected_events = self.fixture_events()
+        self.assertEqual(
+            {event["kind"]["type"] for event in expected_events if "group_ref" in event},
+            {
+                "epoch_stall_backfill_armed",
+                "epoch_stall_backfill_completed",
+                "epoch_stall_backfill_failed",
+            },
+        )
+        self.assertEqual(
+            {event["context"]["operation_id"] for event in expected_events},
+            {"backfill-attempt-opaque-01"},
+        )
+        result = ingest_audit_log_bytes(
+            dump_bytes=self.fixture_path.read_bytes(),
+            # Keep account-scoped started/deferred rows in this group export
+            # without fabricating a top-level group_ref on their wire evidence.
+            fallback_group_slug=GROUP_REF,
+            source_name=self.fixture_path.name,
+        )
+
+        self.assertEqual(result.audit_file.validation_status, AuditFile.STATUS_VALID)
+        self.assertEqual(result.audit_file.valid_event_count, 5)
+        group = AuditGroup.objects.get(group_ref=GROUP_REF)
+        stored_events = list(result.audit_file.events.order_by("seq"))
+        self.assertEqual(len(stored_events), 5)
+        self.assertTrue(all(event.group_id == group.id for event in stored_events))
+
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+        response = self.client.get(reverse("group-agent-export", kwargs={"slug": group.slug}))
+
+        self.assertEqual(response.status_code, 200)
+        exported_events = response.json()["events"]
+        self.assertEqual(len(exported_events), 5)
+        exported_by_type = {event["event_type"]: event for event in exported_events}
+        expected_by_type = {event["kind"]["type"]: event for event in expected_events}
+        self.assertEqual(set(exported_by_type), set(expected_by_type))
+
+        for event_type, expected in expected_by_type.items():
+            with self.subTest(event_type=event_type):
+                exported = exported_by_type[event_type]
+                self.assertEqual(
+                    set(exported),
+                    {
+                        "id",
+                        "source",
+                        "schema_version",
+                        "seq",
+                        "wall_time_ms",
+                        "account_ref",
+                        "engine_id",
+                        "group_ref",
+                        "event_type",
+                        "context",
+                        "kind",
+                        "normalized",
+                    },
+                )
+                self.assertEqual(exported["context"], expected["context"])
+                self.assertEqual(exported["kind"], expected["kind"])
+                self.assertEqual(exported["group_ref"], expected.get("group_ref", ""))
+                self.assertEqual(
+                    exported["normalized"],
+                    {"context_operation_id": expected["context"]["operation_id"]},
+                )
 
 
 class HumanActionGroupingTests(TestCase):

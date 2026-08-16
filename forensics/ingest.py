@@ -767,6 +767,8 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
                 "decrypt_failed",
                 "stale_epoch",
                 "malformed",
+                "invalid_signature",
+                "wrong_recipient",
                 "other",
             }:
                 errors.append("outcome must be a known peeler outcome")
