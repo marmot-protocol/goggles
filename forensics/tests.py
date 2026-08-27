@@ -1,8 +1,11 @@
+import base64
 import contextlib
 import hashlib
 import json
 import os
-from datetime import timedelta
+import unittest
+import zlib
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -98,10 +101,41 @@ ACCOUNT_ALICE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ACCOUNT_BOB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 GROUP_REF = "11" * 32
 OTHER_GROUP_REF = "44" * 32
+DELAYED_COMMIT_GROUP_REF = "55" * 32
 MSG_ID = "22" * 32
 OTHER_MSG_ID = "33" * 32
 DIGEST_A = "aa" * 32
 DIGEST_B = "bb" * 32
+
+
+def create_ordered_pagination_groups(count: int = 4):
+    base = timezone.now()
+    AuditGroup.objects.all().delete()
+    slugs = []
+    for index in range(count):
+        slug = f"{index:02d}" * 32
+        group = AuditGroup.objects.create(
+            name=f"Group {index}",
+            slug=slug,
+            group_ref=slug,
+        )
+        AuditGroup.objects.filter(pk=group.pk).update(updated_at=base - timedelta(hours=index))
+        slugs.append(slug)
+    return slugs
+
+
+def decode_group_list_cursor_payload_without_secret(cursor: str) -> dict:
+    """Decode the client-visible signed cursor payload without SECRET_KEY."""
+    encoded = cursor.split(":")[0]
+    compressed = encoded.startswith(".")
+    if compressed:
+        encoded = encoded[1:]
+    pad = b"=" * (-len(encoded) % 4)
+    data = base64.urlsafe_b64decode(encoded.encode("ascii") + pad)
+    if compressed:
+        data = zlib.decompress(data)
+    return json.loads(data.decode("latin-1"))
+
 
 HEAVY_EVENT_SELECT_COLUMNS = {
     field: f'"forensics_auditevent"."{field}"'
@@ -6068,6 +6102,480 @@ class GroupExportStreamTests(TestCase):
         self.assertTrue(any(record["t"] == "source" for record in records))
         self.assertEqual(records[-1], {"t": "error", "complete": False})
         self.assertNotIn("eof", {record["t"] for record in records})
+
+
+class GroupListApiTests(TestCase):
+    """GET /api/v1/groups/ — readable group enumeration for sessions and PATs."""
+
+    def setUp(self):
+        ingest_audit_log_bytes(dump_bytes=representative_audit_log().encode("utf-8"))
+        self.group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.url = reverse("api-group-list")
+
+    def test_lists_readable_groups_with_personal_access_token(self):
+        raw_token, token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-groups/v1")
+        slugs = [group["slug"] for group in payload["groups"]]
+        self.assertIn(self.group.slug, slugs)
+        token.refresh_from_db()
+        self.assertIsNotNone(token.last_used_at)
+
+    def test_requires_authentication_returns_401_json_not_redirect(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_invalid_bearer_token(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Bearer gpat_deadbeef_nope")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_expired_personal_access_token(self):
+        raw_token, _token = PersonalAccessToken.issue(
+            "stale", user=self.user, expires_at=timezone.now() - timedelta(seconds=1)
+        )
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_malformed_authorization_scheme(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Token gpat_not_bearer")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_inactive_personal_access_token(self):
+        raw_token, token = PersonalAccessToken.issue("revoked", user=self.user)
+        token.is_active = False
+        token.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_personal_access_token_of_deactivated_owner(self):
+        raw_token, _token = PersonalAccessToken.issue("orphaned", user=self.user)
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_upload_token_cannot_list_groups(self):
+        raw_token, _token = UploadToken.issue("device")
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_lists_with_logged_in_session(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(self.group.slug, slugs)
+
+    def test_denied_group_is_omitted_from_list_and_export_returns_404(self):
+        other = AuditGroup.objects.create(
+            name="Out of scope",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        export_url = reverse("api-group-export-stream", kwargs={"slug": other.slug})
+
+        def scoped_queryset(reader):
+            self.assertEqual(reader.user, self.user)
+            return AuditGroup.objects.filter(slug=self.group.slug)
+
+        with mock.patch("forensics.views.readable_groups_queryset", side_effect=scoped_queryset):
+            list_response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+            export_response = self.client.get(export_url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(list_response.status_code, 200)
+        slugs = [group["slug"] for group in list_response.json()["groups"]]
+        self.assertEqual(slugs, [self.group.slug])
+        self.assertEqual(export_response.status_code, 404)
+
+    def test_newly_created_group_appears_without_manual_slug_configuration(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        new_group = AuditGroup.objects.create(
+            name="Fresh group",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(new_group.slug, slugs)
+
+    def test_response_includes_bounded_pagination_metadata(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "1"},
+        )
+
+        payload = response.json()
+        self.assertEqual(payload["pagination"]["limit"], 1)
+        self.assertEqual(payload["pagination"]["returned"], 1)
+        self.assertIn("has_more", payload["pagination"])
+        self.assertIn("next_cursor", payload["pagination"])
+        self.assertIn("polling_watermark", payload)
+
+    def test_cursor_does_not_expose_group_slug(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+        exposed_slug = slugs[0]
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "1"},
+        )
+
+        cursor = response.json()["pagination"]["next_cursor"]
+        payload = decode_group_list_cursor_payload_without_secret(cursor)
+        self.assertNotIn(exposed_slug, cursor)
+        self.assertNotIn(exposed_slug, json.dumps(payload))
+        self.assertNotIn(exposed_slug, payload.values())
+
+    def test_updated_since_filters_groups_for_polling(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        stale = AuditGroup.objects.create(
+            name="Stale",
+            slug="aa" * 32,
+            group_ref="aa" * 32,
+        )
+        AuditGroup.objects.filter(pk=stale.pk).update(updated_at=timezone.now() - timedelta(days=2))
+        stale.refresh_from_db()
+        fresh = AuditGroup.objects.create(
+            name="Fresh",
+            slug=OTHER_GROUP_REF,
+            group_ref=OTHER_GROUP_REF,
+        )
+        since = (timezone.now() - timedelta(hours=1)).isoformat()
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": since},
+        )
+
+        slugs = [group["slug"] for group in response.json()["groups"]]
+        self.assertIn(fresh.slug, slugs)
+        self.assertNotIn(stale.slug, slugs)
+        self.assertIn(self.group.slug, slugs)
+
+    def test_updated_since_returns_empty_index_when_nothing_changed(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        after_all_updates = (timezone.now() + timedelta(seconds=1)).isoformat()
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": after_all_updates},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["groups"], [])
+        self.assertFalse(response.json()["pagination"]["has_more"])
+
+    def test_group_list_enrichment_is_bounded_to_the_requested_page(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        for index in range(3):
+            AuditGroup.objects.create(
+                name=f"Extra {index}",
+                slug=f"{index:02d}" * 32,
+                group_ref=f"{index:02d}" * 32,
+            )
+        with mock.patch("forensics.views.group_list_rows", wraps=group_list_rows) as wrapped_rows:
+            self.client.get(
+                self.url,
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+                data={"limit": "2"},
+            )
+
+        self.assertEqual(len(wrapped_rows.call_args.args[0]), 2)
+
+    def test_deleting_earlier_group_between_pages_does_not_skip_later_groups(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        self.assertEqual([group["slug"] for group in page1.json()["groups"]], slugs[:2])
+
+        AuditGroup.objects.filter(slug=slugs[0]).delete()
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={
+                "limit": "2",
+                "cursor": page1.json()["pagination"]["next_cursor"],
+            },
+        )
+        self.assertEqual(page2.status_code, 200)
+        self.assertEqual(
+            [group["slug"] for group in page2.json()["groups"]],
+            slugs[2:],
+        )
+
+    def test_cursor_keeps_updated_since_filter_across_pages(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+        newest_group = AuditGroup.objects.get(slug=slugs[0])
+        updated_since = newest_group.updated_at - timedelta(hours=2, minutes=30)
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "updated_since": updated_since.isoformat()},
+        )
+        self.assertEqual(page1.status_code, 200)
+        self.assertEqual([group["slug"] for group in page1.json()["groups"]], slugs[:2])
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={
+                "limit": "2",
+                "cursor": page1.json()["pagination"]["next_cursor"],
+            },
+        )
+        self.assertEqual(page2.status_code, 200)
+        self.assertEqual(
+            [group["slug"] for group in page2.json()["groups"]],
+            [slugs[2]],
+        )
+        self.assertEqual(page2.json()["updated_since"], updated_since.isoformat())
+
+    def test_group_updated_after_polling_watermark_appears_on_next_poll(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        page1_payload = page1.json()
+        polling_watermark = page1_payload["polling_watermark"]
+        next_cursor = page1_payload["pagination"]["next_cursor"]
+
+        AuditGroup.objects.filter(slug=slugs[2]).update(updated_at=timezone.now())
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "cursor": next_cursor},
+        )
+        self.assertEqual(page2.status_code, 200)
+        page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+        self.assertNotIn(slugs[2], page2_slugs)
+        self.assertEqual(page2_slugs, [slugs[3]])
+        self.assertFalse(page2.json()["pagination"]["has_more"])
+
+        next_poll = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": polling_watermark},
+        )
+        self.assertEqual(next_poll.status_code, 200)
+        self.assertIn(slugs[2], [group["slug"] for group in next_poll.json()["groups"]])
+
+    def test_rejects_invalid_or_tampered_cursor(self):
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+
+        for cursor in ("not-a-cursor", "tampered:cursor:value"):
+            response = self.client.get(
+                self.url,
+                HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+                data={"cursor": cursor},
+            )
+            self.assertEqual(response.status_code, 400, cursor)
+            self.assertEqual(response.json(), {"error": "invalid cursor"})
+
+    def test_pre_watermark_group_missed_by_incremental_poll_needs_full_rescan(self):
+        """Groups that become visible after page 1 with updated_at <= watermark are
+        excluded from page 2 and from updated_since=polling_watermark; only a full
+        index rescan discovers them."""
+        raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        slugs = create_ordered_pagination_groups()
+        base = AuditGroup.objects.get(slug=slugs[0]).updated_at
+
+        page1 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2"},
+        )
+        self.assertEqual(page1.status_code, 200)
+        page1_payload = page1.json()
+        polling_watermark = page1_payload["polling_watermark"]
+        next_cursor = page1_payload["pagination"]["next_cursor"]
+
+        delayed = AuditGroup.objects.create(
+            name="Delayed commit",
+            slug=DELAYED_COMMIT_GROUP_REF,
+            group_ref=DELAYED_COMMIT_GROUP_REF,
+        )
+        AuditGroup.objects.filter(pk=delayed.pk).update(
+            updated_at=base - timedelta(minutes=30),
+        )
+
+        page2 = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"limit": "2", "cursor": next_cursor},
+        )
+        self.assertEqual(page2.status_code, 200)
+        page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+        self.assertNotIn(DELAYED_COMMIT_GROUP_REF, page2_slugs)
+        self.assertEqual(page2_slugs, slugs[2:])
+
+        incremental = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+            data={"updated_since": polling_watermark},
+        )
+        self.assertEqual(incremental.status_code, 200)
+        incremental_slugs = [group["slug"] for group in incremental.json()["groups"]]
+        self.assertNotIn(DELAYED_COMMIT_GROUP_REF, incremental_slugs)
+
+        full_rescan = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(full_rescan.status_code, 200)
+        rescan_slugs = [group["slug"] for group in full_rescan.json()["groups"]]
+        self.assertIn(DELAYED_COMMIT_GROUP_REF, rescan_slugs)
+
+
+@unittest.skipUnless(connection.vendor == "postgresql", "requires PostgreSQL")
+class GroupListPollingCommitRaceTests(TransactionTestCase):
+    """Real commit-order race: updated_at is assigned before upload commit."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.raw_token, _token = PersonalAccessToken.issue("watchdog", user=self.user)
+        self.url = reverse("api-group-list")
+        self.slugs = create_ordered_pagination_groups()
+        self.base = AuditGroup.objects.get(slug=self.slugs[0]).updated_at
+        self.delayed_updated_at = self.base - timedelta(minutes=30)
+
+    def _postgres_connection(self):
+        import psycopg
+
+        params = connection.get_connection_params()
+        params.setdefault("connect_timeout", 10)
+        return psycopg.connect(**params)
+
+    def test_delayed_upload_commit_is_discovered_by_full_rescan_not_incremental_watermark(self):
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {self.raw_token}"}
+        delayed_slug = DELAYED_COMMIT_GROUP_REF
+        delayed_name = "Delayed upload commit"
+        now = timezone.now()
+
+        pg_conn = self._postgres_connection()
+        try:
+            with pg_conn.transaction():
+                with pg_conn.cursor() as cursor:
+                    self.assertEqual(
+                        [
+                            field.column
+                            for field in AuditGroup._meta.concrete_fields
+                            if not field.primary_key
+                        ],
+                        [
+                            "name",
+                            "slug",
+                            "group_ref",
+                            "divergent_message_count",
+                            "notes",
+                            "created_at",
+                            "updated_at",
+                        ],
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO forensics_auditgroup (
+                            name, slug, group_ref, divergent_message_count, notes,
+                            created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, 0, '', %s, %s)
+                        """,
+                        (
+                            delayed_name,
+                            delayed_slug,
+                            delayed_slug,
+                            now,
+                            self.delayed_updated_at,
+                        ),
+                    )
+
+                page1 = self.client.get(self.url, data={"limit": "2"}, **auth)
+                self.assertEqual(page1.status_code, 200)
+                page1_payload = page1.json()
+                polling_watermark = page1_payload["polling_watermark"]
+                next_cursor = page1_payload["pagination"]["next_cursor"]
+                self.assertLess(
+                    self.delayed_updated_at,
+                    datetime.fromisoformat(polling_watermark),
+                )
+                page1_slugs = [group["slug"] for group in page1_payload["groups"]]
+                self.assertEqual(page1_slugs, self.slugs[:2])
+                self.assertNotIn(delayed_slug, page1_slugs)
+
+            page2 = self.client.get(
+                self.url,
+                data={"limit": "2", "cursor": next_cursor},
+                **auth,
+            )
+            self.assertEqual(page2.status_code, 200)
+            page2_slugs = [group["slug"] for group in page2.json()["groups"]]
+            self.assertNotIn(delayed_slug, page2_slugs)
+            self.assertEqual(page2_slugs, self.slugs[2:])
+
+            incremental = self.client.get(
+                self.url,
+                data={"updated_since": polling_watermark},
+                **auth,
+            )
+            self.assertEqual(incremental.status_code, 200)
+            incremental_slugs = [group["slug"] for group in incremental.json()["groups"]]
+            self.assertNotIn(delayed_slug, incremental_slugs)
+
+            full_rescan = self.client.get(self.url, **auth)
+            self.assertEqual(full_rescan.status_code, 200)
+            rescan_slugs = [group["slug"] for group in full_rescan.json()["groups"]]
+            self.assertIn(delayed_slug, rescan_slugs)
+        finally:
+            pg_conn.close()
 
 
 class ProfileAccessTokenTests(TestCase):

@@ -239,8 +239,11 @@ def file_rows_for_group(audit_files, group):
 # ---------------------------------------------------------------------------
 
 
-def group_list_rows():
-    groups = list(AuditGroup.objects.all())
+def group_list_rows(groups=None):
+    if groups is None:
+        groups = list(AuditGroup.objects.all())
+    else:
+        groups = list(groups)
     group_file_counts = audit_file_counts_for_groups(groups)
     group_event_stats, fork_group_ids = event_stats_for_groups(groups)
     for group in groups:

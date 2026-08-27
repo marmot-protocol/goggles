@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import datetime
+from typing import NamedTuple
 
 from django.conf import settings
 from django.contrib import messages
@@ -25,6 +26,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
@@ -42,6 +44,11 @@ from .analysis import (
     human_action_groups_for_group,
     structural_quarantine_exclusion,
     valid_events_for_group,
+)
+from .group_list_cursor import (
+    InvalidGroupListCursor,
+    decode_group_list_cursor,
+    encode_group_list_cursor,
 )
 from .ingest import ingest_audit_log_bytes
 from .models import (
@@ -69,6 +76,8 @@ GROUP_ENGINE_PREVIEW_LIMIT = 12
 GROUP_DETAIL_TAB_EVENT_LIMIT = 100
 GROUP_PROJECTION_API_DEFAULT_LIMIT = 100
 GROUP_PROJECTION_API_MAX_LIMIT = 500
+GROUP_LIST_API_DEFAULT_LIMIT = 100
+GROUP_LIST_API_MAX_LIMIT = 500
 GROUP_EXPORT_SCHEMA_VERSION = "goggles-group-export/v1"
 FULL_DATA_AUDIT_MODE = "full_data"
 ERROR_SEVERITY_TOKENS = (
@@ -860,13 +869,54 @@ def nested_json_value(value: dict, path: tuple[str, ...]):
     return current
 
 
-@login_required
+@require_GET
 def api_group_list(request: HttpRequest):
-    groups = group_list_rows()
+    reader = authenticate_reader(request)
+    if reader is None:
+        return JsonResponse({"error": "authentication required"}, status=401)
+
+    filters = group_list_api_filters(request)
+    limit = filters["limit"]
+    cursor_raw = filters["cursor"]
+    try:
+        if cursor_raw:
+            cursor = decode_group_list_cursor(cursor_raw)
+            polling_watermark = cursor.watermark
+            keyset_filter = cursor.keyset_filter()
+            updated_since = cursor.updated_since
+        else:
+            polling_watermark = timezone.now()
+            keyset_filter = Q()
+            updated_since = filters["updated_since"]
+    except InvalidGroupListCursor:
+        return JsonResponse({"error": "invalid cursor"}, status=400)
+
+    queryset = readable_groups_queryset(reader).order_by("-updated_at", "pk")
+    queryset = queryset.filter(updated_at__lte=polling_watermark)
+    if updated_since is not None:
+        queryset = queryset.filter(updated_at__gt=updated_since)
+    queryset = queryset.filter(keyset_filter)
+
+    page_candidates = list(queryset[: limit + 1])
+    page_groups = page_candidates[:limit]
+    groups = group_list_rows(page_groups)
+    has_more = len(page_candidates) > limit
+    next_cursor = None
+    if has_more and page_groups:
+        last_group = page_groups[-1]
+        next_cursor = encode_group_list_cursor(
+            watermark=polling_watermark,
+            updated_at=last_group.updated_at,
+            group_id=last_group.pk,
+            updated_since=updated_since,
+        )
     return JsonResponse(
         {
             "schema_version": "goggles-groups/v1",
             "groups": [group_list_api_payload(group) for group in groups],
+            "pagination": group_list_pagination_payload(limit, len(groups), has_more, next_cursor),
+            "polling_watermark": polling_watermark.isoformat(),
+            **group_list_change_detection_payload(filters, updated_since),
         },
         json_dumps_params={"separators": (",", ":")},
     )
@@ -1400,6 +1450,39 @@ def group_list_api_payload(group) -> dict:
     }
 
 
+def group_list_api_filters(request: HttpRequest) -> dict:
+    limit = GROUP_LIST_API_DEFAULT_LIMIT
+    limit_raw = request.GET.get("limit")
+    if limit_raw not in (None, ""):
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = GROUP_LIST_API_DEFAULT_LIMIT
+    limit = min(max(limit, 1), GROUP_LIST_API_MAX_LIMIT)
+    return {
+        "limit": limit,
+        "cursor": (request.GET.get("cursor") or "").strip(),
+        "updated_since": parse_group_list_updated_since(request.GET.get("updated_since")),
+    }
+
+
+def parse_group_list_updated_since(value: str | None):
+    if value in (None, ""):
+        return None
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def group_list_change_detection_payload(filters: dict, updated_since) -> dict:
+    if updated_since is None:
+        return {}
+    return {"updated_since": updated_since.isoformat()}
+
+
 def group_api_payload(group: AuditGroup) -> dict:
     shell = group_summary_header_context(group)
     return {
@@ -1690,6 +1773,20 @@ def pagination_payload(limit: int, offset: int, returned: int, has_more: bool) -
         "returned": returned,
         "has_more": has_more,
         "next_offset": offset + returned if has_more else None,
+    }
+
+
+def group_list_pagination_payload(
+    limit: int,
+    returned: int,
+    has_more: bool,
+    next_cursor: str | None,
+) -> dict:
+    return {
+        "limit": limit,
+        "returned": returned,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
     }
 
 
@@ -3182,21 +3279,36 @@ def authenticate_request(request: HttpRequest) -> UploadToken | None:
     return UploadToken.authenticate(bearer_value(request.headers.get("Authorization")))
 
 
-def authenticate_reader(request: HttpRequest) -> bool:
-    """Whether the request may read forensic data: a logged-in session or a valid
-    personal access token.
+class ReaderPrincipal(NamedTuple):
+    user: object
+    access_token: PersonalAccessToken | None = None
 
-    Deliberately not group-scoped — Goggles has no per-user data authorization, so
-    this only answers "is this an authenticated reader?". On the token path it
-    records ``last_used_at`` (a real write, not a pure predicate).
+
+def readable_groups_queryset(reader: ReaderPrincipal):
+    """Groups the reader may export. Shared by the list and export endpoints."""
+    del reader  # reserved for future per-user scope
+    return AuditGroup.objects.all()
+
+
+def get_readable_group_or_404(reader: ReaderPrincipal, slug: str) -> AuditGroup:
+    return get_object_or_404(readable_groups_queryset(reader), slug=slug)
+
+
+def authenticate_reader(request: HttpRequest) -> ReaderPrincipal | None:
+    """Authenticate a forensic reader from a logged-in session or valid personal
+    access token.
+
+    Returns the authenticated reader principal so list/export can apply a shared
+    object-level readable-group scope. On the token path it records
+    ``last_used_at`` (a real write, not a pure predicate).
     """
     if request.user.is_authenticated:
-        return True
+        return ReaderPrincipal(user=request.user)
     token = PersonalAccessToken.authenticate(bearer_value(request.headers.get("Authorization")))
     if token is None:
-        return False
+        return None
     token.mark_used()
-    return True
+    return ReaderPrincipal(user=token.user, access_token=token)
 
 
 @require_GET
@@ -3212,10 +3324,11 @@ def api_group_export_stream(request: HttpRequest, slug: str):
     """
     if not settings.GOGGLES_EXPORTS_ENABLED:
         return JsonResponse({"error": "exports are temporarily disabled"}, status=503)
-    if not authenticate_reader(request):
+    reader = authenticate_reader(request)
+    if reader is None:
         return JsonResponse({"error": "authentication required"}, status=401)
 
-    group = get_object_or_404(AuditGroup, slug=slug)
+    group = get_readable_group_or_404(reader, slug)
     # The export is unconditionally the complete group; it takes no query filters.
     # Honoring them would mean filtering raw ``events`` too — undermining the
     # "complete aggregate" contract the CGKA consumer depends on (every
