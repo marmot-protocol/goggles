@@ -8,6 +8,12 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 DEFAULT_SCHEMA_PATH = settings.BASE_DIR / "docs" / "schemas" / "audit-log-event.v2.schema.json"
+DEFAULT_SCHEMA_PATHS = {
+    "marmot-forensics-audit/v2": DEFAULT_SCHEMA_PATH,
+    "marmot-forensics-audit/v3": (
+        settings.BASE_DIR / "docs" / "schemas" / "audit-log-event.v3.schema.json"
+    ),
+}
 
 
 class Command(BaseCommand):
@@ -17,13 +23,19 @@ class Command(BaseCommand):
         parser.add_argument("paths", nargs="+", help="JSONL audit log path(s) to validate.")
         parser.add_argument(
             "--schema",
-            default=str(DEFAULT_SCHEMA_PATH),
-            help="JSON Schema path. Defaults to the committed V2 audit event schema.",
+            help=(
+                "Validate every row against one JSON Schema path. By default, select the "
+                "committed V2 or V3 schema from each row's schema_version."
+            ),
         )
 
     def handle(self, *args, **options):
-        schema_path = Path(options["schema"])
-        validator = schema_validator(schema_path)
+        validator = schema_validator(Path(options["schema"])) if options["schema"] else None
+        validators = (
+            {}
+            if validator is not None
+            else {version: schema_validator(path) for version, path in DEFAULT_SCHEMA_PATHS.items()}
+        )
         event_count = 0
         error_count = 0
         for raw_path in options["paths"]:
@@ -41,7 +53,27 @@ class Command(BaseCommand):
                         error_count += 1
                         self.stderr.write(f"{path}:{line_number}: invalid JSON: {exc.msg}")
                         continue
-                    errors = sorted(validator.iter_errors(event), key=lambda error: error.path)
+                    event_validator = validator
+                    if event_validator is None:
+                        schema_version = (
+                            event.get("schema_version") if isinstance(event, dict) else None
+                        )
+                        event_validator = (
+                            validators.get(schema_version)
+                            if isinstance(schema_version, str)
+                            else None
+                        )
+                        if event_validator is None:
+                            error_count += 1
+                            expected = ", ".join(sorted(validators))
+                            self.stderr.write(
+                                f"{path}:{line_number}:schema_version: unsupported schema_version; "
+                                f"expected one of {expected}"
+                            )
+                            continue
+                    errors = sorted(
+                        event_validator.iter_errors(event), key=lambda error: error.path
+                    )
                     for error in errors:
                         for pointer, message in safe_validation_errors(error):
                             error_count += 1

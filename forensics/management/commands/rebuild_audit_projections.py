@@ -15,7 +15,7 @@ from forensics.models import (
     RecipientExpectation,
     StateDelta,
 )
-from forensics.projections import AUDIT_SCHEMA_VERSION_V2, rebuild_group_projections
+from forensics.projections import PROJECTION_AUDIT_SCHEMA_VERSIONS, rebuild_group_projections
 
 PROJECTION_MODELS = (
     DeliveryArtifact,
@@ -73,7 +73,7 @@ class Command(BaseCommand):
             return groups_from_selectors(group_selectors)
         if audit_file_ids:
             return groups_from_audit_file_ids(audit_file_ids)
-        return groups_with_v2_evidence()
+        return groups_with_projection_evidence()
 
 
 def groups_from_selectors(selectors: list[str]) -> list[AuditGroup]:
@@ -116,11 +116,11 @@ def groups_from_audit_file_ids(audit_file_ids: list[int]) -> list[AuditGroup]:
     return groups
 
 
-def groups_with_v2_evidence() -> list[AuditGroup]:
+def groups_with_projection_evidence() -> list[AuditGroup]:
     group_ids = (
         AuditEvent.objects.filter(
             parse_status=AuditEvent.STATUS_VALID,
-            schema_version=AUDIT_SCHEMA_VERSION_V2,
+            schema_version__in=PROJECTION_AUDIT_SCHEMA_VERSIONS,
             group__isnull=False,
         )
         .values_list("group_id", flat=True)

@@ -15,7 +15,13 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
-from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.test import (
+    RequestFactory,
+    SimpleTestCase,
+    TestCase,
+    TransactionTestCase,
+    override_settings,
+)
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -85,6 +91,7 @@ from .views import (
 
 SCHEMA_VERSION = "marmot-forensics-audit/v1"
 SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
+SCHEMA_VERSION_V3 = "marmot-forensics-audit/v3"
 ENGINE_ALICE = "0123456789abcdef0123456789abcdef"
 ENGINE_BOB = "abcdef0123456789abcdef0123456789"
 ACCOUNT_ALICE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -186,6 +193,29 @@ def audit_event_v2(
         "group_ref": group_ref,
         "context": context if context is not None else {"operation_id": f"op-v2-{seq}"},
         "kind": kind or {"type": "recorder_started", "recorder": "mdk"},
+    }
+
+
+def audit_event_v3(
+    seq,
+    engine_id=ENGINE_ALICE,
+    group_ref=GROUP_REF,
+    account_ref=ACCOUNT_ALICE,
+    kind=None,
+    wall_time_ms=None,
+    context=None,
+    recorder_session_id="session-v3-a",
+):
+    return {
+        "schema_version": SCHEMA_VERSION_V3,
+        "seq": seq,
+        "wall_time_ms": wall_time_ms or 1_700_000_100_000 + seq,
+        "recorder_session_id": recorder_session_id,
+        "account_ref": account_ref,
+        "engine_id": engine_id,
+        "group_ref": group_ref,
+        "context": context if context is not None else {"operation_id": f"op-v3-{seq}"},
+        "kind": kind or {"type": "recorder_started", "recorder": "jsonl"},
     }
 
 
@@ -2232,6 +2262,173 @@ class AuditLogIngestionTests(TestCase):
         )
         self.assertIn("raw_line", evidence_response.json()["event"])
 
+    def test_v3_upload_builds_safe_only_projections_and_v2_still_uploads(self):
+        raw_token, _token = UploadToken.issue("v2 and v3 test client")
+        v3_body = jsonl(
+            audit_event_v3(
+                0,
+                kind={
+                    "type": "source_context",
+                    "source": {
+                        "account_label": "Alice",
+                        "device_name": "Alice laptop",
+                        "platform": "macos",
+                    },
+                },
+            ),
+            audit_event_v3(
+                1,
+                kind={
+                    "type": "transport_received",
+                    "msg_id": MSG_ID,
+                    "transport": {
+                        "transport": "nostr",
+                        "delivery_plane": "relay",
+                        "relay_url": "wss://relay.example",
+                        "nostr_event_id": DIGEST_A,
+                    },
+                    "payload_len": 42,
+                    "payload_digest": DIGEST_B,
+                },
+            ),
+            audit_event_v3(
+                2,
+                kind={
+                    "type": "recipient_expectation",
+                    "msg_id": MSG_ID,
+                    "expectation": {
+                        "artifact_kind": "application_message",
+                        "recipient_scope": "all_other_current_group_members",
+                        "membership_epoch": 7,
+                        "expected_member_refs": [ACCOUNT_BOB],
+                        "expected_count": 1,
+                    },
+                },
+            ),
+            audit_event_v3(
+                3,
+                context={"convergence": {"run_id": "run-v3", "phase": "selected"}},
+                kind={
+                    "type": "convergence_decision",
+                    "current_tip_epoch": 7,
+                    "max_rewind_commits": 5,
+                    "selected_branch_id": "branch-a",
+                    "selected_fork_epoch": 6,
+                    "selected_tip_epoch": 8,
+                    "decisive_rule": "witness_quorum_met",
+                    "candidates": [
+                        {
+                            "branch_id": "branch-a",
+                            "fork_epoch": 6,
+                            "tip_epoch": 8,
+                            "eligible": True,
+                            "commit_ids": [MSG_ID],
+                            "score": {
+                                "valid_commit_depth": 2,
+                                "witness_quorum_met": True,
+                            },
+                        }
+                    ],
+                },
+            ),
+            audit_event_v3(
+                4,
+                kind={
+                    "type": "group_state_changed",
+                    "epoch": 8,
+                    "change_kind": "group_disbanded",
+                    "origin_commit_id": MSG_ID,
+                    "fields": ["group_status"],
+                    "value": {"digest": DIGEST_A, "len": 9},
+                },
+            ),
+            audit_event_v3(
+                5,
+                kind={
+                    "type": "sync_drain",
+                    "duration_ms": 25,
+                    "deliveries": 3,
+                    "skipped": 1,
+                },
+            ),
+        )
+
+        v3_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=v3_body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(v3_response.status_code, 201)
+        self.assertEqual(v3_response.json()["schema_versions"], [SCHEMA_VERSION_V3])
+        self.assertEqual(v3_response.json()["audit_data_modes"], ["safe_only"])
+        self.assertEqual(v3_response.json()["source"]["account_label"], "Alice")
+        v3_file = AuditFile.objects.get(schema_versions=[SCHEMA_VERSION_V3])
+        self.assertEqual(v3_file.validation_status, AuditFile.STATUS_VALID)
+        self.assertNotIn("audit_data_mode", v3_file.events.first().raw_event)
+        self.assertTrue(
+            v3_file.events.filter(
+                event_type="sync_drain",
+                parse_status=AuditEvent.STATUS_VALID,
+            ).exists()
+        )
+
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        artifact = DeliveryArtifact.objects.get(group=group, artifact_id=MSG_ID)
+        self.assertEqual(artifact.audit_data_modes, ["safe_only"])
+        self.assertEqual(artifact.recipient_expectations.get().expected_member_refs, [ACCOUNT_BOB])
+        self.assertEqual(
+            NetworkObservation.objects.get(group=group, phase="transport_received").relay_url,
+            "wss://relay.example",
+        )
+        run = ConvergenceRun.objects.get(group=group, run_id="run-v3")
+        self.assertEqual(run.selected_branch_id, "branch-a")
+        decisive_rule = ConvergenceRuleEvaluation.objects.get(run=run)
+        self.assertEqual(decisive_rule.rule_name, "witness_quorum_met")
+        self.assertTrue(decisive_rule.decisive)
+        self.assertEqual(decisive_rule.selected_branch_id, "branch-a")
+        delta = StateDelta.objects.get(group=group)
+        self.assertEqual(delta.change_kind, "group_disbanded")
+        self.assertEqual(delta.value, {"digest": DIGEST_A, "len": 9})
+        self.assertEqual(delta.audit_data_mode, "safe_only")
+
+        v2_response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=jsonl(
+                audit_event_v2(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    kind={"type": "recorder_started", "recorder": "jsonl"},
+                )
+            ),
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(v2_response.status_code, 201)
+        self.assertEqual(v2_response.json()["schema_versions"], [SCHEMA_VERSION_V2])
+        self.assertEqual(v2_response.json()["audit_data_modes"], ["obfuscated_sensitive_data"])
+        self.assertEqual(AuditFile.objects.filter(groups=group).count(), 2)
+
+    def test_v3_only_peeler_outcomes_preserve_v2_validation(self):
+        for outcome in ("invalid_signature", "wrong_recipient"):
+            kind = {
+                "type": "peeler_outcome",
+                "msg_id": MSG_ID,
+                "outcome": outcome,
+                "fallback_snapshot_used": False,
+            }
+            with self.subTest(schema_version=SCHEMA_VERSION_V3, outcome=outcome):
+                normalized, errors = ingest_module.normalize_event(audit_event_v3(0, kind=kind))
+                self.assertEqual(errors, [])
+                self.assertEqual(normalized["outcome"], outcome)
+
+            with self.subTest(schema_version=SCHEMA_VERSION_V2, outcome=outcome):
+                _normalized, errors = ingest_module.normalize_event(audit_event_v2(0, kind=kind))
+                self.assertIn("outcome must be a known peeler outcome", errors)
+
     def test_v2_message_ids_must_be_canonical_64_hex_ids(self):
         raw_token, _token = UploadToken.issue("v2 strict message ids")
         body = jsonl(
@@ -2256,6 +2453,34 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("msg_id must be 64 hex characters", response.json()["error"])
         event = AuditEvent.objects.get()
+        self.assertEqual(event.msg_id, "")
+        self.assertEqual(event.raw_event["kind"]["msg_id"], "abcd")
+
+    def test_v3_message_ids_must_be_canonical_64_hex_ids(self):
+        raw_token, _token = UploadToken.issue("v3 strict message ids")
+        body = jsonl(
+            audit_event_v3(
+                0,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": "abcd",
+                    "new_state": "processed",
+                    "reason": "short_id_regression",
+                },
+            )
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            HTTP_AUTHORIZATION=f"Bearer {raw_token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("msg_id must be 64 hex characters", response.json()["error"])
+        event = AuditEvent.objects.get()
+        self.assertEqual(event.audit_data_mode, "safe_only")
         self.assertEqual(event.msg_id, "")
         self.assertEqual(event.raw_event["kind"]["msg_id"], "abcd")
 
@@ -4049,6 +4274,37 @@ class AuditLogIngestionTests(TestCase):
 
 
 class RebuildAuditProjectionsCommandTests(TestCase):
+    def test_rebuild_without_selectors_includes_v3_evidence(self):
+        result = ingest_audit_log_bytes(
+            dump_bytes=jsonl(
+                audit_event_v3(
+                    0,
+                    kind={
+                        "type": "transport_received",
+                        "msg_id": MSG_ID,
+                        "transport": {
+                            "transport": "nostr",
+                            "relay_url": "wss://relay.example",
+                        },
+                        "payload_len": 42,
+                        "payload_digest": DIGEST_A,
+                    },
+                )
+            ).encode("utf-8"),
+            source_name="v3-command-test.jsonl",
+        )
+
+        self.assertEqual(result.audit_file.schema_versions, [SCHEMA_VERSION_V3])
+        DeliveryArtifact.objects.all().delete()
+        NetworkObservation.objects.all().delete()
+
+        output = StringIO()
+        call_command("rebuild_audit_projections", stdout=output)
+
+        self.assertEqual(DeliveryArtifact.objects.get().artifact_id, MSG_ID)
+        self.assertEqual(NetworkObservation.objects.get().relay_url, "wss://relay.example")
+        self.assertIn("Rebuilt audit projections for 1 group(s)", output.getvalue())
+
     def test_rebuild_restores_v2_projection_tables_from_raw_evidence(self):
         result = ingest_audit_log_bytes(
             dump_bytes=jsonl(
@@ -4950,6 +5206,45 @@ class ValidateAuditSchemaCommandTests(TestCase):
         )
 
         self.assertIn("Schema validation passed for 14 event(s)", output.getvalue())
+
+    def test_validate_audit_schema_dispatches_mixed_v2_and_v3_rows(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mixed.jsonl"
+            path.write_text(
+                jsonl(
+                    audit_event_v2(0),
+                    audit_event_v3(
+                        1,
+                        kind={
+                            "type": "group_state_changed",
+                            "epoch": 8,
+                            "change_kind": "group_disbanded",
+                            "value": {"digest": DIGEST_A, "len": 9},
+                        },
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            output = StringIO()
+
+            call_command("validate_audit_schema", str(path), stdout=output)
+
+        self.assertIn("Schema validation passed for 2 event(s)", output.getvalue())
+
+    def test_validate_audit_schema_reports_non_string_schema_version(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bad-version.jsonl"
+            path.write_text(
+                json.dumps({"schema_version": [SCHEMA_VERSION_V3]}, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            stderr = StringIO()
+
+            with self.assertRaisesMessage(CommandError, "Schema validation failed"):
+                call_command("validate_audit_schema", str(path), stderr=stderr)
+
+        self.assertIn("bad-version.jsonl:1:schema_version", stderr.getvalue())
+        self.assertIn("unsupported schema_version", stderr.getvalue())
 
     def test_validate_audit_schema_reports_line_without_raw_body(self):
         with TemporaryDirectory() as temp_dir:
@@ -6008,7 +6303,7 @@ class PurgeAuditDataCommandTests(TestCase):
         self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
 
 
-class PruneAuditDataCommandTests(TestCase):
+class PruneAuditDataCommandTests(TransactionTestCase):
     def ingest_paired_evidence(self):
         """One group holding a 20-day-old upload and a fresh upload."""
         _raw_token, token = UploadToken.issue("ios qa")

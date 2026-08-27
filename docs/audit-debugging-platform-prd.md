@@ -294,22 +294,23 @@ explicit authorization and auditability.
 
 ## Current Goggles Changes Needed
 
-Near-term support should assume a greenfield database reset and V2-first
-projection model:
+Near-term support should assume a greenfield database reset and a v3-current,
+v2-compatible projection model:
 
-- Accept V1 and V2 raw event rows, but make V2 the target normalized contract.
+- Accept v1, v2, and v3 raw event rows, with safe-only v3 as the current
+  normalized contract and v1/v2 retained for historical evidence.
 - Add a compact raw-evidence layer for files, lines, schema version, event type,
-  refs, audit data mode, and evidence hashes.
+  refs, the normalized privacy posture, and evidence hashes.
 - Add relational projection tables for Delivery, Network, Convergence, and
   State instead of expanding the single `AuditEvent` table indefinitely.
-- Normalize and display audit data mode from top-level rows, recorder/session
-  context, and source metadata.
+- Normalize historical v2 audit data modes and derive the fixed `safe_only`
+  posture for v3 rows.
 - Separate real app/user actions from system-stamped attribution rows.
 - Remove the all-events timeline and replace it with smaller purpose-built
   group tabs.
 - Add clear full-data badges, warnings, and access checks anywhere decrypted
   message content or full transport identifiers can appear.
-- Update fixtures and parser tests for the V2 JSON Schema.
+- Keep parser/schema tests for both historical v2 and current v3.
 - Include derived projections in agent export and API output.
 
 ## MDK Audit Data Gaps
@@ -317,8 +318,9 @@ projection model:
 The latest audit changes are a strong foundation, but Goggles probably needs
 additional MDK events for complete explainability.
 
-A first draft of the proposed V2 event-line schema is in
-[`docs/schemas/audit-log-event.v2.schema.json`](schemas/audit-log-event.v2.schema.json).
+The current safe-only v3 event-line schema is in
+[`docs/schemas/audit-log-event.v3.schema.json`](schemas/audit-log-event.v3.schema.json);
+the historical v2 schema remains alongside it for compatibility.
 The Goggles internal read API contract is documented in
 [`docs/api-v1.md`](api-v1.md).
 

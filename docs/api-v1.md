@@ -37,7 +37,8 @@ Projection endpoints support these filters where the field applies:
 
 - `engine_id`
 - `account_ref`
-- `audit_data_mode`
+- `audit_data_mode` (`safe_only` for v3; historical v2 mode tokens remain
+  filterable)
 - `message_id`
 - `event_type`
 - `severity`: `info`, `warning`, or `error`
@@ -96,9 +97,11 @@ wire ids, or preserved raw evidence include:
 }
 ```
 
-The current internal-testing policy grants full-data readout to authenticated
-Goggles users. If Goggles later separates analyst and administrator roles, this
-metadata is the field-level hook for enforcing stricter access.
+Current v3 evidence reports the derived `safe_only` posture. Historical v2
+`full_data` evidence remains readable by authenticated Goggles users under the
+current internal-testing policy. If Goggles later separates analyst and
+administrator roles, this metadata is the field-level hook for enforcing
+stricter access.
 
 ## Endpoints
 
