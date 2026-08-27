@@ -31,6 +31,14 @@ SUPPORTED_AUDIT_SCHEMA_VERSIONS = {
     AUDIT_SCHEMA_VERSION_V3,
 }
 CURRENT_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V2, AUDIT_SCHEMA_VERSION_V3}
+PEELER_OUTCOMES = {
+    "success",
+    "decrypt_failed",
+    "stale_epoch",
+    "malformed",
+    "other",
+}
+V3_PEELER_OUTCOMES = PEELER_OUTCOMES | {"invalid_signature", "wrong_recipient"}
 DEFAULT_AUDIT_DATA_MODE = "obfuscated_sensitive_data"
 SAFE_ONLY_AUDIT_DATA_MODE = "safe_only"
 AUDIT_DATA_MODES = {DEFAULT_AUDIT_DATA_MODE, "full_data"}
@@ -775,13 +783,12 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
         case "peeler_outcome":
             copy_msg_id(kind, normalized, errors)
             copy_str(kind, normalized, errors, "outcome")
-            if normalized.get("outcome") not in {
-                "success",
-                "decrypt_failed",
-                "stale_epoch",
-                "malformed",
-                "other",
-            }:
+            allowed_outcomes = (
+                V3_PEELER_OUTCOMES
+                if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V3
+                else PEELER_OUTCOMES
+            )
+            if normalized.get("outcome") not in allowed_outcomes:
                 errors.append("outcome must be a known peeler outcome")
             fallback = kind.get("fallback_snapshot_used")
             if not isinstance(fallback, bool):

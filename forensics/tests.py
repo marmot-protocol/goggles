@@ -15,7 +15,13 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
-from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.test import (
+    RequestFactory,
+    SimpleTestCase,
+    TestCase,
+    TransactionTestCase,
+    override_settings,
+)
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -2405,6 +2411,23 @@ class AuditLogIngestionTests(TestCase):
         self.assertEqual(v2_response.json()["schema_versions"], [SCHEMA_VERSION_V2])
         self.assertEqual(v2_response.json()["audit_data_modes"], ["obfuscated_sensitive_data"])
         self.assertEqual(AuditFile.objects.filter(groups=group).count(), 2)
+
+    def test_v3_only_peeler_outcomes_preserve_v2_validation(self):
+        for outcome in ("invalid_signature", "wrong_recipient"):
+            kind = {
+                "type": "peeler_outcome",
+                "msg_id": MSG_ID,
+                "outcome": outcome,
+                "fallback_snapshot_used": False,
+            }
+            with self.subTest(schema_version=SCHEMA_VERSION_V3, outcome=outcome):
+                normalized, errors = ingest_module.normalize_event(audit_event_v3(0, kind=kind))
+                self.assertEqual(errors, [])
+                self.assertEqual(normalized["outcome"], outcome)
+
+            with self.subTest(schema_version=SCHEMA_VERSION_V2, outcome=outcome):
+                _normalized, errors = ingest_module.normalize_event(audit_event_v2(0, kind=kind))
+                self.assertIn("outcome must be a known peeler outcome", errors)
 
     def test_v2_message_ids_must_be_canonical_64_hex_ids(self):
         raw_token, _token = UploadToken.issue("v2 strict message ids")
@@ -6280,7 +6303,7 @@ class PurgeAuditDataCommandTests(TestCase):
         self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
 
 
-class PruneAuditDataCommandTests(TestCase):
+class PruneAuditDataCommandTests(TransactionTestCase):
     def ingest_paired_evidence(self):
         """One group holding a 20-day-old upload and a fresh upload."""
         _raw_token, token = UploadToken.issue("ios qa")
