@@ -40,6 +40,8 @@ NETWORK_EVENT_TYPES = {
 }
 CONVERGENCE_EVENT_TYPES = {"convergence_run_state", "convergence_decision"}
 AUDIT_SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
+AUDIT_SCHEMA_VERSION_V3 = "marmot-forensics-audit/v3"
+PROJECTION_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V2, AUDIT_SCHEMA_VERSION_V3}
 INFERRED_CONVERGENCE_TERMINAL_PHASES = {
     "applied",
     "blocked",
@@ -122,7 +124,7 @@ def rebuild_file_projections(audit_file: AuditFile) -> None:
     existing rows needs no full clear. Use ``rebuild_group_projections`` (the
     management-command path) for an explicit full rebuild from raw evidence.
     """
-    if AUDIT_SCHEMA_VERSION_V2 not in (audit_file.schema_versions or []):
+    if not PROJECTION_AUDIT_SCHEMA_VERSIONS.intersection(audit_file.schema_versions or []):
         return
     group_ids = set(audit_file.groups.values_list("id", flat=True))
     group_ids.update(
@@ -767,7 +769,10 @@ def project_convergence_decision(run: ConvergenceRun, kind: dict[str, Any]) -> N
             },
         )
 
-    for sequence, rule in enumerate(kind.get("rule_trace") or []):
+    rule_trace = kind.get("rule_trace")
+    if not isinstance(rule_trace, list):
+        rule_trace = []
+    for sequence, rule in enumerate(rule_trace):
         if not isinstance(rule, dict):
             continue
         ConvergenceRuleEvaluation.objects.create(
@@ -782,6 +787,20 @@ def project_convergence_decision(run: ConvergenceRun, kind: dict[str, Any]) -> N
             selected_branch_id=str(rule.get("selected_branch_id") or ""),
             rejected_branch_id=str(rule.get("rejected_branch_id") or ""),
             sequence=sequence,
+        )
+
+    # Legacy V2 carries the full rule trace. Safe-only V3 replaces that trace
+    # with the name of the decisive rule; project the scalar into the existing
+    # model so API/UI consumers retain the decision without inventing inputs or
+    # results that are no longer present on the wire.
+    decisive_rule = kind.get("decisive_rule")
+    if not rule_trace and isinstance(decisive_rule, str) and decisive_rule:
+        ConvergenceRuleEvaluation.objects.create(
+            run=run,
+            rule_name=decisive_rule,
+            decisive=True,
+            selected_branch_id=str(kind.get("selected_branch_id") or ""),
+            sequence=0,
         )
 
 

@@ -74,7 +74,7 @@ purge-audit-data *args: migrate
 shell: migrate
     DATABASE_URL='{{database_url}}' {{python}} manage.py shell
 
-# Validate JSONL audit events against the committed V2 schema.
+# Validate JSONL audit events against committed V2/V3 schemas by row version.
 validate-schema *paths:
     {{python}} manage.py validate_audit_schema {{paths}}
 

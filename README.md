@@ -2,9 +2,11 @@
 
 Internal Marmot audit-log explorer.
 
-Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from MDK clients (current schema `marmot-forensics-audit/v2`; legacy `v1` is still accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
+Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from MDK clients (current safe-only schema `marmot-forensics-audit/v3`; legacy `v1` and `v2` are still accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
 
-The audit event schema is committed at `docs/schemas/audit-log-event.v2.schema.json`.
+The current and legacy normalized audit event schemas are committed at
+`docs/schemas/audit-log-event.v3.schema.json` and
+`docs/schemas/audit-log-event.v2.schema.json`.
 See also `docs/audit-log-glossary.md` for a plain-English term guide,
 `docs/api-v1.md` for the authenticated read API, `docs/deployment.md` for VM
 deployment notes, and `docs/audit-debugging-platform-prd.md` for the platform's
@@ -41,7 +43,7 @@ just purge-audit-data    # delete audit uploads/events/groups/projections/report
 just migrate             # apply migrations to the dev database
 just makemigrations      # create migrations from model changes
 just shell               # open a Django shell against the dev database
-just validate-schema P   # validate JSONL paths against the committed V2 audit schema
+just validate-schema P   # validate JSONL paths against committed V2/V3 schemas
 just django-check        # run Django's system checks
 just lint                # run Ruff lint checks
 just format              # format Python code with Ruff
@@ -67,7 +69,7 @@ format checking, migration drift checking, and the locked dependency audit.
 
 ## Upload An Audit Log
 
-Each line must be one JSON object in the `marmot-forensics-audit` JSONL shape. Current `marmot-forensics-audit/v2` rows must include `schema_version`, `seq`, `wall_time_ms`, `audit_data_mode` (`obfuscated_sensitive_data` or `full_data`), a non-empty `engine_id`, and a `kind` object. Legacy `marmot-forensics-audit/v1` rows are still accepted, but they must additionally carry a human action (`kind.type = "human_action"` or `context.human_action.action`); action-less v1 rows are quarantined. If the JSONL includes valid `group_ref` values, Goggles will create or reuse those groups automatically. One uploaded file can contain multiple groups, but it should normally contain one `engine_id` and one `account_ref`. The bundled `fixtures/*.jsonl` samples are all `marmot-forensics-audit/v2`.
+Each line must be one JSON object in the `marmot-forensics-audit` JSONL shape. Current `marmot-forensics-audit/v3` rows include `schema_version`, `seq`, `wall_time_ms`, a non-empty `engine_id`, and a `kind` object; v3 has one safe-only privacy posture and no `audit_data_mode` field. Historical `marmot-forensics-audit/v2` rows remain accepted with their required `audit_data_mode` (`obfuscated_sensitive_data` or `full_data`). Legacy `marmot-forensics-audit/v1` rows are also accepted, but they must additionally carry a human action (`kind.type = "human_action"` or `context.human_action.action`); action-less v1 rows are quarantined. If the JSONL includes valid `group_ref` values, Goggles will create or reuse those groups automatically. One uploaded file can contain multiple groups, but it should normally contain one `engine_id` and one `account_ref`. The bundled `fixtures/*.jsonl` samples remain v2 compatibility fixtures.
 
 ```sh
 curl -X POST http://127.0.0.1:8000/api/v1/audit-logs/ \
@@ -330,9 +332,11 @@ docker compose exec web python manage.py shell -c "from forensics.models import 
   `--confirm-delete-audit-data` to perform a deployment cutover. Rebuild the
   normalized projections from the preserved raw lines with
   `manage.py rebuild_audit_projections` if a projection needs to be regenerated.
-- Validate JSONL against the committed V2 schema with
+- Validate V2/V3 JSONL against the committed schema selected from each row's
+  `schema_version` with
   `manage.py validate_audit_schema <path>` (or `just validate-schema <path>`)
-  before relying on a third-party export.
+  before relying on a third-party export. Pass `--schema <path>` to force one
+  schema for every row.
 - Do not log bearer tokens or raw upload bodies. Keep Caddy access logs away from `Authorization` headers.
 - Back up the Postgres named volume with `pg_dump`, store backups encrypted, and test restore before relying on them:
 

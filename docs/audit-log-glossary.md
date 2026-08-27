@@ -2,7 +2,9 @@
 
 This glossary explains the Marmot forensic audit-log terms as Goggles uses
 them. It is a reader's guide, not the canonical schema. For exact field
-requirements, use `docs/schemas/audit-log-event.v2.schema.json`.
+requirements, use `docs/schemas/audit-log-event.v3.schema.json` for current
+safe-only logs or `docs/schemas/audit-log-event.v2.schema.json` for historical
+v2 logs.
 
 Treat the fields described here as sensitive forensic data. Raw uploads,
 bearer tokens, engine ids, account refs, group refs, message ids, payload
@@ -16,7 +18,8 @@ An audit log is JSONL: one JSON object per line. Each line is one audit event.
 Each event has two layers:
 
 - Top-level envelope fields, such as `schema_version`, `seq`, `wall_time_ms`,
-  `audit_data_mode`, `account_ref`, `engine_id`, and `group_ref`.
+  `account_ref`, `engine_id`, and `group_ref`. Historical v2 rows also carry
+  `audit_data_mode`.
 - A `kind` object, whose `type` says what happened and whose remaining fields
   are specific to that event type.
 
@@ -31,11 +34,11 @@ convergence run, state change, and evidence line.
 | Audit event | One JSONL line describing something the recorder saw or did. |
 | Raw line | The original preserved JSONL line. This is the source evidence. |
 | Evidence ref | A pointer back to source evidence, usually file id, line number, line hash, and event kind. Derived rows should link to evidence instead of embedding raw JSON everywhere. |
-| `schema_version` | The audit-log schema version. Current logs use `marmot-forensics-audit/v2`; legacy V1 logs are still accepted with restrictions. |
+| `schema_version` | The audit-log schema version. Current logs use safe-only `marmot-forensics-audit/v3`; legacy v1 and v2 logs remain accepted. |
 | `seq` | Per-recorder sequence number for ordering events emitted by one recorder session. |
 | `wall_time_ms` | Milliseconds since Unix epoch according to the client/engine that recorded the event. Useful for timelines, but it is not a cryptographic ordering guarantee. |
-| `recorder_session_id` | Identifier for a recorder session. Mode changes may restart or reopen a recorder session. |
-| `audit_data_mode` | Sensitivity mode for the event. `obfuscated_sensitive_data` avoids decrypted content and full identifiers where possible. `full_data` may include decrypted message content, full author ids, and transport wire ids. |
+| `recorder_session_id` | Identifier for a recorder session. Recorder restarts or reopens may create a new session. |
+| `audit_data_mode` | Historical v2 sensitivity mode. `obfuscated_sensitive_data` avoids decrypted content and full identifiers where possible; `full_data` may include them. V3 removed this wire field and Goggles derives the normalized `safe_only` posture from `schema_version`. |
 | `account_ref` | Stable obfuscated account reference used for joins. It is sensitive. |
 | `engine_id` | The specific account-device engine that emitted the event. One uploaded file should normally contain one engine id. |
 | `group_ref` | Stable group reference used to put events into a Goggles group workspace. |
@@ -67,8 +70,8 @@ convergence run, state change, and evidence line.
 | `missing_inferred` | Goggles expected evidence but did not find comparable observation evidence. This is an inference, not proof of non-delivery. |
 | `unobserved_no_uploaded_engine` | The expected recipient has no comparable uploaded engine evidence, so Goggles cannot say much. |
 | `observed_not_expected` | An engine observed an artifact that was not in the expected recipient set. |
-| `decoded_payload` | Decoded content from the artifact. In `full_data` mode this may include decrypted user-visible content. |
-| `decoded_app_event` | Application-protocol details extracted from decoded content, such as app event kind, content, author pubkey, tags, client message id, reply/thread ids, attachments, or raw app event data. |
+| `decoded_payload` | Historical v2 full-data decoded content. Safe-only v3 does not emit it. |
+| `decoded_app_event` | Historical v2 application-protocol details extracted from decoded content. Safe-only v3 does not emit them. |
 | Attachment metadata | Optional decoded-app-event metadata about attachments, such as content type, file name, byte length, digest, and app-specific metadata. |
 | Peeler | The layer that tries to unwrap, decrypt, or peel incoming transport/application envelopes. |
 | Peeler outcome | Result of peeling: `success`, `decrypt_failed`, `stale_epoch`, `malformed`, or `other`. |
@@ -147,30 +150,30 @@ convergence run, state change, and evidence line.
 | Losing branches | Candidate branches that were considered but not selected. |
 | Score | Structured branch scoring details, such as valid commit depth, effective depth, witness quorum, witness score, tip priority, and tip digest. |
 | App witness | Evidence from application-level messages that supports a candidate branch. |
-| Rule trace / rule evaluation | Sequence of branch-selection rules, their inputs, their result, and whether each rule was decisive. |
-| Decisive rule | Rule evaluation that directly selected or rejected a branch. |
+| Rule trace / rule evaluation | Historical v2 sequence of branch-selection rules, their inputs, their result, and whether each rule was decisive. |
+| Decisive rule | Rule that directly selected or rejected a branch. Safe-only v3 records its name as a scalar instead of retaining the free-form v2 rule trace. |
 | Auto-commit decision | Event explaining whether the engine decided to commit a proposal automatically and why. |
 
 ## Event Family Map
 
 | Family | Event types | What to look for |
 | --- | --- | --- |
-| Recorder and context | `recorder_started`, `audit_data_mode_changed`, `source_context`, `engine_context`, `group_context`, `recorder_health` | File/session setup, source labels, engine/group metadata, and recorder health. |
+| Recorder and context | `recorder_started`, `source_context`, `engine_context`, `group_context`, `recorder_health` (plus historical v2 `audit_data_mode_changed`) | File/session setup, source labels, engine/group metadata, and recorder health. |
 | Human action | `human_action` | User or system intent before following message, network, state, or raw evidence. |
 | Send and group creation | `send_entry`, `send_outcome`, `send_error`, `create_group_entry`, `create_group_outcome`, `create_group_error` | Local creation of outbound artifacts and create-group results. |
-| Network and transport | `transport_received`, `ingest_entry`, `ingest_outcome`, `ingest_error`, `publish_attempt`, `publish_outcome`, `publish_failure` | Whether an artifact was published, acknowledged, received from transport, or ingested. |
-| Delivery and processing | `message_content_decoded`, `recipient_expectation`, `peeler_outcome`, `message_state_changed`, `rejection` | Decoded content, recipient expectations, decrypt/peel results, processing states, and failures. |
+| Network and transport | `transport_received`, `ingest_entry`, `ingest_outcome`, `ingest_error`, `publish_attempt`, `publish_outcome`, `publish_failure`, `subscription_rebuild`, `sync_drain` | Whether an artifact was published, acknowledged, received from transport, ingested, or replayed during synchronization. |
+| Delivery and processing | `recipient_expectation`, `peeler_outcome`, `message_state_changed`, `rejection` (plus historical v2 `message_content_decoded`) | Recipient expectations, decrypt/peel results, processing states, and failures. |
 | Epoch and group state | `epoch_confirmed`, `epoch_rolled_back`, `epoch_state_changed`, `group_state_changed` | MLS epoch transitions and authenticated group-state changes. |
-| Recovery and snapshots | `pending_commit_recovered_on_open`, `group_hydration_quarantined`, `group_hydration_recovered`, `snapshot_created`, `fork_resolution` | Recovery paths, state snapshots, hydration health, and fork decisions. |
-| Convergence | `convergence_run_state`, `convergence_decision`, `auto_commit_decision` | Branch candidates, selection rules, selected branch, and convergence lifecycle. |
+| Recovery and snapshots | `pending_commit_recovered_on_open`, `group_hydration_quarantined`, `group_hydration_recovered`, `snapshot_created`, `fork_resolution`, and the `epoch_stall_backfill_*` events | Recovery paths, state snapshots, hydration health, replay/backfill attempts, and fork decisions. |
+| Convergence | `convergence_run_state`, `convergence_decision`, `convergence_pass_discarded`, `auto_commit_decision` | Branch candidates, decisive rules, selected branches, stale-pass discards, and convergence lifecycle. |
 
 ## Common Reading Pitfalls
 
 - A missing observation is usually an inference, not proof. Direct non-arrival
   requires transport/server-side evidence or adapter delivery logs.
 - `msg_id` is not a Nostr id. Transport/on-wire ids live in transport fields.
-- `full_data` means the event may contain decrypted content or full
-  identifiers. Handle it as high-sensitivity forensic evidence.
+- Historical v2 `full_data` means the event may contain decrypted content or
+  full identifiers. Handle it as high-sensitivity forensic evidence.
 - One uploaded file should normally contain one `engine_id` and one
   `account_ref`; mixed-engine or mixed-account uploads are structurally
   quarantined because attribution is untrustworthy.

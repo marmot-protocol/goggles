@@ -24,8 +24,15 @@ logger = logging.getLogger(__name__)
 
 AUDIT_SCHEMA_VERSION_V1 = "marmot-forensics-audit/v1"
 AUDIT_SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
-SUPPORTED_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V1, AUDIT_SCHEMA_VERSION_V2}
+AUDIT_SCHEMA_VERSION_V3 = "marmot-forensics-audit/v3"
+SUPPORTED_AUDIT_SCHEMA_VERSIONS = {
+    AUDIT_SCHEMA_VERSION_V1,
+    AUDIT_SCHEMA_VERSION_V2,
+    AUDIT_SCHEMA_VERSION_V3,
+}
+CURRENT_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V2, AUDIT_SCHEMA_VERSION_V3}
 DEFAULT_AUDIT_DATA_MODE = "obfuscated_sensitive_data"
+SAFE_ONLY_AUDIT_DATA_MODE = "safe_only"
 AUDIT_DATA_MODES = {DEFAULT_AUDIT_DATA_MODE, "full_data"}
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
@@ -518,7 +525,7 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         errors.append("account_ref must be 32 hex characters when present")
     elif normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
         errors.append("account_ref must be 32 hex characters when present")
-    if normalized["schema_version"] == AUDIT_SCHEMA_VERSION_V2:
+    if normalized["schema_version"] in CURRENT_AUDIT_SCHEMA_VERSIONS:
         if not normalized["engine_id"]:
             errors.append("engine_id must be a non-empty string")
         elif string_exceeds_model_limit("engine_id", normalized["engine_id"], errors):
@@ -582,6 +589,12 @@ def audit_data_mode_for_event(
 ) -> str:
     if schema_version == AUDIT_SCHEMA_VERSION_V1:
         return DEFAULT_AUDIT_DATA_MODE
+    if schema_version == AUDIT_SCHEMA_VERSION_V3:
+        # V3 removed the wire-level data-mode field and has one intrinsically
+        # safe-only posture. Keep that posture visible in Goggles' normalized
+        # filters/classification without pretending the legacy V2 token was
+        # present in the uploaded evidence.
+        return SAFE_ONLY_AUDIT_DATA_MODE
 
     value = data.get("audit_data_mode")
     if not isinstance(value, str):
@@ -1452,13 +1465,13 @@ def copy_msg_field(
 
 
 def is_valid_message_id(value: Any, normalized: dict[str, Any]) -> bool:
-    if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V2:
+    if normalized.get("schema_version") in CURRENT_AUDIT_SCHEMA_VERSIONS:
         return is_hex(value, exact_len=64)
     return is_hex(value, even=True)
 
 
 def message_id_requirement_label(normalized: dict[str, Any]) -> str:
-    if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V2:
+    if normalized.get("schema_version") in CURRENT_AUDIT_SCHEMA_VERSIONS:
         return "64 hex characters"
     return "even-length hex"
 
