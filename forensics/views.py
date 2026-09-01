@@ -25,6 +25,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.cache import patch_vary_headers
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
@@ -860,16 +861,29 @@ def nested_json_value(value: dict, path: tuple[str, ...]):
     return current
 
 
-@login_required
+@require_GET
 def api_group_list(request: HttpRequest):
+    """List every group. Readable by a personal access token, not just a session:
+    this is the discovery step a machine consumer needs before it can pull each
+    group's streaming export, which is already PAT-authenticated.
+    """
+    if not authenticate_reader(request):
+        return JsonResponse({"error": "authentication required"}, status=401)
+
     groups = group_list_rows()
-    return JsonResponse(
+    response = JsonResponse(
         {
             "schema_version": "goggles-groups/v1",
             "groups": [group_list_api_payload(group) for group in groups],
         },
         json_dumps_params={"separators": (",", ":")},
     )
+    response["Cache-Control"] = "no-store"  # sensitive payload
+    # The reply now depends on the Authorization header too. Without this a shared
+    # cache would key a token-authenticated response — which carries no Cookie —
+    # under the anonymous key and hand the whole group index to the next caller.
+    patch_vary_headers(response, ["Authorization"])
+    return response
 
 
 @login_required

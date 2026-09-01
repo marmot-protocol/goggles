@@ -98,6 +98,7 @@ ACCOUNT_ALICE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ACCOUNT_BOB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 GROUP_REF = "11" * 32
 OTHER_GROUP_REF = "44" * 32
+THIRD_GROUP_REF = "77" * 32
 MSG_ID = "22" * 32
 OTHER_MSG_ID = "33" * 32
 DIGEST_A = "aa" * 32
@@ -6068,6 +6069,151 @@ class GroupExportStreamTests(TestCase):
         self.assertTrue(any(record["t"] == "source" for record in records))
         self.assertEqual(records[-1], {"t": "error", "complete": False})
         self.assertNotIn("eof", {record["t"] for record in records})
+
+
+class GroupListApiAuthTests(TestCase):
+    """Group discovery over the JSON API. Same reader contract as the streaming
+    export: a logged-in session or a personal access token, never an upload token."""
+
+    def setUp(self):
+        # Three groups, not one: with a single row the slug-list and byte-identity
+        # assertions below cannot catch an ordering, duplication, or row-leak
+        # regression. AuditGroup.Meta.ordering is ["-updated_at", "-created_at"],
+        # so the index is the reverse of ingestion order.
+        ingest_audit_log_bytes(dump_bytes=representative_audit_log().encode("utf-8"))
+        for group_ref in (OTHER_GROUP_REF, THIRD_GROUP_REF):
+            ingest_audit_log_bytes(
+                dump_bytes=jsonl(
+                    audit_event(
+                        0,
+                        engine_id=ENGINE_BOB,
+                        group_ref=group_ref,
+                        account_ref=ACCOUNT_BOB,
+                    )
+                ).encode("utf-8")
+            )
+        self.group = AuditGroup.objects.get(slug=GROUP_REF)
+        self.expected_slugs = [THIRD_GROUP_REF, OTHER_GROUP_REF, GROUP_REF]
+        self.user = User.objects.create_user(
+            username="reader", password="correct horse battery staple"
+        )
+        self.url = reverse("api-group-list")
+
+    def test_requires_authentication(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"error": "authentication required"})
+
+    def test_rejects_invalid_bearer_token(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Bearer gpat_deadbeef_nope")
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_malformed_authorization_header(self):
+        response = self.client.get(self.url, HTTP_AUTHORIZATION="Token gpat_deadbeef_nope")
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_revoked_personal_access_token(self):
+        raw_token, token = PersonalAccessToken.issue("revoked", user=self.user)
+        token.is_active = False
+        token.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_expired_personal_access_token(self):
+        raw_token, _token = PersonalAccessToken.issue(
+            "stale", user=self.user, expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_rejects_token_of_deactivated_user(self):
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_upload_token_cannot_list_groups(self):
+        # Pins the view-level contract: authenticate_reader() accepts only the
+        # personal-access-token family, so widening it to upload tokens turns this
+        # 401 into a 200. The crypto-layer prefix guard that keeps the two token
+        # families structurally un-confusable is covered separately, by
+        # PersonalAccessTokenTests.test_upload_and_personal_tokens_never_cross_authenticate.
+        raw_token, _token = UploadToken.issue("device")
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+        self.assertEqual(response.status_code, 401)
+
+    def test_personal_access_token_is_refused_by_session_only_group_endpoints(self):
+        """A personal access token authorizes exactly two endpoints — this index and
+        the streaming group export. Every other read endpoint stays session-only.
+
+        docs/api-v1.md and AGENTS.md both state that "exactly two" claim, and nothing
+        else in the suite defends it: swapping @login_required for authenticate_reader
+        on one of these views would otherwise leave the suite green and both documents
+        silently false. Widening an endpoint on purpose means updating those docs too.
+        """
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+
+        for name, kwargs in (
+            ("api-group-detail", {"slug": self.group.slug}),
+            ("api-account-groups", {"account_ref": ACCOUNT_ALICE}),
+            ("api-engine-groups", {"engine_id": ENGINE_ALICE}),
+        ):
+            with self.subTest(endpoint=name):
+                response = self.client.get(
+                    reverse(name, kwargs=kwargs), HTTP_AUTHORIZATION=f"Bearer {raw_token}"
+                )
+                # @login_required sees an anonymous request and redirects to the
+                # login page; the token buys no access here.
+                self.assertEqual(response.status_code, 302)
+                self.assertTrue(response["Location"].startswith("/accounts/login/"))
+
+    def test_lists_groups_with_logged_in_session(self):
+        self.client.login(username="reader", password="correct horse battery staple")
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-groups/v1")
+        self.assertEqual([group["slug"] for group in payload["groups"]], self.expected_slugs)
+
+    def test_lists_groups_with_personal_access_token_and_records_last_used(self):
+        raw_token, token = PersonalAccessToken.issue("cgka", user=self.user)
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "goggles-groups/v1")
+        self.assertEqual([group["slug"] for group in payload["groups"]], self.expected_slugs)
+        token.refresh_from_db()
+        self.assertIsNotNone(token.last_used_at)
+
+    def test_personal_access_token_and_session_return_identical_bytes(self):
+        # The discovery payload is the same evidence however the reader
+        # authenticated, so the two paths must agree byte for byte.
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+
+        token_response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.client.login(username="reader", password="correct horse battery staple")
+        self.assertEqual(token_response.content, self.client.get(self.url).content)
+
+    def test_response_is_uncacheable_and_varies_on_both_credential_sources(self):
+        # A shared cache must not key the token-authenticated index — which carries
+        # no Cookie — under the anonymous key and replay it to the next caller.
+        raw_token, _token = PersonalAccessToken.issue("cgka", user=self.user)
+
+        response = self.client.get(self.url, HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        vary = {value.strip().lower() for value in response["Vary"].split(",")}
+        self.assertEqual(vary, {"cookie", "authorization"})
 
 
 class ProfileAccessTokenTests(TestCase):
