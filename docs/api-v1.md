@@ -7,17 +7,21 @@ JSONL evidence.
 
 ## Authentication
 
-All read APIs require a logged-in Goggles user. Upload APIs use reusable bearer
-tokens and are documented separately in the app workflow notes.
+Read APIs require a logged-in Goggles user, except the two endpoints named below.
+Upload APIs use reusable bearer tokens and are documented separately in the app
+workflow notes.
 
-The streaming group export additionally accepts a **personal access token** — a
-read-only bearer credential a user mints from their profile page (or an operator
-mints for a service account with `manage.py create_access_token "<name>" --user
-<username>`). Send it as `Authorization: Bearer gpat_…`. A personal access token
-authorizes only the streaming group export (below) — not uploads, and not the
-session-authenticated read APIs; it is revoked by the owner, by an admin, by expiry,
-or by deactivating the owning user. Upload tokens (`goggles_…`) and personal access
-tokens (`gpat_…`) are distinct credentials and never interchangeable.
+The group index and the streaming group export additionally accept a **personal
+access token** — a read-only bearer credential a user mints from their profile page
+(or an operator mints for a service account with `manage.py create_access_token
+"<name>" --user <username>`). Send it as `Authorization: Bearer gpat_…`. A personal
+access token authorizes exactly two endpoints — the group index
+`GET /api/v1/groups/` and the streaming export `GET /api/v1/groups/{slug}/export/`
+(both below) — so one token is enough for an agent to discover group slugs and then
+pull each group's complete aggregate. It authorizes nothing else: not uploads, and
+not the remaining session-authenticated read APIs. It is revoked by the owner, by an
+admin, by expiry, or by deactivating the owning user. Upload tokens (`goggles_…`) and
+personal access tokens (`gpat_…`) are distinct credentials and never interchangeable.
 
 The current internal deployment treats authenticated Goggles users as one shared
 internal tenant. Even so, endpoint implementations should route through
@@ -115,6 +119,15 @@ stricter access.
 Group responses include `schema_version`, group summary fields, tab counts, and
 classification metadata indicating whether full-data audit content may be
 present.
+
+The group index is the only one of these four that accepts a personal access token
+(`Authorization: Bearer gpat_…`); the other three require a logged-in session. It
+lists every group's `slug`, so an agent holding one token can discover slugs before
+calling the [streaming export](#group-export-streaming). It takes no query filters,
+is not paginated, and is not gated by `GOGGLES_EXPORTS_ENABLED`. An anonymous or
+invalid-token request returns `401` JSON rather than redirecting to the login page.
+Like the streaming export, it is `GET`-only: a `HEAD` request returns `405`, so probe
+it with `GET` rather than `curl -I`.
 
 ### Group Export (streaming)
 

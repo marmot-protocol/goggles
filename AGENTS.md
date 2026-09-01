@@ -38,15 +38,17 @@ Upload bearer tokens are long-lived, reusable credentials, not one-time codes:
 
 Personal access tokens (`PersonalAccessToken`, raw prefix `gpat_`) are the
 **read-only** counterpart to upload tokens. They authenticate reads — currently the
-streaming group export (`GET /api/v1/groups/<slug>/export/`) — never uploads. They
-are a distinct model and credential from `UploadToken`; the two are never
+group index (`GET /api/v1/groups/`) and the streaming group export
+(`GET /api/v1/groups/<slug>/export/`), and no other read endpoint — never uploads.
+They are a distinct model and credential from `UploadToken`; the two are never
 interchangeable.
 
 - A user mints and revokes their own from the profile page; the raw token is shown
   exactly once and only its hash is stored.
 - For a service account (e.g. the CGKA pipeline), mint one bound to a user with
   `manage.py create_access_token "name" --user <username>` (optionally
-  `--expires-in-days N`).
+  `--expires-in-days N`). One token covers both endpoints, so the pipeline
+  discovers group slugs from the index instead of hardcoding them.
 - A token is only as live as its owner: it stops authenticating when revoked
   (`is_active = False`), when `expires_at` passes, or when the owning user is
   deactivated.
