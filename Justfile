@@ -101,7 +101,7 @@ audit-dependencies:
     requirements_file="$(mktemp)"
     trap 'rm -f "$requirements_file"' EXIT
     uv export --locked --all-groups --format requirements-txt -o "$requirements_file"
-    uv run --with pip-audit==2.10.0 pip-audit \
+    uv run --with pip-audit==2.10.1 pip-audit \
       -r "$requirements_file" \
       --strict \
       --require-hashes \
