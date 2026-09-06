@@ -5,7 +5,7 @@ from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import connection
 from django.utils import timezone
 
-from forensics.models import AuditEvent, AuditFile, AuditGroup
+from forensics.models import AuditEvent, AuditFile, AuditGroup, UploadRejection
 from forensics.projections import rebuild_group_projections
 
 # PostgreSQL reclaims disk space from deleted raw_text/event rows only after a
@@ -23,8 +23,9 @@ DELETE_BATCH_SIZE = 200
 
 class Command(BaseCommand):
     help = (
-        "Delete audit evidence (uploaded files and their events) older than the "
-        "retention window, and rebuild projections for affected groups. "
+        "Delete audit evidence (uploaded files and their events) and recorded upload "
+        "rejections older than the retention window, and rebuild projections for "
+        "affected groups. "
         "Retention defaults to settings.GOGGLES_AUDIT_RETENTION_DAYS (14 days); "
         "override with --retention-days."
     )
@@ -55,7 +56,11 @@ class Command(BaseCommand):
             .filter(created_at__lt=cutoff)
             .values_list("id", flat=True)
         )
-        if not stale_file_ids:
+        # Rejection rows carry a source IP and user agent, so they age out on
+        # the same window as the evidence they failed to become.
+        stale_rejections = UploadRejection.objects.filter(created_at__lt=cutoff)
+        stale_rejection_count = stale_rejections.count()
+        if not stale_file_ids and not stale_rejection_count:
             self.stdout.write(
                 f"Retention window of {retention_days} day(s): nothing to prune. "
                 f"Cutoff was {cutoff:%Y-%m-%d %H:%M:%S}."
@@ -65,8 +70,8 @@ class Command(BaseCommand):
         stale_group_ids = touched_group_ids(stale_file_ids)
         self.stdout.write(
             f"Retention window of {retention_days} day(s): "
-            f"{len(stale_file_ids)} audit file(s) exceed it "
-            f"(cutoff {cutoff:%Y-%m-%d %H:%M:%S})."
+            f"{len(stale_file_ids)} audit file(s) and {stale_rejection_count} upload "
+            f"rejection(s) exceed it (cutoff {cutoff:%Y-%m-%d %H:%M:%S})."
         )
 
         if options["dry_run"]:
@@ -76,8 +81,10 @@ class Command(BaseCommand):
             )
             return
 
-        delete_files(stale_file_ids)
-        vacuum_audit_data()
+        stale_rejections.delete()
+        if stale_file_ids:
+            delete_files(stale_file_ids)
+            vacuum_audit_data()
         for group in AuditGroup.objects.filter(id__in=sorted(stale_group_ids)):
             # Rebuild each touched group from its surviving evidence so derived
             # projections stop referencing now-deleted events.
@@ -85,8 +92,8 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Pruned {len(stale_file_ids)} audit file(s); rebuilt projections "
-                f"for {len(stale_group_ids)} group(s)."
+                f"Pruned {len(stale_file_ids)} audit file(s) and {stale_rejection_count} "
+                f"upload rejection(s); rebuilt projections for {len(stale_group_ids)} group(s)."
             )
         )
 

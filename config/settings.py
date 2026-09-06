@@ -275,8 +275,26 @@ LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "group-list"
 LOGOUT_REDIRECT_URL = "login"
 
-GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
-GOGGLES_MAX_DUMP_RECORDS = int(os.environ.get("GOGGLES_MAX_DUMP_RECORDS", 50_000))
+# Upload ceiling. Marmot clients refuse to upload a segment larger than 64 MiB,
+# so the server accepts exactly that: anything lower leaves a band of files the
+# client will re-post forever and the server never sees. The edge proxy's body
+# limit must sit *above* this value (see deploy/Caddyfile.goggles.ipf.dev) so the
+# 413 is decided -- and recorded as an UploadRejection -- here, not at the edge.
+GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 64 * 1024 * 1024))
+# The record cap bounds per-line object expansion (every parsed line becomes an
+# AuditEvent instance in memory), which the byte ceiling alone does not: a body
+# of minimal 138-byte lines would expand to half a million objects. It is
+# derived from the byte ceiling rather than fixed, because a ceiling raised
+# without re-deriving it once made the cap the binding limit for legitimate
+# full-size logs (a 64 MiB body of ~600-byte field lines is ~112k records). At
+# 256 bytes/line -- below anything a real client writes, above the smallest
+# valid line -- the cap binds only on pathological tiny-line bodies and tracks
+# any operator override of GOGGLES_MAX_DUMP_BYTES. This is a sizing divisor,
+# not a validation floor: lowering it toward 138 raises the memory bound.
+RECORD_CAP_BYTES_PER_LINE = 256
+GOGGLES_MAX_DUMP_RECORDS = int(
+    os.environ.get("GOGGLES_MAX_DUMP_RECORDS", GOGGLES_MAX_DUMP_BYTES // RECORD_CAP_BYTES_PER_LINE)
+)
 GOGGLES_MAX_JSONL_LINE_BYTES = int(os.environ.get("GOGGLES_MAX_JSONL_LINE_BYTES", 2 * 1024 * 1024))
 GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
     os.environ.get("GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST", 50_000)

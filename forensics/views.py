@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 from datetime import datetime
 
 from django.conf import settings
@@ -11,6 +12,7 @@ from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
+from django.db import DatabaseError
 from django.db.models import Count, Max, Min, Prefetch, Q
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Length, Substr
@@ -20,6 +22,7 @@ from django.http import (
     HttpResponse,
     JsonResponse,
     StreamingHttpResponse,
+    UnreadablePostError,
 )
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
@@ -58,12 +61,19 @@ from .models import (
     PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
+    UploadRejection,
     UploadToken,
 )
+from .request_body import counted_body_bytes, declared_content_length
 from .streaming import ExportSection, stream_ndjson
 from .token_crypto import expiry_from_days
 
+logger = logging.getLogger(__name__)
+
 UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
+UPLOAD_LENGTH_REQUIRED_ERROR = "Content-Length header is required for audit log uploads"
+UPLOAD_INCOMPLETE_BODY_ERROR = "incomplete request body"
+UPLOAD_REJECTION_LIST_LIMIT = 50
 AUDIT_FILE_EVENT_PAGE_SIZE = 100
 RAW_TEXT_PREVIEW_CHARS = 32 * 1024
 GROUP_ENGINE_PREVIEW_LIMIT = 12
@@ -201,6 +211,14 @@ def upload_log_list(request: HttpRequest):
         valid=Count("id", filter=Q(validation_status=AuditFile.STATUS_VALID)),
         invalid=Count("id", filter=Q(validation_status=AuditFile.STATUS_INVALID)),
     )
+    # Attempts refused before ingestion never become an AuditFile; list them
+    # alongside so a device that keeps failing is visible from the same page.
+    stats["rejected"] = UploadRejection.objects.count()
+    rejections = (
+        UploadRejection.objects.select_related("upload_token")
+        .defer("user_agent")
+        .order_by("-created_at", "-id")[:UPLOAD_REJECTION_LIST_LIMIT]
+    )
     # The template only renders latest_upload.created_at, so restrict this row to
     # that column too — otherwise .first() loads the full row (incl. raw_text) for
     # one potentially near-limit upload. See #39.
@@ -212,6 +230,7 @@ def upload_log_list(request: HttpRequest):
             "audit_files": audit_files,
             "stats": stats,
             "latest_upload": latest_upload,
+            "rejections": rejections,
         },
     )
 
@@ -3127,18 +3146,10 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
             status=503,
         )
 
-    install_max_dump_size_upload_handler(request)
-
     try:
-        audit_bytes, source_name, content_type = audit_bytes_from_request(request)
-    except (RequestDataTooBig, TooManyFilesSent):
-        # RequestDataTooBig: a part (or the cumulative upload) exceeded the size
-        # cap. TooManyFilesSent: the request carried more parts than
-        # DATA_UPLOAD_MAX_NUMBER_FILES. Both are rejected with the same 413 so a
-        # multi-part memory-exhaustion attempt cannot bypass the ceiling.
-        return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
-    if len(audit_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
-        return JsonResponse({"error": UPLOAD_TOO_LARGE_ERROR}, status=413)
+        audit_bytes, source_name, content_type = verified_audit_bytes(request)
+    except UploadRefused as refusal:
+        return reject_upload(request, token, group_slug, refusal)
 
     fallback_slug, fallback_name = fallback_group_from_request(request, group_slug)
     source_metadata = source_metadata_from_request(request)
@@ -3298,8 +3309,103 @@ def api_group_export_stream(request: HttpRequest, slug: str):
     return response
 
 
+def is_multipart_request(request: HttpRequest) -> bool:
+    return (request.content_type or "").startswith("multipart/")
+
+
+class UploadRefused(Exception):
+    """An upload the API will not ingest, with what the response and record need."""
+
+    def __init__(
+        self,
+        reason: str,
+        status: int,
+        error: str,
+        *,
+        declared: int | None = None,
+        received: int | None = None,
+    ):
+        super().__init__(error)
+        self.reason = reason
+        self.status = status
+        self.error = error
+        self.declared = declared
+        self.received = received
+
+
+def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
+    """Read the upload body, refusing anything that cannot be trusted whole.
+
+    A transfer cut mid-body (app killed, mobile link dropped, socket write timed
+    out while the server was busy, proxy abort) reaches Django as a silently
+    *short* body: gunicorn's length reader returns what arrived before EOF and
+    ``request.body`` never compares it to ``Content-Length``. Left unchecked, the
+    prefix was ingested with its cut-off last line quarantined, and the client,
+    seeing the 400 as a failure, re-posted the whole file anyway. Raises
+    :class:`UploadRefused` instead of returning a body that is over the size
+    ceiling, shorter than declared, or of unknowable length.
+    """
+    declared = declared_content_length(request)
+    if declared is None:
+        raise UploadRefused(
+            UploadRejection.REASON_LENGTH_REQUIRED, 411, UPLOAD_LENGTH_REQUIRED_ERROR
+        )
+    too_large = UploadRefused(
+        UploadRejection.REASON_TOO_LARGE, 413, UPLOAD_TOO_LARGE_ERROR, declared=declared
+    )
+    if not is_multipart_request(request) and declared > settings.GOGGLES_MAX_DUMP_BYTES:
+        # Decide on the header alone so an oversized body is never read into
+        # memory. Multipart bodies are bounded while streaming by
+        # MaxDumpSizeUploadHandler instead (framing overhead makes the header
+        # an inexact proxy for the file size).
+        raise too_large
+
+    install_max_dump_size_upload_handler(request)
+    try:
+        audit_bytes, source_name, content_type = audit_bytes_from_request(request)
+    except TooManyFilesSent as exc:
+        # More parts than DATA_UPLOAD_MAX_NUMBER_FILES: same 413 as an oversized
+        # body so a multi-part memory-exhaustion attempt cannot bypass the ceiling.
+        raise UploadRefused(
+            UploadRejection.REASON_TOO_MANY_PARTS,
+            413,
+            UPLOAD_TOO_LARGE_ERROR,
+            declared=declared,
+            received=counted_body_bytes(request),
+        ) from exc
+    except RequestDataTooBig as exc:
+        # A part (or the cumulative upload) exceeded the size cap while streaming.
+        too_large.received = counted_body_bytes(request)
+        raise too_large from exc
+    except UnreadablePostError as exc:
+        # The socket failed mid-read (a reset rather than a clean close). The
+        # received count is unknown, not zero: gunicorn buffers its 1 KiB reads
+        # and hands them over only once complete, so a reset discards whatever
+        # had arrived before the counter ever saw it.
+        raise UploadRefused(
+            UploadRejection.REASON_INCOMPLETE_BODY,
+            400,
+            UPLOAD_INCOMPLETE_BODY_ERROR,
+            declared=declared,
+        ) from exc
+    if len(audit_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
+        too_large.received = len(audit_bytes)
+        raise too_large
+
+    received = received_body_bytes(request, audit_bytes)
+    if received is not None and received < declared:
+        raise UploadRefused(
+            UploadRejection.REASON_INCOMPLETE_BODY,
+            400,
+            f"{UPLOAD_INCOMPLETE_BODY_ERROR}: received {received} of {declared} bytes",
+            declared=declared,
+            received=received,
+        )
+    return audit_bytes, source_name, content_type
+
+
 def install_max_dump_size_upload_handler(request: HttpRequest) -> None:
-    if (request.content_type or "").startswith("multipart/"):
+    if is_multipart_request(request):
         request.upload_handlers.insert(0, MaxDumpSizeUploadHandler(request))
 
 
@@ -3311,6 +3417,12 @@ def audit_bytes_from_request(request: HttpRequest) -> tuple[bytes, str, str]:
             or next(iter(request.FILES.values()))
         )
         return read_upload_bytes(upload), upload.name, getattr(upload, "content_type", "")
+    if is_multipart_request(request):
+        # The parser consumed the multipart body and found no file part (an
+        # empty form, or a transfer cut before the part completed). request.body
+        # is unavailable after that read and would raise; there is nothing to
+        # ingest either way.
+        return b"", "", ""
     if request.body:
         return request.body, "", request.content_type or ""
     return b"", "", ""
@@ -3329,6 +3441,91 @@ def read_upload_bytes(upload) -> bytes:
     if len(data) > max_dump_bytes:
         raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
     return data
+
+
+def received_body_bytes(request: HttpRequest, audit_bytes: bytes) -> int | None:
+    """How many body bytes actually arrived, or ``None`` if that cannot be known.
+
+    Prefers the WSGI-level counter installed by ``config.wsgi`` (the only way to
+    measure a multipart body). Without it a raw body is measured directly; a
+    multipart body cannot be, so the completeness check is skipped for it.
+    """
+    counted = counted_body_bytes(request)
+    if counted is not None:
+        return counted
+    if is_multipart_request(request):
+        return None
+    return len(audit_bytes)
+
+
+def reject_upload(
+    request: HttpRequest,
+    token: UploadToken,
+    group_slug: str | None,
+    refusal: UploadRefused,
+) -> JsonResponse:
+    """Record a refused upload and build its response.
+
+    The log line carries the reason and byte counts; never the token, body, user
+    agent, or IP.
+    """
+    record_upload_rejection(request, token, group_slug, refusal)
+    logger.warning(
+        "audit log upload rejected: %s (HTTP %s): declared=%s received=%s",
+        refusal.reason,
+        refusal.status,
+        refusal.declared,
+        refusal.received,
+    )
+    return JsonResponse(
+        {
+            "error": refusal.error,
+            "reason": refusal.reason,
+            "declared_bytes": refusal.declared,
+            "received_bytes": refusal.received,
+        },
+        status=refusal.status,
+    )
+
+
+def record_upload_rejection(
+    request: HttpRequest,
+    token: UploadToken,
+    group_slug: str | None,
+    refusal: UploadRefused,
+) -> None:
+    """Persist the refusal for operators; best effort.
+
+    Reads only headers and the URL -- never ``request.POST``/``request.body`` --
+    because several refusals exist precisely so the body is *not* read. The row
+    is a side effect of a response already decided, so a database failure here
+    is logged rather than allowed to turn a deliberate 400/413 into a 500.
+    """
+    try:
+        UploadRejection.objects.create(
+            upload_token=token,
+            reason=refusal.reason,
+            status_code=refusal.status,
+            declared_content_length=refusal.declared,
+            received_bytes=refusal.received,
+            content_type=(request.content_type or "")[:120],
+            group_slug=rejected_upload_group_slug(request, group_slug),
+            source_device_label=request.headers.get("X-Goggles-Device-Label", "")[:255],
+            source_platform=request.headers.get("X-Goggles-Platform", "")[:120],
+            source_app_version=request.headers.get("X-Goggles-App-Version", "")[:120],
+            source_ip=client_ip(request),
+            user_agent=request.headers.get("User-Agent", "")[:5000],
+        )
+    except DatabaseError:
+        logger.exception("could not record upload rejection")
+
+
+def rejected_upload_group_slug(request: HttpRequest, group_slug: str | None) -> str:
+    """The fallback group a rejected attempt targeted, from URL/query/header only."""
+    candidate = group_slug or request.GET.get("group") or request.headers.get("X-Goggles-Group")
+    if not candidate:
+        return ""
+    return slugify(candidate)[:160] or "incoming"
 
 
 def source_metadata_from_request(request: HttpRequest) -> dict[str, str]:
