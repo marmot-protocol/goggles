@@ -474,7 +474,32 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
                 errors=errors,
             )
         )
+    annotate_incomplete_final_record(raw_text, parsed_lines)
     return parsed_lines
+
+
+INCOMPLETE_FINAL_RECORD_PREFIX = "incomplete final record (upload does not end with a newline)"
+
+
+def annotate_incomplete_final_record(raw_text: str, parsed_lines: list[ParsedLine]) -> None:
+    """Flag a last line that is unparseable JSON *and* lacks its terminating newline.
+
+    Clients write one ``\n``-terminated record per line, so a body whose final
+    bytes are a JSON fragment with no newline was almost certainly read while
+    that record was still being written -- the client sized ``Content-Length``
+    from a file that was mid-append. That is a different failure from a body cut
+    in transit (which the upload view now refuses outright by comparing bytes
+    received to ``Content-Length``); annotating it here keeps the two
+    distinguishable in the stored ``validation_error`` and in group exports.
+    A trailing-newline-free *valid* record is legal JSONL and is left alone.
+    """
+    if not parsed_lines or raw_text.endswith("\n"):
+        return
+    last = parsed_lines[-1]
+    if last.data is not None or not last.errors:
+        return
+    if last.errors[0].startswith("invalid JSON"):
+        last.errors[0] = f"{INCOMPLETE_FINAL_RECORD_PREFIX}: {last.errors[0]}"
 
 
 def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:

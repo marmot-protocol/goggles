@@ -19,6 +19,7 @@ from .models import (
     PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
+    UploadRejection,
     UploadToken,
 )
 
@@ -150,6 +151,38 @@ class AuditFileAdmin(admin.ModelAdmin):
         url = reverse("admin:forensics_auditevent_changelist")
         query = urlencode({"audit_file__id__exact": obj.pk})
         return format_html('<a href="{}?{}">View events</a>', url, query)
+
+
+@admin.register(UploadRejection)
+class UploadRejectionAdmin(admin.ModelAdmin):
+    """Read-only trace of authenticated upload attempts refused before ingestion.
+
+    Rows are written only by the upload API; the admin is for finding a device
+    that keeps failing (filter by reason, then read declared vs received bytes).
+    """
+
+    list_display = (
+        "created_at",
+        "reason",
+        "status_code",
+        "declared_content_length",
+        "received_bytes",
+        "source_platform",
+        "source_app_version",
+        "source_device_label",
+        "upload_token",
+    )
+    list_filter = ("reason", "status_code", "source_platform")
+    date_hierarchy = "created_at"
+    ordering = ("-created_at", "-id")
+    readonly_fields = tuple(field.name for field in UploadRejection._meta.fields)
+    show_full_result_count = False
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(AuditEvent)
