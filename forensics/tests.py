@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import io
 import json
 import os
 from datetime import timedelta
@@ -22,6 +23,7 @@ from django.test import (
     TransactionTestCase,
     override_settings,
 )
+from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -62,8 +64,10 @@ from .models import (
     PersonalAccessToken,
     RecipientExpectation,
     StateDelta,
+    UploadRejection,
     UploadToken,
 )
+from .request_body import REQUEST_BODY_COUNTER_KEY, CountingInput
 from .seed_data import SCENARIO_GROUPS, build_dev_scenario, group_ref_for
 from .streaming import ExportSection, stream_ndjson
 from .token_crypto import MAX_TOKEN_EXPIRY_DAYS, expiry_from_days
@@ -1113,8 +1117,13 @@ class AuditLogIngestionTests(TestCase):
 
         self.assertEqual(response.status_code, 413)
         self.assertEqual(response.json()["error"], "audit log exceeds maximum upload size")
+        self.assertEqual(response.json()["reason"], "too_large")
         self.assertEqual(AuditFile.objects.count(), 0)
         self.assertEqual(AuditEvent.objects.count(), 0)
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_TOO_LARGE)
+        self.assertEqual(rejection.status_code, 413)
+        self.assertEqual(rejection.declared_content_length, 11)
 
     @override_settings(GOGGLES_MAX_DUMP_BYTES=10)
     def test_multipart_upload_size_limit_rejects_before_reading_file(self):
@@ -6523,6 +6532,42 @@ class PruneAuditDataCommandTests(TransactionTestCase):
 
         self.assertEqual(AuditFile.objects.count(), 1)
 
+    def test_prunes_stale_upload_rejections_even_without_stale_files(self):
+        _raw_token, token = UploadToken.issue("ios qa")
+        old = UploadRejection.objects.create(
+            upload_token=token,
+            reason=UploadRejection.REASON_INCOMPLETE_BODY,
+            status_code=400,
+            declared_content_length=100,
+            received_bytes=60,
+        )
+        UploadRejection.objects.filter(pk=old.pk).update(
+            created_at=timezone.now() - timedelta(days=20)
+        )
+        recent = UploadRejection.objects.create(
+            upload_token=token, reason=UploadRejection.REASON_TOO_LARGE, status_code=413
+        )
+        out = StringIO()
+
+        call_command("prune_audit_data", stdout=out)
+
+        self.assertIn("1 upload rejection(s)", out.getvalue())
+        self.assertFalse(UploadRejection.objects.filter(pk=old.pk).exists())
+        self.assertTrue(UploadRejection.objects.filter(pk=recent.pk).exists())
+
+    def test_dry_run_keeps_stale_upload_rejections(self):
+        _raw_token, token = UploadToken.issue("ios qa")
+        old = UploadRejection.objects.create(
+            upload_token=token, reason=UploadRejection.REASON_TOO_LARGE, status_code=413
+        )
+        UploadRejection.objects.filter(pk=old.pk).update(
+            created_at=timezone.now() - timedelta(days=20)
+        )
+
+        call_command("prune_audit_data", "--dry-run", stdout=StringIO())
+
+        self.assertTrue(UploadRejection.objects.filter(pk=old.pk).exists())
+
     def test_vacuum_runs_only_on_postgres(self):
         stale_connection = mock.MagicMock()
         stale_connection.vendor = "postgresql"
@@ -9615,3 +9660,389 @@ class ClientIpTests(SimpleTestCase):
         request = self.factory.post("/", REMOTE_ADDR="garbage")
 
         self.assertIsNone(client_ip(request))
+
+
+class UploadRejectionTests(TestCase):
+    """The upload API refuses bodies it cannot trust -- shorter than their
+    Content-Length, missing a Content-Length, or over the size ceiling -- without
+    ingesting anything, and records each refusal so operators can see it. A body
+    cut mid-transfer used to be parsed as-is: the prefix was ingested, the cut
+    line quarantined, the client saw a 400 and re-posted the whole file anyway."""
+
+    def setUp(self):
+        self.raw_token, self.token = UploadToken.issue("android qa")
+        self.headers = {
+            "HTTP_AUTHORIZATION": f"Bearer {self.raw_token}",
+            "HTTP_X_GOGGLES_DEVICE_LABEL": "Pixel 8",
+            "HTTP_X_GOGGLES_PLATFORM": "android",
+            "HTTP_X_GOGGLES_APP_VERSION": "0.9.18",
+            "HTTP_USER_AGENT": "Marmot-Android/0.9.18",
+            "REMOTE_ADDR": "203.0.113.10",
+        }
+
+    def post_raw(self, sent: bytes, declared: int, url=None, **extra):
+        # The test client sizes CONTENT_LENGTH from ``data``; override both the
+        # header and the input stream so the body arrives short, the way gunicorn
+        # delivers a transfer that was cut before Content-Length bytes arrived.
+        return self.client.post(
+            url or reverse("api-audit-log-upload"),
+            data=sent,
+            content_type="application/x-ndjson",
+            **{
+                **self.headers,
+                "wsgi.input": io.BytesIO(sent),
+                "CONTENT_LENGTH": str(declared),
+                **extra,
+            },
+        )
+
+    def test_body_shorter_than_content_length_is_refused_without_ingesting(self):
+        full = representative_audit_log().encode("utf-8")
+        cut = full[: len(full) - 40]  # ends mid-record
+
+        response = self.post_raw(cut, declared=len(full))
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["reason"], "incomplete_body")
+        self.assertEqual(payload["declared_bytes"], len(full))
+        self.assertEqual(payload["received_bytes"], len(cut))
+        self.assertIn("incomplete request body", payload["error"])
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        self.assertEqual(AuditGroup.objects.count(), 0)
+        self.token.refresh_from_db()
+        self.assertIsNone(self.token.last_used_at)
+
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_INCOMPLETE_BODY)
+        self.assertEqual(rejection.status_code, 400)
+        self.assertEqual(rejection.declared_content_length, len(full))
+        self.assertEqual(rejection.received_bytes, len(cut))
+        self.assertEqual(rejection.upload_token, self.token)
+        self.assertEqual(rejection.content_type, "application/x-ndjson")
+        self.assertEqual(rejection.source_device_label, "Pixel 8")
+        self.assertEqual(rejection.source_platform, "android")
+        self.assertEqual(rejection.source_app_version, "0.9.18")
+        self.assertEqual(rejection.source_ip, "203.0.113.10")
+        self.assertEqual(rejection.user_agent, "Marmot-Android/0.9.18")
+        self.assertEqual(rejection.group_slug, "")
+
+    def test_refusal_is_logged_with_reason_and_byte_counts_but_no_secrets(self):
+        full = representative_audit_log().encode("utf-8")
+        cut = full[:-40]
+
+        with self.assertLogs("forensics.views", level="WARNING") as logs:
+            self.post_raw(cut, declared=len(full))
+
+        (line,) = logs.output
+        self.assertIn(f"incomplete_body (HTTP 400): declared={len(full)} received={len(cut)}", line)
+        self.assertNotIn(self.raw_token, line)
+        self.assertNotIn("Marmot-Android", line)
+        self.assertNotIn("203.0.113.10", line)
+
+    def test_refusal_records_the_group_the_attempt_targeted(self):
+        full = representative_audit_log().encode("utf-8")
+
+        response = self.post_raw(
+            full[:-40],
+            declared=len(full),
+            url=reverse("api-group-audit-log-upload", kwargs={"group_slug": "field-test"}),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(UploadRejection.objects.get().group_slug, "field-test")
+        # Refusing must not create the fallback group either.
+        self.assertFalse(AuditGroup.objects.filter(slug="field-test").exists())
+
+    def test_body_matching_content_length_is_ingested_normally(self):
+        full = representative_audit_log().encode("utf-8")
+
+        response = self.post_raw(full, declared=len(full))
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(AuditFile.objects.count(), 1)
+        self.assertEqual(UploadRejection.objects.count(), 0)
+
+    def test_missing_content_length_is_refused_with_411(self):
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log(),
+            content_type="application/x-ndjson",
+            **{**self.headers, "CONTENT_LENGTH": ""},
+        )
+
+        self.assertEqual(response.status_code, 411)
+        self.assertEqual(response.json()["reason"], "length_required")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_LENGTH_REQUIRED)
+        self.assertEqual(rejection.status_code, 411)
+        self.assertIsNone(rejection.declared_content_length)
+        self.assertIsNone(rejection.received_bytes)
+
+    @override_settings(GOGGLES_MAX_DUMP_BYTES=10, DATA_UPLOAD_MAX_MEMORY_SIZE=1024)
+    def test_oversized_declared_body_is_refused_before_any_byte_is_read(self):
+        class UnreadInput:
+            def read(self, *args, **kwargs):
+                raise AssertionError("an oversized body must be rejected on its header")
+
+            readline = read
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=b"x" * 11,
+            content_type="application/x-ndjson",
+            **{**self.headers, "wsgi.input": UnreadInput()},
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["reason"], "too_large")
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_TOO_LARGE)
+        self.assertEqual(rejection.declared_content_length, 11)
+        self.assertIsNone(rejection.received_bytes)
+
+    @override_settings(
+        GOGGLES_MAX_DUMP_BYTES=10,
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+        FILE_UPLOAD_MAX_MEMORY_SIZE=1024,
+    )
+    def test_oversized_multipart_upload_is_recorded_as_rejection(self):
+        upload_file = SimpleUploadedFile(
+            "audit-too-large.jsonl", b"x" * 11, content_type="application/x-ndjson"
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data={"audit_log": upload_file},
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["reason"], "too_large")
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_TOO_LARGE)
+        self.assertTrue(rejection.content_type.startswith("multipart/form-data"))
+        self.assertIsNotNone(rejection.declared_content_length)
+
+    def test_socket_error_while_reading_is_refused_as_incomplete(self):
+        class ResetInput:
+            def read(self, *args, **kwargs):
+                raise OSError("connection reset by peer")
+
+            readline = read
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log(),
+            content_type="application/x-ndjson",
+            **{**self.headers, "wsgi.input": ResetInput()},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["reason"], "incomplete_body")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_INCOMPLETE_BODY)
+        self.assertIsNone(rejection.received_bytes)
+
+    def multipart_payload(self, body: bytes) -> bytes:
+        return encode_multipart(
+            BOUNDARY,
+            {
+                "audit_log": SimpleUploadedFile(
+                    "audit.jsonl", body, content_type="application/x-ndjson"
+                ),
+                "platform": "ios",
+            },
+        )
+
+    def post_counted_multipart(self, sent: bytes, declared: int):
+        counter = CountingInput(io.BytesIO(sent))
+        # ``post()`` would re-encode bytes as a multipart form; ``generic`` passes
+        # the pre-built body through untouched.
+        return self.client.generic(
+            "POST",
+            reverse("api-audit-log-upload"),
+            data=sent,
+            content_type=MULTIPART_CONTENT,
+            **{
+                **self.headers,
+                "wsgi.input": counter,
+                REQUEST_BODY_COUNTER_KEY: counter,
+                "CONTENT_LENGTH": str(declared),
+            },
+        )
+
+    def test_truncated_multipart_body_is_refused_when_bytes_are_counted(self):
+        payload = self.multipart_payload(representative_audit_log().encode("utf-8"))
+        cut = payload[: len(payload) - 120]  # inside the file part
+
+        response = self.post_counted_multipart(cut, declared=len(payload))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["reason"], "incomplete_body")
+        self.assertEqual(response.json()["received_bytes"], len(cut))
+        self.assertEqual(AuditFile.objects.count(), 0)
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.declared_content_length, len(payload))
+        self.assertEqual(rejection.received_bytes, len(cut))
+
+    def test_complete_multipart_body_is_accepted_when_bytes_are_counted(self):
+        payload = self.multipart_payload(representative_audit_log().encode("utf-8"))
+
+        response = self.post_counted_multipart(payload, declared=len(payload))
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["source"]["platform"], "ios")
+        self.assertEqual(UploadRejection.objects.count(), 0)
+
+    def test_unauthenticated_attempts_are_not_recorded(self):
+        full = representative_audit_log().encode("utf-8")
+
+        response = self.post_raw(
+            full[:-40], declared=len(full), HTTP_AUTHORIZATION="Bearer goggles_nope"
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(UploadRejection.objects.count(), 0)
+
+    def test_truncated_final_record_without_newline_is_annotated_but_kept(self):
+        # Content-Length matches the body: the client sized it from a file that
+        # was still being appended, so the last record is a JSON fragment with no
+        # newline. That is evidence of a client-side race, not a cut transfer;
+        # keep the quarantine behavior but make the two cases distinguishable.
+        body = representative_audit_log() + '{"schema_version": "marmot-forensics-audit/v3", "se'
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.json()["error"]
+        self.assertIn("line 3: incomplete final record (upload does not end with a newline)", error)
+        self.assertIn("invalid JSON", error)
+        audit_file = AuditFile.objects.get()
+        self.assertEqual(audit_file.valid_event_count, 2)
+        self.assertEqual(audit_file.invalid_event_count, 1)
+        self.assertEqual(UploadRejection.objects.count(), 0)
+
+    def test_valid_final_record_without_newline_is_not_annotated(self):
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log().rstrip("\n"),
+            content_type="application/x-ndjson",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_invalid_final_record_with_newline_is_not_annotated(self):
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=representative_audit_log() + "{not-json}\n",
+            content_type="application/x-ndjson",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("incomplete final record", response.json()["error"])
+
+    def test_upload_log_list_shows_rejected_attempts(self):
+        full = representative_audit_log().encode("utf-8")
+        self.post_raw(full[:-40], declared=len(full))
+        User.objects.create_user(username="analyst", password="correct horse battery staple")
+        self.client.login(username="analyst", password="correct horse battery staple")
+
+        response = self.client.get(reverse("upload-log-list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Rejected attempts")
+        self.assertContains(response, "incomplete_body")
+        self.assertContains(response, "Pixel 8")
+        self.assertContains(response, f"{len(full)} declared")
+
+    def test_admin_changelist_renders_rejections(self):
+        full = representative_audit_log().encode("utf-8")
+        self.post_raw(full[:-40], declared=len(full))
+        User.objects.create_superuser("root", "root@example.com", "correct horse battery staple")
+        self.client.login(username="root", password="correct horse battery staple")
+
+        response = self.client.get(reverse("admin:forensics_uploadrejection_changelist"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "incomplete_body")
+
+
+class RequestBodyCounterWsgiTests(TransactionTestCase):
+    """The production entrypoint (config.wsgi) must install the byte counter;
+    without it a short raw body is still caught, but a short multipart body is
+    not. Runs the real WSGI callable, so no wrapping test transaction."""
+
+    def call_wsgi(self, sent: bytes, declared: int, raw_token: str, content_type: str):
+        from config.wsgi import application
+
+        environ = {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/api/v1/audit-logs/",
+            "SCRIPT_NAME": "",
+            "QUERY_STRING": "",
+            "SERVER_NAME": "testserver",
+            "SERVER_PORT": "80",
+            "SERVER_PROTOCOL": "HTTP/1.1",
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_HOST": "testserver",
+            "HTTP_AUTHORIZATION": f"Bearer {raw_token}",
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": str(declared),
+            "wsgi.input": io.BytesIO(sent),
+            "wsgi.errors": io.StringIO(),
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": "http",
+            "wsgi.multithread": False,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+        }
+        captured = {}
+
+        def start_response(status, headers, exc_info=None):
+            captured["status"] = int(status[:3])
+
+        body = b"".join(application(environ, start_response))
+        return captured["status"], json.loads(body)
+
+    def test_wsgi_entrypoint_refuses_short_multipart_body(self):
+        raw_token, _token = UploadToken.issue("cli")
+        payload = encode_multipart(
+            BOUNDARY,
+            {
+                "audit_log": SimpleUploadedFile(
+                    "audit.jsonl",
+                    representative_audit_log().encode("utf-8"),
+                    content_type="application/x-ndjson",
+                )
+            },
+        )
+        cut = payload[: len(payload) - 120]
+
+        status, body = self.call_wsgi(cut, len(payload), raw_token, MULTIPART_CONTENT)
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["reason"], "incomplete_body")
+        self.assertEqual(body["received_bytes"], len(cut))
+        self.assertEqual(AuditFile.objects.count(), 0)
+        self.assertEqual(UploadRejection.objects.count(), 1)
+
+    def test_wsgi_entrypoint_accepts_complete_raw_body(self):
+        raw_token, _token = UploadToken.issue("cli")
+        full = representative_audit_log().encode("utf-8")
+
+        status, body = self.call_wsgi(full, len(full), raw_token, "application/x-ndjson")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(body["validation_status"], "valid")
+        self.assertEqual(UploadRejection.objects.count(), 0)
