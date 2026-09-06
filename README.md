@@ -229,45 +229,23 @@ The web container runs `collectstatic` into the Docker-managed `static-assets` v
 
 ### Caddy
 
-Use `deploy/Caddyfile.goggles.ipf.dev` as the Caddy site snippet:
+The Caddy site definition lives in `deploy/Caddyfile.goggles.ipf.dev`; that file
+is the single source and is not repeated here. It proxies the app to `127.0.0.1:8000`
+and `/static/*` to the static sidecar on `127.0.0.1:8001`, and it encodes two rules:
 
-```caddyfile
-goggles.ipf.dev {
-    request_body {
-        max_size 68MiB
-    }
-
-    log {
-        output file /var/log/caddy/goggles-access.log
-        format filter {
-            wrap json
-            fields {
-                request>headers>Authorization delete
-                request>headers>Cookie delete
-            }
-        }
-    }
-
-    encode zstd gzip
-
-    handle_path /static/* {
-        reverse_proxy 127.0.0.1:8001
-    }
-
-    handle {
-        reverse_proxy 127.0.0.1:8000
-    }
-}
-```
+- The `request_body` limit must sit **above** `GOGGLES_MAX_DUMP_BYTES` (64 MiB by
+  default), not equal to it: a body Caddy refuses never reaches Django, so the 413
+  leaves no `UploadRejection` row and the device that keeps failing is invisible.
+  Mind the units — Caddy's `50MB` meant 50,000,000 bytes, *below* the app's old
+  50 MiB ceiling; the file uses `MiB`.
+- The `log` block is the only record of requests Caddy itself refuses. It strips
+  bearer tokens, cookies, the group ref, and the device label; the client IP and
+  user agent remain, so the file is age-bounded to the audit retention window
+  (14 days) rather than kept until it rolls by size.
 
 The static sidecar avoids requiring the Caddy system user to read inside the app checkout. It serves generated CSS, JavaScript, and admin assets only.
 
-The `request_body` limit must sit **above** `GOGGLES_MAX_DUMP_BYTES` (64 MiB by
-default), not equal to it: a body Caddy refuses never reaches Django, so the 413
-leaves no `UploadRejection` row and the device that keeps failing is invisible.
-Mind the units — Caddy's `50MB` meant 50,000,000 bytes, *below* the app's old
-50 MiB ceiling. The `log` block is the only record of requests Caddy itself
-refuses; it strips bearer tokens and cookies. Stock Caddy does not include rate limiting. If the deployed Caddy build includes a rate-limit module, put it in front of the upload paths. If not, rely on private network controls, Caddy body limits, Django bearer tokens, token rotation, and host-level protections such as firewall rules or fail2ban.
+Stock Caddy does not include rate limiting. If the deployed Caddy build includes a rate-limit module, put it in front of the upload paths. If not, rely on private network controls, Caddy body limits, Django bearer tokens, token rotation, and host-level protections such as firewall rules or fail2ban.
 
 Health check:
 
