@@ -15,7 +15,7 @@ from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.test import (
     RequestFactory,
     SimpleTestCase,
@@ -9501,6 +9501,30 @@ class DebugFailClosedSettingsTests(SimpleTestCase):
             with self.assertRaises(ImproperlyConfigured):
                 self._load_settings()
 
+    def test_record_cap_is_derived_from_the_byte_ceiling(self):
+        # A byte ceiling raised without re-deriving the record cap made the cap
+        # the binding limit at the top of the accepted range (a 64 MiB body of
+        # ~600-byte field lines is ~112k records, over a fixed 100k). Tie the
+        # two so an operator override of one cannot strand the other.
+        with self._clean_env(DJANGO_DEBUG="1", GOGGLES_MAX_DUMP_BYTES=str(8 * 1024 * 1024)):
+            ns = self._load_settings()
+        self.assertEqual(ns["GOGGLES_MAX_DUMP_RECORDS"], 8 * 1024 * 1024 // 256)
+
+    def test_record_cap_default_cannot_bind_before_the_byte_ceiling(self):
+        # The smallest line that passes validation is 138 bytes and real audit
+        # lines run 600-1000; at 256 bytes/line the cap only binds on a
+        # pathological tiny-line body, never on a legitimate full-size log.
+        with self._clean_env(DJANGO_DEBUG="1"):
+            ns = self._load_settings()
+        self.assertEqual(ns["GOGGLES_MAX_DUMP_RECORDS"], ns["GOGGLES_MAX_DUMP_BYTES"] // 256)
+        # Field-average lines are ~600 bytes; a full-size body of them must fit.
+        self.assertGreater(ns["GOGGLES_MAX_DUMP_RECORDS"], ns["GOGGLES_MAX_DUMP_BYTES"] // 600)
+
+    def test_record_cap_env_override_still_wins(self):
+        with self._clean_env(DJANGO_DEBUG="1", GOGGLES_MAX_DUMP_RECORDS="123"):
+            ns = self._load_settings()
+        self.assertEqual(ns["GOGGLES_MAX_DUMP_RECORDS"], 123)
+
     def test_explicit_opt_in_enables_debug(self):
         # Local development / CI opt in with DJANGO_DEBUG=1; that must still work
         # and must not trip the production guards.
@@ -9846,6 +9870,54 @@ class UploadRejectionTests(TestCase):
         rejection = UploadRejection.objects.get()
         self.assertEqual(rejection.reason, UploadRejection.REASON_INCOMPLETE_BODY)
         self.assertIsNone(rejection.received_bytes)
+
+    def test_reset_socket_reports_unknown_received_bytes_even_when_counted(self):
+        # gunicorn's Body.read buffers 1 KiB reads and hands them over only when
+        # complete, so a reset mid-read leaves the counter at 0. Zero is not what
+        # arrived; report the count as unknown.
+        class ResetInput:
+            def read(self, size=-1):
+                raise OSError("connection reset by peer")
+
+            readline = read
+
+        full = representative_audit_log().encode("utf-8")
+        counter = CountingInput(ResetInput())
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=full,
+            content_type="application/x-ndjson",
+            **{**self.headers, "wsgi.input": counter, REQUEST_BODY_COUNTER_KEY: counter},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["reason"], "incomplete_body")
+        self.assertIsNone(response.json()["received_bytes"])
+        self.assertIsNone(UploadRejection.objects.get().received_bytes)
+
+    def test_refusal_response_survives_a_failure_to_record_it(self):
+        # Recording is a side effect; a database error there must not turn a
+        # deliberate 400/413 into a 500.
+        full = representative_audit_log().encode("utf-8")
+        cut = full[:-40]
+
+        with (
+            mock.patch(
+                "forensics.views.UploadRejection.objects.create",
+                side_effect=DatabaseError("connection lost"),
+            ),
+            self.assertLogs("forensics.views", level="WARNING") as logs,
+        ):
+            response = self.post_raw(cut, declared=len(full))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["reason"], "incomplete_body")
+        self.assertEqual(response.json()["received_bytes"], len(cut))
+        self.assertTrue(
+            any("audit log upload rejected: incomplete_body" in line for line in logs.output)
+        )
+        self.assertTrue(any("could not record upload rejection" in line for line in logs.output))
 
     def multipart_payload(self, body: bytes) -> bytes:
         return encode_multipart(

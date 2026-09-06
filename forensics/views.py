@@ -12,6 +12,7 @@ from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
+from django.db import DatabaseError
 from django.db.models import Count, Max, Min, Prefetch, Q
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Length, Substr
@@ -3377,13 +3378,15 @@ def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
         too_large.received = counted_body_bytes(request)
         raise too_large from exc
     except UnreadablePostError as exc:
-        # The socket failed mid-read (a reset rather than a clean close).
+        # The socket failed mid-read (a reset rather than a clean close). The
+        # received count is unknown, not zero: gunicorn buffers its 1 KiB reads
+        # and hands them over only once complete, so a reset discards whatever
+        # had arrived before the counter ever saw it.
         raise UploadRefused(
             UploadRejection.REASON_INCOMPLETE_BODY,
             400,
             UPLOAD_INCOMPLETE_BODY_ERROR,
             declared=declared,
-            received=counted_body_bytes(request),
         ) from exc
     if len(audit_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
         too_large.received = len(audit_bytes)
@@ -3463,25 +3466,10 @@ def reject_upload(
 ) -> JsonResponse:
     """Record a refused upload and build its response.
 
-    Reads only headers and the URL -- never ``request.POST``/``request.body`` --
-    because several refusals exist precisely so the body is *not* read. The log
-    line carries the reason and byte counts; never the token, body, user agent,
-    or IP.
+    The log line carries the reason and byte counts; never the token, body, user
+    agent, or IP.
     """
-    UploadRejection.objects.create(
-        upload_token=token,
-        reason=refusal.reason,
-        status_code=refusal.status,
-        declared_content_length=refusal.declared,
-        received_bytes=refusal.received,
-        content_type=(request.content_type or "")[:120],
-        group_slug=rejected_upload_group_slug(request, group_slug),
-        source_device_label=request.headers.get("X-Goggles-Device-Label", "")[:255],
-        source_platform=request.headers.get("X-Goggles-Platform", "")[:120],
-        source_app_version=request.headers.get("X-Goggles-App-Version", "")[:120],
-        source_ip=client_ip(request),
-        user_agent=request.headers.get("User-Agent", "")[:5000],
-    )
+    record_upload_rejection(request, token, group_slug, refusal)
     logger.warning(
         "audit log upload rejected: %s (HTTP %s): declared=%s received=%s",
         refusal.reason,
@@ -3498,6 +3486,38 @@ def reject_upload(
         },
         status=refusal.status,
     )
+
+
+def record_upload_rejection(
+    request: HttpRequest,
+    token: UploadToken,
+    group_slug: str | None,
+    refusal: UploadRefused,
+) -> None:
+    """Persist the refusal for operators; best effort.
+
+    Reads only headers and the URL -- never ``request.POST``/``request.body`` --
+    because several refusals exist precisely so the body is *not* read. The row
+    is a side effect of a response already decided, so a database failure here
+    is logged rather than allowed to turn a deliberate 400/413 into a 500.
+    """
+    try:
+        UploadRejection.objects.create(
+            upload_token=token,
+            reason=refusal.reason,
+            status_code=refusal.status,
+            declared_content_length=refusal.declared,
+            received_bytes=refusal.received,
+            content_type=(request.content_type or "")[:120],
+            group_slug=rejected_upload_group_slug(request, group_slug),
+            source_device_label=request.headers.get("X-Goggles-Device-Label", "")[:255],
+            source_platform=request.headers.get("X-Goggles-Platform", "")[:120],
+            source_app_version=request.headers.get("X-Goggles-App-Version", "")[:120],
+            source_ip=client_ip(request),
+            user_agent=request.headers.get("User-Agent", "")[:5000],
+        )
+    except DatabaseError:
+        logger.exception("could not record upload rejection")
 
 
 def rejected_upload_group_slug(request: HttpRequest, group_slug: str | None) -> str:

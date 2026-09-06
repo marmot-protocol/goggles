@@ -16,14 +16,18 @@ a one-off run with `uv run python manage.py prune_audit_data --retention-days N`
 ## Upload Limits and Rejected Uploads
 
 Marmot clients refuse to upload a segment larger than 64 MiB, so the server accepts
-exactly that (`GOGGLES_MAX_DUMP_BYTES`, default 64 MiB; `GOGGLES_MAX_DUMP_RECORDS`,
-default 100,000 lines). The limits are layered and must stay in this order:
+exactly that (`GOGGLES_MAX_DUMP_BYTES`, default 64 MiB). The record cap
+`GOGGLES_MAX_DUMP_RECORDS` defaults to `GOGGLES_MAX_DUMP_BYTES // 256` (262,144 at
+64 MiB), derived rather than fixed so it cannot become the binding limit when the
+byte ceiling changes: the smallest line that passes validation is 138 bytes and
+real audit lines run 600–1,000, so only a pathological tiny-line body ever hits
+it. The limits are layered and must stay in this order:
 
 | Layer | Limit | Why |
 | --- | --- | --- |
 | Marmot client | 64 MiB per file | Anything the client would send must be accepted somewhere, or it is re-posted forever. |
 | Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. |
-| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record. |
+| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which is age-bounded to 14 days. |
 
 Every authenticated attempt the upload API refuses before ingesting is stored as
 an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`, or
@@ -41,10 +45,10 @@ line in the worker while it ingests. Measured locally (gunicorn, one worker, a
 19× the body. With the default `3 workers × 4 threads` the worst case of twelve
 simultaneous maximum-size uploads is ~14.7 GiB, inside the 16 GiB
 `GOGGLES_WEB_MEMORY_LIMIT` but with little headroom; lower `GOGGLES_WEB_THREADS`
-if such uploads are ever concurrent in practice. That same run took 179 s on
-SQLite (Postgres is faster); a client whose read timeout is shorter than the
-ingest sees a timeout, but its re-post of the identical body is answered
-`200` immediately because the file is already stored.
+if such uploads are ever concurrent in practice. A maximum-size ingest can also
+take longer than a mobile client's read timeout; the client then reports a
+failure, but its re-post of the identical body is answered `200` immediately
+because the file is already stored.
 
 ### Investigating rejected or missing uploads
 
@@ -52,12 +56,16 @@ ingest sees a timeout, but its re-post of the identical body is answered
   `time "METHOD path" status bytes durations cl=<Content-Length> platform=<X-Goggles-Platform> app=<X-Goggles-App-Version>`.
   Count non-2xx by status and platform, or look at the duration column (`%(L)s`)
   for the request-time distribution during an incident window.
-- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON) is the only
-  record of requests Caddy refused itself (413 over `max_size`, client aborts).
-  Filter on `"status":413` and group by `request.headers.User-Agent`.
+- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON, kept 14 days)
+  is the only record of requests Caddy refused itself (413 over `max_size`,
+  client aborts). Filter on `"status":413` and group by
+  `request.headers.User-Agent`.
 - A device whose file never gets through shows up as repeated `too_large`
   rejections from the same token/platform; a lossy or overloaded path shows up
   as `incomplete_body` rejections whose `received_bytes` vary per attempt.
+  `received_bytes` is known only when the client closed the connection cleanly;
+  a connection reset discards what gunicorn had buffered, so those rows record
+  it as unknown (`null`).
 
 ## Audit Redesign Cutover
 
