@@ -1,6 +1,31 @@
 goggles.ipf.dev {
+	# Must sit ABOVE Django's GOGGLES_MAX_DUMP_BYTES (64 MiB) so the 413 for an
+	# oversized upload is decided by Django -- which records it as an
+	# UploadRejection -- rather than dying here with no server-side trace.
+	# Caddy units: "MB" is decimal (50MB was 50,000,000 bytes, below Django's
+	# old 50 MiB), "MiB" is binary. The margin covers multipart framing.
 	request_body {
-		max_size 50MB
+		max_size 68MiB
+	}
+
+	# Edge access log: the only place a request that never reaches Django (a
+	# body over max_size, a client that disconnected) leaves a record. Bearer
+	# tokens and cookies are stripped; the remaining fields are what an
+	# investigation of rejected uploads needs (status, size, duration, client
+	# platform/version headers, user agent).
+	log {
+		output file /var/log/caddy/goggles-access.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Goggles-Group delete
+			}
+		}
 	}
 
 	encode zstd gzip

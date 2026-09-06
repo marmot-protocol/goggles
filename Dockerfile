@@ -30,6 +30,10 @@ EXPOSE 8000
 # past a multi-minute stream so gunicorn does not reap it. --max-requests recycles
 # workers periodically (gracefully, after in-flight streams finish) for leak hygiene
 # now that workers are long-lived. See docs/deployment.md for the capacity model.
+# --access-logfile mirrors docker-compose.yml so a bare `docker run` also emits
+# per-request status/duration lines (path without query string, no IP or UA).
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", \
      "--workers", "3", "--threads", "4", "--timeout", "300", \
-     "--max-requests", "500", "--max-requests-jitter", "50"]
+     "--max-requests", "500", "--max-requests-jitter", "50", \
+     "--access-logfile", "-", \
+     "--access-logformat", "%(t)s \"%(m)s %(U)s\" %(s)s %(B)s %(L)ss cl=%({content-length}i)s platform=%({x-goggles-platform}i)s app=%({x-goggles-app-version}i)s"]
