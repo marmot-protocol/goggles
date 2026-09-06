@@ -275,8 +275,16 @@ LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "group-list"
 LOGOUT_REDIRECT_URL = "login"
 
-GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 50 * 1024 * 1024))
-GOGGLES_MAX_DUMP_RECORDS = int(os.environ.get("GOGGLES_MAX_DUMP_RECORDS", 50_000))
+# Upload ceiling. Marmot clients refuse to upload a segment larger than 64 MiB,
+# so the server accepts exactly that: anything lower leaves a band of files the
+# client will re-post forever and the server never sees. The edge proxy's body
+# limit must sit *above* this value (see deploy/Caddyfile.goggles.ipf.dev) so the
+# 413 is decided -- and recorded as an UploadRejection -- here, not at the edge.
+GOGGLES_MAX_DUMP_BYTES = int(os.environ.get("GOGGLES_MAX_DUMP_BYTES", 64 * 1024 * 1024))
+# Record cap sized so it is not the binding limit for a legitimate 64 MiB log
+# (real audit lines run ~0.7-1 KiB) while still bounding per-line object
+# expansion for pathological tiny-line bodies.
+GOGGLES_MAX_DUMP_RECORDS = int(os.environ.get("GOGGLES_MAX_DUMP_RECORDS", 100_000))
 GOGGLES_MAX_JSONL_LINE_BYTES = int(os.environ.get("GOGGLES_MAX_JSONL_LINE_BYTES", 2 * 1024 * 1024))
 GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
     os.environ.get("GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST", 50_000)
