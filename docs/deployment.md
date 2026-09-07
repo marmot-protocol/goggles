@@ -109,7 +109,8 @@ Recommended cutover:
    the app process.
 
 The purge command deletes audit uploads, raw events, group workspaces, derived
-projections, and saved reports. It preserves user accounts and upload tokens.
+projections, saved reports, and recorded upload rejections. It preserves user
+accounts and upload tokens.
 
 On large Postgres databases, run `VACUUM ANALYZE` after the purge if reclaiming
 space or refreshing planner statistics matters for the deployment window.

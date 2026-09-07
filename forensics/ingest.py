@@ -948,7 +948,7 @@ def refresh_group_rollups(group_ids: list[int]) -> None:
 # does not override the base implementation, which returns ``len(objs)`` -- so
 # every event lands in one statement. ``AuditEvent`` has ~71 concrete columns
 # per unsaved row, so any valid upload over ~900 lines (the common case: real
-# Marmot audit logs are append-only JSONL and the upload ceiling is 50 MiB)
+# Marmot audit logs are append-only JSONL and the upload ceiling is 64 MiB)
 # overflows the 65535 cap. psycopg raises a non-``IntegrityError`` that escapes
 # the ``except IntegrityError`` handler in ``ingest_audit_log_bytes()`` and 500s
 # the upload, losing the raw evidence. Cap the batch from the live field count
