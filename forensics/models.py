@@ -244,11 +244,13 @@ class UploadRejection(models.Model):
     REASON_TOO_MANY_PARTS = "too_many_parts"
     REASON_INCOMPLETE_BODY = "incomplete_body"
     REASON_LENGTH_REQUIRED = "length_required"
+    REASON_MALFORMED_BODY = "malformed_body"
     REASON_CHOICES = [
         (REASON_TOO_LARGE, "Body exceeds the upload size limit"),
         (REASON_TOO_MANY_PARTS, "Multipart body carries more than one file part"),
         (REASON_INCOMPLETE_BODY, "Body shorter than its Content-Length"),
         (REASON_LENGTH_REQUIRED, "Content-Length header missing"),
+        (REASON_MALFORMED_BODY, "Body could not be parsed as multipart"),
     ]
 
     upload_token = models.ForeignKey(

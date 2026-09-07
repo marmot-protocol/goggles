@@ -26,12 +26,12 @@ it. The limits are layered and must stay in this order:
 | Layer | Limit | Why |
 | --- | --- | --- |
 | Marmot client | 64 MiB per file | Anything the client would send must be accepted somewhere, or it is re-posted forever. |
-| Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. |
-| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which is age-bounded to 14 days. |
+| Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. The header check applies to non-multipart bodies; a multipart body is bounded while its file part streams, so multipart framing is not counted against the 64 MiB. |
+| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which rotates daily and is age-bounded to 14 days. |
 
 Every authenticated attempt the upload API refuses before ingesting is stored as
-an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`, or
-`length_required`; declared vs received bytes; client platform/version headers;
+an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`,
+`length_required`, or `malformed_body`; declared vs received bytes; client platform/version headers;
 token; IP). They appear on the **Upload logs** page, in the admin under
 *Upload rejections*, and are pruned by `prune_audit_data` on the same retention
 window as evidence. A body shorter than its `Content-Length` is refused with `400`
@@ -50,13 +50,28 @@ take longer than a mobile client's read timeout; the client then reports a
 failure, but its re-post of the identical body is answered `200` immediately
 because the file is already stored.
 
+### Deploying the new limits
+
+1. A production `.env` copied from an older README example pins
+   `GOGGLES_MAX_DUMP_BYTES=52428800` and `GOGGLES_MAX_DUMP_RECORDS=50000`. Set the
+   byte value to `67108864` and remove the records line; otherwise the settings
+   defaults in this release never apply and the old ceilings remain in force.
+   `.env.example` in the repository should carry the same two changes (someone
+   with access to it must edit it).
+2. Apply `deploy/Caddyfile.goggles.ipf.dev` on the host, create `/var/log/caddy`
+   writable by the caddy user, and reload Caddy.
+3. Recreate the web service so the gunicorn access-log flags and the new
+   environment take effect; the migration runs at startup:
+   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web`.
+
 ### Investigating rejected or missing uploads
 
 - `docker compose logs web` carries a gunicorn access line per request:
   `time "METHOD path" status bytes durations cl=<Content-Length> platform=<X-Goggles-Platform> app=<X-Goggles-App-Version>`.
   Count non-2xx by status and platform, or look at the duration column (`%(L)s`)
   for the request-time distribution during an incident window.
-- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON, kept 14 days)
+- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON, rotated daily,
+  kept 14 days)
   is the only record of requests Caddy refused itself (413 over `max_size`,
   client aborts). Filter on `"status":413` and group by
   `request.headers.User-Agent`.

@@ -10,13 +10,15 @@ goggles.ipf.dev {
 
 	# Edge access log: the only place a request that never reaches Django (a
 	# body over max_size, a client that disconnected) leaves a record. Bearer
-	# tokens, cookies, the group ref, and the human device label are stripped;
-	# the client IP and user agent remain because a 413 investigation groups by
-	# them, so the file is age-bounded to the audit retention window (14 days,
+	# tokens, cookies, the group ref (header and ?group= query parameter), and
+	# the human device label are stripped; the client IP and user agent remain
+	# because a 413 investigation groups by them, so the file rolls daily and is
+	# age-bounded to the audit retention window (14 days,
 	# GOGGLES_AUDIT_RETENTION_DAYS) rather than kept until it rolls by size.
 	# Status, size, duration, and the client platform/version headers stay.
 	log {
 		output file /var/log/caddy/goggles-access.log {
+			roll_at 00:00
 			roll_size 50MiB
 			roll_keep 10
 			roll_keep_for 336h
@@ -24,6 +26,9 @@ goggles.ipf.dev {
 		format filter {
 			wrap json
 			fields {
+				request>uri query {
+					delete group
+				}
 				request>headers>Authorization delete
 				request>headers>Cookie delete
 				request>headers>X-Goggles-Group delete

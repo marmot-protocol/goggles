@@ -482,7 +482,7 @@ INCOMPLETE_FINAL_RECORD_PREFIX = "incomplete final record (upload does not end w
 
 
 def annotate_incomplete_final_record(raw_text: str, parsed_lines: list[ParsedLine]) -> None:
-    """Flag a last line that is unparseable JSON *and* lacks its terminating newline.
+    """Flag a last record that is unparseable JSON *and* lacks its terminating newline.
 
     Clients write one ``\n``-terminated record per line, so a body whose final
     bytes are a JSON fragment with no newline was almost certainly read while
@@ -492,10 +492,17 @@ def annotate_incomplete_final_record(raw_text: str, parsed_lines: list[ParsedLin
     received to ``Content-Length``); annotating it here keeps the two
     distinguishable in the stored ``validation_error`` and in group exports.
     A trailing-newline-free *valid* record is legal JSONL and is left alone.
+
+    "Lacks its newline" means the record occupies the text's final ``\n``-split
+    segment. Checking ``raw_text.endswith("\n")`` instead would misfire when a
+    terminated fragment is followed by whitespace-only content.
     """
-    if not parsed_lines or raw_text.endswith("\n"):
+    if not parsed_lines:
         return
     last = parsed_lines[-1]
+    final_segment_number = raw_text.count("\n") + 1
+    if last.line_number != final_segment_number:
+        return
     if last.data is not None or not last.errors:
         return
     if last.errors[0].startswith("invalid JSON"):

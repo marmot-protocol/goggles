@@ -9440,7 +9440,10 @@ class DebugFailClosedSettingsTests(SimpleTestCase):
 
     # Environment keys the settings module reads; cleared for a clean slate so a
     # stray DJANGO_* var in the test runner's environment can't mask the default.
-    _MANAGED_PREFIXES = ("DJANGO_", "GLITCHTIP_")
+    # GOGGLES_ is cleared too: the Justfile loads .env into the environment, and
+    # a .env copied from the README example pins GOGGLES_MAX_DUMP_RECORDS, which
+    # would make the default-derivation tests fail under `just test`.
+    _MANAGED_PREFIXES = ("DJANGO_", "GLITCHTIP_", "GOGGLES_")
     _MANAGED_KEYS = ("DATABASE_URL",)
 
     # A representative production-style environment, deliberately missing
@@ -10002,6 +10005,43 @@ class UploadRejectionTests(TestCase):
         self.assertEqual(audit_file.valid_event_count, 2)
         self.assertEqual(audit_file.invalid_event_count, 1)
         self.assertEqual(UploadRejection.objects.count(), 0)
+
+    def test_terminated_final_fragment_followed_by_whitespace_is_not_annotated(self):
+        # The fragment on line 3 ends with its newline; only whitespace follows.
+        # The writer finished that line, so this is a plain invalid record, not
+        # a mid-append read, and must not be reported as missing its newline.
+        body = (
+            representative_audit_log() + '{"schema_version": "marmot-forensics-audit/v3", "se\n   '
+        )
+
+        response = self.client.post(
+            reverse("api-audit-log-upload"),
+            data=body,
+            content_type="application/x-ndjson",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["validation_status"], "invalid")
+        self.assertNotIn("incomplete final record", response.json()["error"])
+
+    def test_malformed_multipart_body_is_refused_and_recorded(self):
+        # A multipart Content-Type with no boundary makes Django's parser raise;
+        # unhandled, that was a 500 with no trace instead of a recorded refusal.
+        response = self.client.generic(
+            "POST",
+            reverse("api-audit-log-upload"),
+            data=b"garbage\r\n",
+            content_type="multipart/form-data",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["reason"], "malformed_body")
+        self.assertEqual(AuditFile.objects.count(), 0)
+        rejection = UploadRejection.objects.get()
+        self.assertEqual(rejection.reason, UploadRejection.REASON_MALFORMED_BODY)
+        self.assertEqual(rejection.status_code, 400)
 
     def test_valid_final_record_without_newline_is_not_annotated(self):
         response = self.client.post(

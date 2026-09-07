@@ -127,8 +127,7 @@ DJANGO_SECURE_HSTS_SECONDS=31536000
 DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=0
 DJANGO_SECURE_HSTS_PRELOAD=0
 DATABASE_URL=postgres://goggles:replace-with-long-random-database-password@db:5432/goggles
-GOGGLES_MAX_DUMP_BYTES=52428800
-GOGGLES_MAX_DUMP_RECORDS=50000
+GOGGLES_MAX_DUMP_BYTES=67108864
 GOGGLES_MAX_JSONL_LINE_BYTES=2097152
 GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST=50000
 GOGGLES_AGENT_EXPORT_MAX_EVENTS=50000
@@ -153,6 +152,10 @@ POSTGRES_DB=goggles
 POSTGRES_USER=goggles
 POSTGRES_PASSWORD=replace-with-long-random-database-password
 ```
+
+Leave `GOGGLES_MAX_DUMP_RECORDS` unset unless you have a reason: it derives from
+the byte ceiling (`GOGGLES_MAX_DUMP_BYTES // 256`), and an explicit value pins the
+record cap even when the ceiling changes.
 
 Compose reads container resource and logging limits while it parses the Compose
 file, before a service's `env_file` is applied. The default `.env` works for
@@ -239,9 +242,10 @@ and `/static/*` to the static sidecar on `127.0.0.1:8001`, and it encodes two ru
   Mind the units — Caddy's `50MB` meant 50,000,000 bytes, *below* the app's old
   50 MiB ceiling; the file uses `MiB`.
 - The `log` block is the only record of requests Caddy itself refuses. It strips
-  bearer tokens, cookies, the group ref, and the device label; the client IP and
-  user agent remain, so the file is age-bounded to the audit retention window
-  (14 days) rather than kept until it rolls by size.
+  bearer tokens, cookies, the group ref (header and `?group=` query parameter),
+  and the device label; the client IP and user agent remain, so the file rotates
+  daily and is age-bounded to the audit retention window (14 days) rather than
+  kept until it rolls by size.
 
 The static sidecar avoids requiring the Caddy system user to read inside the app checkout. It serves generated CSS, JavaScript, and admin assets only.
 
@@ -321,8 +325,10 @@ docker compose exec web python manage.py shell -c "from forensics.models import 
 - Brain disk encryption is the expected at-rest protection for v1.
 - Upload size defaults to 64 MiB via `GOGGLES_MAX_DUMP_BYTES`, matching the
   largest segment Marmot clients will send; the edge proxy limit must be higher
-  (see Caddy above). Processing is additionally bounded to 100,000 non-empty
-  records and 2 MiB per JSONL line; multipart bodies spool to disk after 1 MiB. Over-complex uploads are retained
+  (see Caddy above). The record cap derives from the byte ceiling
+  (`GOGGLES_MAX_DUMP_BYTES // 256`, 262,144 at 64 MiB) and exists only to catch
+  pathological tiny-line bodies; each JSONL line is further bounded to 2 MiB, and
+  multipart bodies spool to disk after 1 MiB. Over-complex uploads are retained
   as one quarantined raw artifact instead of being expanded into per-line ORM
   objects.
 - Projection APIs default to 100 rows and cap requests at 500. Action-history

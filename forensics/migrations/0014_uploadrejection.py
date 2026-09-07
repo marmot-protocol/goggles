@@ -15,7 +15,7 @@ class Migration(migrations.Migration):
             name='UploadRejection',
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('reason', models.CharField(choices=[('too_large', 'Body exceeds the upload size limit'), ('too_many_parts', 'Multipart body carries more than one file part'), ('incomplete_body', 'Body shorter than its Content-Length'), ('length_required', 'Content-Length header missing')], max_length=32)),
+                ('reason', models.CharField(choices=[('too_large', 'Body exceeds the upload size limit'), ('too_many_parts', 'Multipart body carries more than one file part'), ('incomplete_body', 'Body shorter than its Content-Length'), ('length_required', 'Content-Length header missing'), ('malformed_body', 'Body could not be parsed as multipart')], max_length=32)),
                 ('status_code', models.PositiveSmallIntegerField()),
                 ('declared_content_length', models.PositiveBigIntegerField(blank=True, null=True)),
                 ('received_bytes', models.PositiveBigIntegerField(blank=True, null=True)),

@@ -24,6 +24,7 @@ from django.http import (
     StreamingHttpResponse,
     UnreadablePostError,
 )
+from django.http.multipartparser import MultiPartParserError
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import slugify
 from django.urls import reverse
@@ -73,6 +74,7 @@ logger = logging.getLogger(__name__)
 UPLOAD_TOO_LARGE_ERROR = "audit log exceeds maximum upload size"
 UPLOAD_LENGTH_REQUIRED_ERROR = "Content-Length header is required for audit log uploads"
 UPLOAD_INCOMPLETE_BODY_ERROR = "incomplete request body"
+UPLOAD_MALFORMED_BODY_ERROR = "request body could not be parsed"
 UPLOAD_REJECTION_LIST_LIMIT = 50
 AUDIT_FILE_EVENT_PAGE_SIZE = 100
 RAW_TEXT_PREVIEW_CHARS = 32 * 1024
@@ -3377,6 +3379,17 @@ def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
         # A part (or the cumulative upload) exceeded the size cap while streaming.
         too_large.received = counted_body_bytes(request)
         raise too_large from exc
+    except MultiPartParserError as exc:
+        # The multipart framing itself is broken (e.g. no boundary). Unhandled,
+        # this was a 500 with no trace. It is not a short body, so it gets its
+        # own reason rather than polluting the incomplete_body signal.
+        raise UploadRefused(
+            UploadRejection.REASON_MALFORMED_BODY,
+            400,
+            UPLOAD_MALFORMED_BODY_ERROR,
+            declared=declared,
+            received=counted_body_bytes(request),
+        ) from exc
     except UnreadablePostError as exc:
         # The socket failed mid-read (a reset rather than a clean close). The
         # received count is unknown, not zero: gunicorn buffers its 1 KiB reads
