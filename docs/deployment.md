@@ -13,6 +13,81 @@ no-op startups skip the VACUUM. Preview what would be pruned with
 `uv run python manage.py prune_audit_data --dry-run`, or override the window for
 a one-off run with `uv run python manage.py prune_audit_data --retention-days N`.
 
+## Upload Limits and Rejected Uploads
+
+Marmot clients refuse to upload a segment larger than 64 MiB, so the server accepts
+exactly that (`GOGGLES_MAX_DUMP_BYTES`, default 64 MiB). The record cap
+`GOGGLES_MAX_DUMP_RECORDS` defaults to `GOGGLES_MAX_DUMP_BYTES // 256` (262,144 at
+64 MiB), derived rather than fixed so it cannot become the binding limit when the
+byte ceiling changes: the smallest line that passes validation is 138 bytes and
+real audit lines run 600–1,000, so only a pathological tiny-line body ever hits
+it. The limits are layered and must stay in this order:
+
+| Layer | Limit | Why |
+| --- | --- | --- |
+| Marmot client | 64 MiB per file | Anything the client would send must be accepted somewhere, or it is re-posted forever. |
+| Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. The header check applies to non-multipart bodies; a multipart body is bounded while its file part streams, so multipart framing is not counted against the 64 MiB. |
+| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which rotates daily and is age-bounded to 14 days. |
+
+Each authenticated attempt the upload API refuses before ingesting is recorded as
+an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`,
+`length_required`, or `malformed_body`; declared vs received bytes; client platform/version headers;
+token; IP). Recording is best effort: the row is written after the response is
+decided, and a database or transaction failure is logged (`could not record upload
+rejection`) rather than turned into a 500, so a missing row does not prove no
+refusal occurred; check the application log for that message when the edge log
+shows a 4xx with no matching row. Rejections appear on the **Upload logs** page,
+in the admin under *Upload rejections*, and are pruned by `prune_audit_data` on
+the same retention window as evidence. A body shorter than its `Content-Length` is refused with `400`
+and **not** ingested: gunicorn hands Django whatever arrived before the connection
+closed, and until this check the truncated prefix was ingested, its cut-off last
+line quarantined, and the client (seeing a 400) re-posted the whole file anyway.
+
+Memory: one 64 MiB upload holds the raw bytes, the decoded text, and every parsed
+line in the worker while it ingests. Measured locally (gunicorn, one worker, a
+64 MiB / 71,365-line synthetic log): worker RSS peaked at **1.23 GiB**, i.e. about
+19× the body. With the default `3 workers × 4 threads` the worst case of twelve
+simultaneous maximum-size uploads is ~14.7 GiB, inside the 16 GiB
+`GOGGLES_WEB_MEMORY_LIMIT` but with little headroom; lower `GOGGLES_WEB_THREADS`
+if such uploads are ever concurrent in practice. A maximum-size ingest can also
+take longer than a mobile client's read timeout; the client then reports a
+failure, but its re-post of the identical body is answered `200` immediately
+because the file is already stored.
+
+### Deploying the new limits
+
+1. A production `.env` copied from an older `.env.example` pins
+   `GOGGLES_MAX_DUMP_BYTES=52428800` and `GOGGLES_MAX_DUMP_RECORDS=50000`. Set the
+   byte value to `67108864` and remove the records line; otherwise the settings
+   defaults in this release never apply and the old ceilings remain in force.
+2. Apply `deploy/Caddyfile.goggles.ipf.dev` on the host, create `/var/log/caddy`
+   writable by the caddy user, and reload Caddy.
+3. Recreate the web service so the gunicorn access-log flags and the new
+   environment take effect; the migration runs at startup:
+
+   ```sh
+   export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
+   docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web
+   ```
+
+### Investigating rejected or missing uploads
+
+- `docker compose logs web` carries a gunicorn access line per request:
+  `time "METHOD path" status bytes durations cl=<Content-Length> platform=<X-Goggles-Platform> app=<X-Goggles-App-Version>`.
+  Count non-2xx by status and platform, or look at the duration column (`%(L)s`)
+  for the request-time distribution during an incident window.
+- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON, rotated daily,
+  kept 14 days)
+  is the only record of requests Caddy refused itself (413 over `max_size`,
+  client aborts). Filter on `"status":413` and group by
+  `request.headers.User-Agent`.
+- A device whose file never gets through shows up as repeated `too_large`
+  rejections from the same token/platform; a lossy or overloaded path shows up
+  as `incomplete_body` rejections whose `received_bytes` vary per attempt.
+  `received_bytes` is known only when the client closed the connection cleanly;
+  a connection reset discards what gunicorn had buffered, so those rows record
+  it as unknown (`null`).
+
 ## Audit Redesign Cutover
 
 The audit-log redesign does not require dropping the whole database. Keep the
@@ -34,7 +109,8 @@ Recommended cutover:
    the app process.
 
 The purge command deletes audit uploads, raw events, group workspaces, derived
-projections, and saved reports. It preserves user accounts and upload tokens.
+projections, saved reports, and recorded upload rejections. It preserves user
+accounts and upload tokens.
 
 On large Postgres databases, run `VACUUM ANALYZE` after the purge if reclaiming
 space or refreshing planner statistics matters for the deployment window.

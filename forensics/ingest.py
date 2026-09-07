@@ -474,7 +474,39 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
                 errors=errors,
             )
         )
+    annotate_incomplete_final_record(raw_text, parsed_lines)
     return parsed_lines
+
+
+INCOMPLETE_FINAL_RECORD_PREFIX = "incomplete final record (upload does not end with a newline)"
+
+
+def annotate_incomplete_final_record(raw_text: str, parsed_lines: list[ParsedLine]) -> None:
+    """Flag a last record that is unparseable JSON *and* lacks its terminating newline.
+
+    Clients write one ``\n``-terminated record per line, so a body whose final
+    bytes are a JSON fragment with no newline was almost certainly read while
+    that record was still being written -- the client sized ``Content-Length``
+    from a file that was mid-append. That is a different failure from a body cut
+    in transit (which the upload view now refuses outright by comparing bytes
+    received to ``Content-Length``); annotating it here keeps the two
+    distinguishable in the stored ``validation_error`` and in group exports.
+    A trailing-newline-free *valid* record is legal JSONL and is left alone.
+
+    "Lacks its newline" means the record occupies the text's final ``\n``-split
+    segment. Checking ``raw_text.endswith("\n")`` instead would misfire when a
+    terminated fragment is followed by whitespace-only content.
+    """
+    if not parsed_lines:
+        return
+    last = parsed_lines[-1]
+    final_segment_number = raw_text.count("\n") + 1
+    if last.line_number != final_segment_number:
+        return
+    if last.data is not None or not last.errors:
+        return
+    if last.errors[0].startswith("invalid JSON"):
+        last.errors[0] = f"{INCOMPLETE_FINAL_RECORD_PREFIX}: {last.errors[0]}"
 
 
 def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -916,7 +948,7 @@ def refresh_group_rollups(group_ids: list[int]) -> None:
 # does not override the base implementation, which returns ``len(objs)`` -- so
 # every event lands in one statement. ``AuditEvent`` has ~71 concrete columns
 # per unsaved row, so any valid upload over ~900 lines (the common case: real
-# Marmot audit logs are append-only JSONL and the upload ceiling is 50 MiB)
+# Marmot audit logs are append-only JSONL and the upload ceiling is 64 MiB)
 # overflows the 65535 cap. psycopg raises a non-``IntegrityError`` that escapes
 # the ``except IntegrityError`` handler in ``ingest_audit_log_bytes()`` and 500s
 # the upload, losing the raw evidence. Cap the batch from the live field count
