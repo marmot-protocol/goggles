@@ -6457,6 +6457,24 @@ class PurgeAuditDataCommandTests(TestCase):
         self.assertTrue(User.objects.filter(pk=user.pk).exists())
         self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
 
+    def test_confirmed_purge_also_deletes_upload_rejections(self):
+        # Rejection rows hang off the preserved UploadToken, not off AuditFile or
+        # AuditGroup, so the cascades above never reach them. Purge promises a
+        # clean slate; an IP and user agent surviving it would break that promise.
+        _user, token, _audit_file, _group = self.seed_audit_data()
+        UploadRejection.objects.create(
+            upload_token=token, reason=UploadRejection.REASON_TOO_LARGE, status_code=413
+        )
+        out = StringIO()
+
+        call_command("purge_audit_data", "--dry-run", stdout=out)
+        self.assertIn("upload_rejections=1", out.getvalue())
+        self.assertEqual(UploadRejection.objects.count(), 1)
+
+        call_command("purge_audit_data", "--confirm-delete-audit-data", stdout=out)
+        self.assertEqual(UploadRejection.objects.count(), 0)
+        self.assertTrue(UploadToken.objects.filter(pk=token.pk).exists())
+
 
 class PruneAuditDataCommandTests(TransactionTestCase):
     def ingest_paired_evidence(self):
@@ -10077,6 +10095,23 @@ class UploadRejectionTests(TestCase):
         self.assertContains(response, "incomplete_body")
         self.assertContains(response, "Pixel 8")
         self.assertContains(response, f"{len(full)} declared")
+
+    def test_admin_refuses_to_delete_rejections_even_for_a_superuser(self):
+        # The table's contract: written by the upload API, aged out by prune,
+        # wiped by purge, never edited by hand. A superuser inherits the model's
+        # delete permission, so the admin must decline it explicitly.
+        full = representative_audit_log().encode("utf-8")
+        self.post_raw(full[:-40], declared=len(full))
+        rejection = UploadRejection.objects.get()
+        User.objects.create_superuser("root", "root@example.com", "correct horse battery staple")
+        self.client.login(username="root", password="correct horse battery staple")
+
+        response = self.client.get(
+            reverse("admin:forensics_uploadrejection_delete", args=[rejection.pk])
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(UploadRejection.objects.filter(pk=rejection.pk).exists())
 
     def test_admin_changelist_renders_rejections(self):
         full = representative_audit_log().encode("utf-8")

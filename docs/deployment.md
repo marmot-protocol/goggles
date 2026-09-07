@@ -29,12 +29,16 @@ it. The limits are layered and must stay in this order:
 | Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. The header check applies to non-multipart bodies; a multipart body is bounded while its file part streams, so multipart framing is not counted against the 64 MiB. |
 | Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which rotates daily and is age-bounded to 14 days. |
 
-Every authenticated attempt the upload API refuses before ingesting is stored as
+Each authenticated attempt the upload API refuses before ingesting is recorded as
 an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`,
 `length_required`, or `malformed_body`; declared vs received bytes; client platform/version headers;
-token; IP). They appear on the **Upload logs** page, in the admin under
-*Upload rejections*, and are pruned by `prune_audit_data` on the same retention
-window as evidence. A body shorter than its `Content-Length` is refused with `400`
+token; IP). Recording is best effort: the row is written after the response is
+decided, and a database or transaction failure is logged (`could not record upload
+rejection`) rather than turned into a 500, so a missing row does not prove no
+refusal occurred; check the application log for that message when the edge log
+shows a 4xx with no matching row. Rejections appear on the **Upload logs** page,
+in the admin under *Upload rejections*, and are pruned by `prune_audit_data` on
+the same retention window as evidence. A body shorter than its `Content-Length` is refused with `400`
 and **not** ingested: gunicorn hands Django whatever arrived before the connection
 closed, and until this check the truncated prefix was ingested, its cut-off last
 line quarantined, and the client (seeing a 400) re-posted the whole file anyway.

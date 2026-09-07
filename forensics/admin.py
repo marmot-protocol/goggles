@@ -157,10 +157,10 @@ class AuditFileAdmin(admin.ModelAdmin):
 class UploadRejectionAdmin(admin.ModelAdmin):
     """Authenticated upload attempts refused before ingestion.
 
-    Rows are written only by the upload API, so adding and editing are disabled;
-    deleting stays available as the operator's remedy for a row whose IP or user
-    agent should not be kept. The admin is for finding a device that keeps failing
-    (filter by reason, then read declared vs received bytes).
+    The table's contract: written only by the upload API, aged out by
+    ``prune_audit_data``, wiped by ``purge_audit_data``, never edited by hand. So
+    the admin denies add, change, and delete alike; it exists for finding a device
+    that keeps failing (filter by reason, then read declared vs received bytes).
     """
 
     list_display = (
@@ -184,6 +184,9 @@ class UploadRejectionAdmin(admin.ModelAdmin):
         return False
 
     def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False
 
 
