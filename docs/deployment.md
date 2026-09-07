@@ -52,17 +52,19 @@ because the file is already stored.
 
 ### Deploying the new limits
 
-1. A production `.env` copied from an older README example pins
+1. A production `.env` copied from an older `.env.example` pins
    `GOGGLES_MAX_DUMP_BYTES=52428800` and `GOGGLES_MAX_DUMP_RECORDS=50000`. Set the
    byte value to `67108864` and remove the records line; otherwise the settings
    defaults in this release never apply and the old ceilings remain in force.
-   `.env.example` in the repository should carry the same two changes (someone
-   with access to it must edit it).
 2. Apply `deploy/Caddyfile.goggles.ipf.dev` on the host, create `/var/log/caddy`
    writable by the caddy user, and reload Caddy.
 3. Recreate the web service so the gunicorn access-log flags and the new
    environment take effect; the migration runs at startup:
-   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web`.
+
+   ```sh
+   export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
+   docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web
+   ```
 
 ### Investigating rejected or missing uploads
 

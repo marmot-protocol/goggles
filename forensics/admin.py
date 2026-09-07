@@ -155,10 +155,12 @@ class AuditFileAdmin(admin.ModelAdmin):
 
 @admin.register(UploadRejection)
 class UploadRejectionAdmin(admin.ModelAdmin):
-    """Read-only trace of authenticated upload attempts refused before ingestion.
+    """Authenticated upload attempts refused before ingestion.
 
-    Rows are written only by the upload API; the admin is for finding a device
-    that keeps failing (filter by reason, then read declared vs received bytes).
+    Rows are written only by the upload API, so adding and editing are disabled;
+    deleting stays available as the operator's remedy for a row whose IP or user
+    agent should not be kept. The admin is for finding a device that keeps failing
+    (filter by reason, then read declared vs received bytes).
     """
 
     list_display = (
