@@ -41,8 +41,7 @@ Projection endpoints support these filters where the field applies:
 
 - `engine_id`
 - `account_ref`
-- `audit_data_mode` (`safe_only` for v3; historical v2 mode tokens remain
-  filterable)
+- `audit_data_mode` (`safe_only` for all accepted v4 evidence)
 - `message_id`
 - `event_type`
 - `severity`: `info`, `warning`, or `error`
@@ -101,11 +100,9 @@ wire ids, or preserved raw evidence include:
 }
 ```
 
-Current v3 evidence reports the derived `safe_only` posture. Historical v2
-`full_data` evidence remains readable by authenticated Goggles users under the
-current internal-testing policy. If Goggles later separates analyst and
-administrator roles, this metadata is the field-level hook for enforcing
-stricter access.
+V4 evidence reports the derived `safe_only` posture. Only schema-valid v4 files
+can be uploaded. Historical evidence remains until the separately approved reset;
+see `deployment.md`. Correlation hashes and opaque identifiers remain sensitive.
 
 ## Endpoints
 
@@ -300,9 +297,10 @@ path, but never embed raw JSON or raw JSONL bodies.
 - `GET /api/v1/groups/{group_slug}/engines/`
 
 Returns engines observed in the group with event counts, account refs, first or
-last event times, sensitivity metadata, and client-provided source metadata such
-as account labels, device labels, device ids, device names, platform, app
-version, upload trigger, account pubkey hex, and npub.
+last event times, sensitivity metadata, and validated body source metadata: optional system `hardware_model`, opaque
+`device_id`, platform, app version and upload trigger. Engine labels combine
+platform, model and a shortened opaque engine identifier. Removed account/device
+labels and names are never consumed from source headers or form fields.
 
 ## Human-Facing Investigation Links
 
@@ -317,3 +315,53 @@ Saved reports store an immutable projection snapshot plus investigator notes.
 The report page summarizes every saved projection section, including action
 attribution and pagination `has_more` markers when a snapshot list was truncated
 by the projection page size.
+
+## V4 upload rejection diagnostics
+
+Both raw NDJSON and single-file multipart uploads use the same whole-file v4
+validation boundary. No body, raw line, filename, account/device label, IP or
+user agent is saved for rejected attempts. The rejection record contains only a
+server timestamp, credential reference, HTTP status, fixed reason, optional byte
+counts and optional line number. Failed ingestion logs only an allowlisted
+exception class, never its message or traceback.
+
+Validation failures return
+`{"error": "<code>", "reason": "<code>", "line_number": <number-or-null>}`.
+Use `reason` as the machine-readable field for both validation and transport
+rejections. Existing `error` values are retained for compatibility: validation
+uses the code, while transport failures use a fixed human-readable message.
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `unsupported_schema` | 400 | Missing, legacy or unknown schema version |
+| `invalid_v4_schema` | 400 | V4 contract violation, including removed/unknown fields |
+| `invalid_json` | 400 | Malformed JSON, duplicate keys, non-finite numbers or excessive nesting |
+| `invalid_json_object` | 400 | Record is not a JSON object |
+| `invalid_utf8` | 400 | Body is not UTF-8 |
+| `empty_upload` | 400 | No records |
+| `processing_limit` | 400 | Record count, line byte size or parser resource limit exceeded |
+| `storage_limit_exceeded` | 400 | Schema-valid value exceeds a Goggles storage or display limit |
+| `inconsistent_file_identity` | 400 | Conflicting engine/account identity within the file |
+| `too_large` | 413 | Body exceeds the configured upload byte ceiling |
+| `ingest_failed` | 503 | Validated upload could not be committed; evidence writes rolled back |
+
+Goggles keeps additional operational limits beyond MDK's authoritative schema:
+`GOGGLES_MAX_DUMP_BYTES`, `GOGGLES_MAX_JSONL_LINE_BYTES`,
+`GOGGLES_MAX_DUMP_RECORDS`, JSON nesting depth 200, signed 64-bit persisted
+integers, model field widths and a `wall_time_ms` ceiling of 4102444800000
+(2100-01-01 UTC). These limits fail closed before raw persistence; they do not
+change the vendored schema. Deployments should size the configurable limits for
+MDK's segment sizes. A `storage_limit_exceeded` response is distinct from an
+invalid MDK schema record.
+
+Transport failures occur before validation and return `error` with a fixed
+`reason`: `length_required` (411), `too_large`/`too_many_parts` (413), or
+`incomplete_body`/`malformed_body` (400). Byte counts can accompany incomplete
+transfer diagnostics. Authentication failure returns 401; disabled uploads
+return 503.
+
+Historical `AuditFile.source_name`, `source_ip` and `user_agent` columns remain
+read-only until the separately approved audit-data purge. New uploads do not
+consume these values. Existing v1–v3 `context_source` public keys remain available
+only to internal legacy delivery matching until that purge; no new upload can
+recreate them, and v4 exports gain no public-key source fields.

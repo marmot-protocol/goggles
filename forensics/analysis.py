@@ -145,8 +145,7 @@ def valid_events_for_group(group, *, include_export_fields=False):
     fields = [
         "id",
         "audit_file_id",
-        "audit_file__source_account_label",
-        "audit_file__source_device_label",
+        "audit_file__source_hardware_model",
         "audit_file__source_platform",
         "line_number",
         "parse_status",
@@ -211,8 +210,7 @@ def file_rows_for_group(audit_files, group):
             "id": audit_file.id,
             "source_name": audit_file.source_name or f"audit-file-{audit_file.id}",
             "source_label": source_label_for_file(audit_file),
-            "source_account_label": audit_file.source_account_label,
-            "source_device_label": audit_file.source_device_label,
+            "source_hardware_model": audit_file.source_hardware_model,
             "source_platform": audit_file.source_platform,
             "validation_status": audit_file.validation_status,
             "total_line_count": audit_file.total_line_count,
@@ -575,9 +573,9 @@ def message_traces_from_events(events, all_engines):
 
 def source_label_for_file(audit_file: AuditFile) -> str:
     parts = [
-        audit_file.source_account_label,
-        audit_file.source_device_label,
         audit_file.source_platform,
+        audit_file.source_hardware_model,
+        (audit_file.engine_ids or [""])[0][:12],
     ]
     return " / ".join(part for part in parts if part)
 
@@ -1075,8 +1073,8 @@ def agent_source_row(audit_file):
         "id": audit_file.id,
         "source_name": audit_file.source_name or f"audit-file-{audit_file.id}",
         "source_label": source_label_for_file(audit_file),
-        "source_account_label": audit_file.source_account_label,
-        "source_device_label": audit_file.source_device_label,
+        "source_hardware_model": audit_file.source_hardware_model,
+        "source_device_id": audit_file.source_device_id,
         "source_platform": audit_file.source_platform,
         "source_app_version": audit_file.source_app_version,
         "validation_status": audit_file.validation_status,
@@ -1179,6 +1177,7 @@ def engine_initials(label: str, engine_id: str) -> str:
 def timeline_engines(events):
     by_engine: dict[str, dict] = {}
     file_ids: dict[str, set] = defaultdict(set)
+    source_metadata: dict[str, dict[str, str]] = defaultdict(dict)
     for event in events:
         engine_id = event.engine_id
         if not engine_id:
@@ -1204,9 +1203,11 @@ def timeline_engines(events):
             info["last_event_ms"] = max(
                 info["last_event_ms"] or event.wall_time_ms, event.wall_time_ms
             )
-        label = source_label_for_file(event.audit_file)
-        if label:
-            info["label"] = label
+        metadata = source_metadata[engine_id]
+        for field in ("source_platform", "source_hardware_model"):
+            value = getattr(event.audit_file, field)
+            if value:
+                metadata.setdefault(field, value)
         file_ids[engine_id].add(event.audit_file_id)
 
     engines = sorted(
@@ -1218,6 +1219,17 @@ def timeline_engines(events):
         ),
     )
     for idx, info in enumerate(engines):
+        engine_id = info["engine_id"]
+        metadata = source_metadata[engine_id]
+        info["label"] = " / ".join(
+            part
+            for part in (
+                metadata.get("source_platform"),
+                metadata.get("source_hardware_model"),
+                engine_id[:12],
+            )
+            if part
+        )
         info["idx"] = idx
         info["short"] = info["engine_id"][:8]
         info["initials"] = engine_initials(info["label"], info["engine_id"])

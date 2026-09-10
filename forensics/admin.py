@@ -75,7 +75,7 @@ class AuditFileAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "source_name",
-        "source_device_label",
+        "source_hardware_model",
         "validation_status",
         "valid_event_count",
         "invalid_event_count",
@@ -169,12 +169,8 @@ class UploadRejectionAdmin(admin.ModelAdmin):
         "status_code",
         "declared_content_length",
         "received_bytes",
-        "source_platform",
-        "source_app_version",
-        "source_device_label",
         "upload_token",
     )
-    list_filter = ("reason", "status_code", "source_platform")
     date_hierarchy = "created_at"
     ordering = ("-created_at", "-id")
     readonly_fields = tuple(field.name for field in UploadRejection._meta.fields)

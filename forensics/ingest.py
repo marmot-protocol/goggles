@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.models import Case, IntegerField, Value, When
 from django.template.defaultfilters import slugify
@@ -17,20 +17,12 @@ from django.utils import timezone
 
 from . import normalized_fields as normalized_field_config
 from .analysis import divergent_counts_for_group_ids
-from .models import AuditEvent, AuditFile, AuditGroup, UploadToken
+from .audit_schema import schema_error_code
+from .models import AuditEvent, AuditFile, AuditGroup, UploadRejection, UploadToken
 from .projections import rebuild_file_projections
 
 logger = logging.getLogger(__name__)
 
-AUDIT_SCHEMA_VERSION_V1 = "marmot-forensics-audit/v1"
-AUDIT_SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
-AUDIT_SCHEMA_VERSION_V3 = "marmot-forensics-audit/v3"
-SUPPORTED_AUDIT_SCHEMA_VERSIONS = {
-    AUDIT_SCHEMA_VERSION_V1,
-    AUDIT_SCHEMA_VERSION_V2,
-    AUDIT_SCHEMA_VERSION_V3,
-}
-CURRENT_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V2, AUDIT_SCHEMA_VERSION_V3}
 PEELER_OUTCOMES = {
     "success",
     "decrypt_failed",
@@ -38,10 +30,8 @@ PEELER_OUTCOMES = {
     "malformed",
     "other",
 }
-V3_PEELER_OUTCOMES = PEELER_OUTCOMES | {"invalid_signature", "wrong_recipient"}
-DEFAULT_AUDIT_DATA_MODE = "obfuscated_sensitive_data"
+V4_PEELER_OUTCOMES = PEELER_OUTCOMES | {"invalid_signature", "wrong_recipient"}
 SAFE_ONLY_AUDIT_DATA_MODE = "safe_only"
-AUDIT_DATA_MODES = {DEFAULT_AUDIT_DATA_MODE, "full_data"}
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 # Upper bound for hex message identifiers (``msg_id``, ``outbound_msg_id``,
@@ -64,7 +54,7 @@ MSG_ID_MAX_LENGTH = 512
 # would crash a shared page (the groups landing 500) or a per-group timeline
 # (blank render). Bound ingest at the year-2100 mark -- comfortably inside both
 # ceilings and far beyond any plausible real audit-log timestamp -- and
-# quarantine anything past it like other schema violations.
+# reject anything past it before storage.
 MAX_WALL_TIME_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
 
 # Maximum bracket/brace nesting depth we will hand to ``json.loads``. The audit
@@ -74,8 +64,7 @@ MAX_WALL_TIME_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
 # (e.g. ``[[[[...]]]]`` thousands of levels deep) makes ``json.loads`` recurse
 # until it raises ``RecursionError`` -- which is *not* a ``JSONDecodeError`` --
 # and would otherwise escape the parser as an uncaught 500, losing the raw
-# upload instead of quarantining it. We reject such lines up front with a clear
-# validation error so they are quarantined like any other malformed JSON.
+# upload. Reject such lines before storage with a fixed operational error.
 MAX_JSON_NESTING_DEPTH = 200
 
 
@@ -125,7 +114,19 @@ def loads_audit_json(raw: str) -> Any:
     """
     if max_json_nesting_depth(raw) > MAX_JSON_NESTING_DEPTH:
         raise ValueError(f"nesting exceeds maximum depth of {MAX_JSON_NESTING_DEPTH}")
-    return json.loads(raw)
+
+    def reject_constant(value):
+        raise ValueError("non-finite JSON number")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+
+    return json.loads(raw, parse_constant=reject_constant, object_pairs_hook=unique_object)
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,60 @@ def iter_jsonl_record_lines(raw_text: str) -> Iterator[str]:
         yield raw_line
 
 
+class UploadRejected(ValueError):
+    """A fixed operational code, never a fragment of request data."""
+
+    def __init__(self, code, line_number=None):
+        self.code = code
+        self.line_number = line_number
+        self.status_code = 503 if code == "ingest_failed" else 413 if code == "too_large" else 400
+        super().__init__(code)
+
+
+def validate_upload(dump_bytes: bytes) -> tuple[str, list[ParsedLine]]:
+    if len(dump_bytes) > settings.GOGGLES_MAX_DUMP_BYTES:
+        raise UploadRejected("too_large")
+    try:
+        raw_text = dump_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise UploadRejected("invalid_utf8") from None
+    try:
+        parsed_lines = parse_jsonl(raw_text)
+    except (AuditLogComplexityError, RecursionError, UnicodeError, ValueError):
+        raise UploadRejected("processing_limit") from None
+    if not parsed_lines:
+        raise UploadRejected("empty_upload")
+    for line in parsed_lines:
+        if line.errors:
+            # Only allowlisted operational codes may leave the parser. Never
+            # copy normalization messages, schema paths or request values.
+            code = line.errors[0]
+            if code not in {
+                "unsupported_schema",
+                "invalid_v4_schema",
+                "invalid_json_object",
+                "invalid_json",
+            }:
+                code = "storage_limit_exceeded"
+            raise UploadRejected(code, line.line_number)
+    if has_inconsistent_identity(parsed_lines):
+        raise UploadRejected("inconsistent_file_identity")
+    return raw_text, parsed_lines
+
+
+def record_ingestion_rejection(token, byte_size, code, line_number=None):
+    try:
+        UploadRejection.objects.create(
+            upload_token=token,
+            received_bytes=byte_size,
+            reason=code,
+            status_code=UploadRejected(code).status_code,
+            line_number=line_number,
+        )
+    except DatabaseError:
+        logger.warning("could not record upload rejection")
+
+
 def ingest_audit_log_bytes(
     *,
     dump_bytes: bytes,
@@ -168,121 +223,34 @@ def ingest_audit_log_bytes(
     fallback_group_name: str = "",
     upload_token: UploadToken | None = None,
     uploaded_by=None,
-    source_ip: str | None = None,
-    user_agent: str = "",
-    source_name: str = "",
-    source_account_label: str = "",
-    source_device_label: str = "",
-    source_device_id: str = "",
-    source_device_name: str = "",
-    source_platform: str = "",
-    source_app_version: str = "",
-    source_upload_trigger: str = "",
-    source_account_pubkey_hex: str = "",
-    source_account_npub: str = "",
-    content_type: str = "",
 ) -> IngestionResult:
+    # Validation MUST precede deduplication, group creation, and every write of
+    # evidence. Legacy replays cannot become accepted through an old file hash.
     try:
-        raw_text = dump_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raw_text = dump_bytes.decode("utf-8", errors="replace")
-        return save_invalid_upload(
-            fallback_group_slug=fallback_group_slug,
-            fallback_group_name=fallback_group_name,
-            upload_token=upload_token,
-            uploaded_by=uploaded_by,
-            source_ip=source_ip,
-            user_agent=user_agent,
-            source_name=source_name,
-            source_account_label=source_account_label,
-            source_device_label=source_device_label,
-            source_device_id=source_device_id,
-            source_device_name=source_device_name,
-            source_platform=source_platform,
-            source_app_version=source_app_version,
-            source_upload_trigger=source_upload_trigger,
-            source_account_pubkey_hex=source_account_pubkey_hex,
-            source_account_npub=source_account_npub,
-            content_type=content_type,
-            dump_bytes=dump_bytes,
-            raw_text=raw_text,
-            error=f"Audit log must be UTF-8 JSONL: {exc}.",
-        )
-
+        raw_text, parsed_lines = validate_upload(dump_bytes)
+    except UploadRejected as exc:
+        record_ingestion_rejection(upload_token, len(dump_bytes), exc.code, exc.line_number)
+        raise
     file_sha256 = hashlib.sha256(dump_bytes).hexdigest()
     existing = (
         AuditFile.objects.defer("raw_text", "user_agent").filter(file_sha256=file_sha256).first()
     )
     if existing is not None:
         return IngestionResult(audit_file=existing, created=False)
-
-    try:
-        parsed_lines = parse_jsonl(raw_text)
-    except AuditLogComplexityError as exc:
-        return save_invalid_upload(
-            fallback_group_slug=fallback_group_slug,
-            fallback_group_name=fallback_group_name,
-            upload_token=upload_token,
-            uploaded_by=uploaded_by,
-            source_ip=source_ip,
-            user_agent=user_agent,
-            source_name=source_name,
-            source_account_label=source_account_label,
-            source_device_label=source_device_label,
-            source_device_id=source_device_id,
-            source_device_name=source_device_name,
-            source_platform=source_platform,
-            source_app_version=source_app_version,
-            source_upload_trigger=source_upload_trigger,
-            source_account_pubkey_hex=source_account_pubkey_hex,
-            source_account_npub=source_account_npub,
-            content_type=content_type,
-            dump_bytes=dump_bytes,
-            raw_text=raw_text,
-            error=f"audit log exceeds safe processing limits: {exc}",
-        )
     metadata = file_metadata(parsed_lines)
-    # Account identity is sourced from the JSONL body (source_context), not from
-    # upload headers. Backfill the per-file account fields so file-level views
-    # and the identity indexes keep resolving who is who. An explicit header/POST
-    # value (if one is ever supplied) still wins over the body.
-    body_identity = body_account_identity(parsed_lines)
-    source_account_label = source_account_label or body_identity["account_label"]
-    source_account_pubkey_hex = source_account_pubkey_hex or body_identity["account_pubkey_hex"]
-    validation_errors = [
-        f"line {line.line_number}: {'; '.join(line.errors)}" for line in parsed_lines if line.errors
-    ]
-    if not parsed_lines:
-        validation_errors = ["audit log has no non-empty JSONL lines"]
-    else:
-        validation_errors.extend(file_validation_errors(parsed_lines))
-
-    validation_status = AuditFile.STATUS_INVALID if validation_errors else AuditFile.STATUS_VALID
-    validation_error = "\n".join(validation_errors)
-
+    source = body_source_metadata(parsed_lines)
     try:
         with transaction.atomic():
             audit_file = AuditFile.objects.create(
                 upload_token=upload_token,
                 uploaded_by=uploaded_by,
-                source_name=source_name[:255],
-                source_account_label=source_account_label[:255],
-                source_device_label=source_device_label[:255],
-                source_device_id=source_device_id[:255],
-                source_device_name=source_device_name[:255],
-                source_platform=source_platform[:120],
-                source_app_version=source_app_version[:120],
-                source_upload_trigger=source_upload_trigger[:160],
-                source_account_pubkey_hex=source_account_pubkey_hex[:64],
-                source_account_npub=source_account_npub[:120],
-                content_type=content_type[:120],
+                # Client filenames and headers are not forensic identity.
+                content_type="application/x-ndjson",
                 file_sha256=file_sha256,
                 byte_size=len(dump_bytes),
                 raw_text=raw_text,
-                validation_status=validation_status,
-                validation_error=validation_error,
-                source_ip=source_ip,
-                user_agent=user_agent[:5000],
+                validation_status=AuditFile.STATUS_VALID,
+                **source,
                 **metadata,
             )
             duplicate_count, group_ids = create_events(
@@ -302,121 +270,36 @@ def ingest_audit_log_bytes(
             )
             refresh_group_rollups(locked_group_ids)
             return IngestionResult(audit_file=audit_file, created=True)
-    except IntegrityError:
-        audit_file = AuditFile.objects.defer("raw_text", "user_agent").get(file_sha256=file_sha256)
-        return IngestionResult(audit_file=audit_file, created=False)
     except Exception as exc:
-        # Defense-in-depth: any *other* failure while creating events (e.g. a
-        # psycopg ``DataError`` from a per-statement bind-parameter or btree
-        # index-tuple overflow) is NOT an ``IntegrityError``, so it would
-        # otherwise escape this handler, roll back the ``transaction.atomic()``
-        # block above, and 500 the upload with no ``AuditFile`` persisted --
-        # losing the raw evidence (the failure class of #7 / #14 / #24 / #36 /
-        # #51). The atomic block has already rolled back by the time we get
-        # here, so the partial write is gone; re-save the upload as a single
-        # quarantined ``AuditFile`` that preserves ``raw_text`` verbatim instead
-        # of dropping it on the floor. Log only the fact + exception type (never
-        # the raw upload body or any sensitive field).
-        logger.warning(
-            "audit log ingest failed; quarantining upload to preserve evidence",
-            extra={"error_type": type(exc).__name__},
-        )
-        return save_invalid_upload(
-            fallback_group_slug=fallback_group_slug,
-            fallback_group_name=fallback_group_name,
-            upload_token=upload_token,
-            uploaded_by=uploaded_by,
-            source_ip=source_ip,
-            user_agent=user_agent,
-            source_name=source_name,
-            source_account_label=source_account_label,
-            source_device_label=source_device_label,
-            source_device_id=source_device_id,
-            source_device_name=source_device_name,
-            source_platform=source_platform,
-            source_app_version=source_app_version,
-            source_upload_trigger=source_upload_trigger,
-            source_account_pubkey_hex=source_account_pubkey_hex,
-            source_account_npub=source_account_npub,
-            content_type=content_type,
-            dump_bytes=dump_bytes,
-            raw_text=raw_text,
-            error="audit log ingest failed; upload quarantined to preserve raw evidence",
-        )
-
-
-def save_invalid_upload(
-    *,
-    fallback_group_slug: str | None,
-    fallback_group_name: str,
-    upload_token: UploadToken | None,
-    uploaded_by,
-    source_ip: str | None,
-    user_agent: str,
-    source_name: str,
-    source_account_label: str,
-    source_device_label: str,
-    source_device_id: str,
-    source_device_name: str,
-    source_platform: str,
-    source_app_version: str,
-    source_upload_trigger: str,
-    source_account_pubkey_hex: str,
-    source_account_npub: str,
-    content_type: str,
-    dump_bytes: bytes,
-    raw_text: str,
-    error: str,
-) -> IngestionResult:
-    file_sha256 = hashlib.sha256(dump_bytes).hexdigest()
-    existing = (
-        AuditFile.objects.defer("raw_text", "user_agent").filter(file_sha256=file_sha256).first()
-    )
-    if existing is not None:
-        return IngestionResult(audit_file=existing, created=False)
-    fallback_group = group_for_slug(fallback_group_slug, fallback_group_name)
-    try:
-        with transaction.atomic():
-            audit_file = AuditFile.objects.create(
-                upload_token=upload_token,
-                uploaded_by=uploaded_by,
-                source_name=source_name[:255],
-                source_account_label=source_account_label[:255],
-                source_device_label=source_device_label[:255],
-                source_device_id=source_device_id[:255],
-                source_device_name=source_device_name[:255],
-                source_platform=source_platform[:120],
-                source_app_version=source_app_version[:120],
-                source_upload_trigger=source_upload_trigger[:160],
-                source_account_pubkey_hex=source_account_pubkey_hex[:64],
-                source_account_npub=source_account_npub[:120],
-                content_type=content_type[:120],
-                file_sha256=file_sha256,
-                byte_size=len(dump_bytes),
-                raw_text=raw_text,
-                validation_status=AuditFile.STATUS_INVALID,
-                validation_error=error,
-                total_line_count=1,
-                invalid_event_count=1,
-                source_ip=source_ip,
-                user_agent=user_agent[:5000],
+        if isinstance(exc, IntegrityError):
+            existing = (
+                AuditFile.objects.defer("raw_text", "user_agent")
+                .filter(file_sha256=file_sha256)
+                .first()
             )
-            AuditEvent.objects.create(
-                group=fallback_group,
-                audit_file=audit_file,
-                line_number=1,
-                line_hash=hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest(),
-                raw_line=raw_text,
-                parse_status=AuditEvent.STATUS_INVALID,
-                validation_error=error,
-            )
-            if fallback_group is not None:
-                audit_file.groups.add(fallback_group)
-                AuditGroup.objects.filter(id=fallback_group.id).update(updated_at=timezone.now())
-            return IngestionResult(audit_file=audit_file, created=True)
-    except IntegrityError:
-        audit_file = AuditFile.objects.defer("raw_text", "user_agent").get(file_sha256=file_sha256)
-        return IngestionResult(audit_file=audit_file, created=False)
+            if existing is not None:
+                return IngestionResult(audit_file=existing, created=False)
+        # The atomic write has rolled back. Never quarantine a rejected body or
+        # pass the exception (which may contain SQL/values) to logs/telemetry.
+        # The class is selected from a fixed allowlist; exception messages and
+        # tracebacks can contain SQL/values and must never enter diagnostics.
+        error_type = type(exc).__name__
+        if error_type not in {
+            "DataError",
+            "IntegrityError",
+            "OperationalError",
+            "DatabaseError",
+            "TypeError",
+            "ValueError",
+            "KeyError",
+            "AttributeError",
+            "RuntimeError",
+            "MemoryError",
+        }:
+            error_type = "UnexpectedError"
+        logger.warning("audit log ingestion failed: error_type=%s", error_type)
+        record_ingestion_rejection(upload_token, len(dump_bytes), "ingest_failed")
+        raise UploadRejected("ingest_failed") from None
 
 
 def parse_jsonl(raw_text: str) -> list[ParsedLine]:
@@ -446,18 +329,11 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
         try:
             loaded = loads_audit_json(raw_line)
             if not isinstance(loaded, dict):
-                errors.append("line must be a JSON object")
+                errors.append("invalid_json_object")
             else:
                 data = loaded
-        except json.JSONDecodeError as exc:
-            errors.append(f"invalid JSON: {exc.msg}")
-        except (ValueError, RecursionError) as exc:
-            # ValueError covers the depth-limit guard in loads_audit_json();
-            # RecursionError is a belt-and-suspenders catch in case the
-            # interpreter's recursion limit is hit before the depth guard.
-            # Neither is a JSONDecodeError, so without this they would escape
-            # parse_jsonl() as an uncaught 500 and lose the raw upload.
-            errors.append(f"invalid JSON: {exc}")
+        except (ValueError, RecursionError):
+            errors.append("invalid_json")
 
         normalized: dict[str, Any] = {}
         if data is not None:
@@ -474,43 +350,14 @@ def parse_jsonl(raw_text: str) -> list[ParsedLine]:
                 errors=errors,
             )
         )
-    annotate_incomplete_final_record(raw_text, parsed_lines)
     return parsed_lines
-
-
-INCOMPLETE_FINAL_RECORD_PREFIX = "incomplete final record (upload does not end with a newline)"
-
-
-def annotate_incomplete_final_record(raw_text: str, parsed_lines: list[ParsedLine]) -> None:
-    """Flag a last record that is unparseable JSON *and* lacks its terminating newline.
-
-    Clients write one ``\n``-terminated record per line, so a body whose final
-    bytes are a JSON fragment with no newline was almost certainly read while
-    that record was still being written -- the client sized ``Content-Length``
-    from a file that was mid-append. That is a different failure from a body cut
-    in transit (which the upload view now refuses outright by comparing bytes
-    received to ``Content-Length``); annotating it here keeps the two
-    distinguishable in the stored ``validation_error`` and in group exports.
-    A trailing-newline-free *valid* record is legal JSONL and is left alone.
-
-    "Lacks its newline" means the record occupies the text's final ``\n``-split
-    segment. Checking ``raw_text.endswith("\n")`` instead would misfire when a
-    terminated fragment is followed by whitespace-only content.
-    """
-    if not parsed_lines:
-        return
-    last = parsed_lines[-1]
-    final_segment_number = raw_text.count("\n") + 1
-    if last.line_number != final_segment_number:
-        return
-    if last.data is not None or not last.errors:
-        return
-    if last.errors[0].startswith("invalid JSON"):
-        last.errors[0] = f"{INCOMPLETE_FINAL_RECORD_PREFIX}: {last.errors[0]}"
 
 
 def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
+    schema_error = schema_error_code(data)
+    if schema_error:
+        return {}, [schema_error]
     schema_version = bounded_str_or_empty(
         data.get("schema_version"),
         "schema_version",
@@ -523,7 +370,7 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             "recorder_session_id",
             errors,
         ),
-        "audit_data_mode": audit_data_mode_for_event(data, schema_version, errors),
+        "audit_data_mode": SAFE_ONLY_AUDIT_DATA_MODE,
         "seq": value_if_int(data.get("seq")),
         "wall_time_ms": value_if_int(data.get("wall_time_ms")),
         "account_ref": (
@@ -535,12 +382,6 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         ),
     }
 
-    if normalized["schema_version"] not in SUPPORTED_AUDIT_SCHEMA_VERSIONS:
-        errors.append(
-            "unsupported schema_version "
-            f"{data.get('schema_version')!r}; expected one of "
-            f"{', '.join(sorted(SUPPORTED_AUDIT_SCHEMA_VERSIONS))}"
-        )
     if normalized["seq"] is None:
         errors.append("seq must be a non-negative integer")
     elif int_exceeds_model_limit("seq", normalized["seq"], errors):
@@ -554,45 +395,12 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             f"wall_time_ms must be a non-negative integer within range (at most {MAX_WALL_TIME_MS})"
         )
         normalized["wall_time_ms"] = None
-    # ``account_ref`` / ``group_ref`` are coerced to "" above via
-    # ``value_if_str()`` for any non-string. A present-but-non-string value
-    # (number, list, object, bool) must be treated as a schema violation -- like
-    # ``engine_id``, which is validated unconditionally below -- and not silently
-    # dropped to "" (which would skip the truthiness-gated checks, mark the event
-    # valid, lose attribution, and silently re-bucket the event under the
-    # fallback group). Distinguish "absent" (None) from "present but wrong type".
-    if present_but_not_str(data, "account_ref"):
-        errors.append("account_ref must be 32 hex characters when present")
-    elif normalized["account_ref"] and not is_hex(normalized["account_ref"], exact_len=32):
-        errors.append("account_ref must be 32 hex characters when present")
-    if normalized["schema_version"] in CURRENT_AUDIT_SCHEMA_VERSIONS:
-        if not normalized["engine_id"]:
-            errors.append("engine_id must be a non-empty string")
-        elif string_exceeds_model_limit("engine_id", normalized["engine_id"], errors):
-            normalized["engine_id"] = ""
-    elif not is_hex(normalized["engine_id"], exact_len=32):
-        errors.append("engine_id must be 32 hex characters")
-    if present_but_not_str(data, "group_ref"):
-        errors.append(
-            "group_ref must be even-length hex and at most "
-            f"{group_ref_max_length()} characters when present"
-        )
-    elif normalized["group_ref"] and not valid_group_ref(normalized["group_ref"]):
-        errors.append(
-            "group_ref must be even-length hex and at most "
-            f"{group_ref_max_length()} characters when present"
-        )
-        # Drop the out-of-schema value from the stored column. ``group_ref`` is
-        # a TextField indexed by a composite btree (group_ref, wall_time_ms);
-        # storing an oversized value verbatim makes the INSERT fail on Postgres
-        # with a DataError (``index row size N exceeds btree version 4 maximum
-        # 2704``) that escapes the ``except IntegrityError`` handler and 500s
-        # the upload, losing the raw evidence. A valid group_ref is already
-        # bounded to group_ref_max_length() (well under the btree limit), so
-        # only invalid values can overflow the index -- and they are quarantine
-        # noise, not searchable refs. Clearing it mirrors how bounded fields
-        # (e.g. envelope_kind) drop over-limit values while keeping the
-        # validation error and the verbatim raw line/event as evidence.
+    # Schema validity is already established; these are explicit storage/index
+    # limits and produce storage_limit_exceeded, not a schema-violation code.
+    if string_exceeds_model_limit("engine_id", normalized["engine_id"], errors):
+        normalized["engine_id"] = ""
+    if normalized["group_ref"] and len(normalized["group_ref"]) > group_ref_max_length():
+        errors.append("group_ref exceeds storage limit")
         normalized["group_ref"] = ""
 
     normalize_context(data.get("context"), normalized, errors)
@@ -613,37 +421,7 @@ def normalize_event(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
 
     variant_errors = normalize_kind(event_type, kind, normalized)
     errors.extend(variant_errors)
-    if normalized["schema_version"] == AUDIT_SCHEMA_VERSION_V1 and not normalized.get(
-        "human_action_action"
-    ):
-        errors.append(
-            "new audit rows must include kind.type 'human_action' or context.human_action.action"
-        )
     return normalized, errors
-
-
-def audit_data_mode_for_event(
-    data: dict[str, Any],
-    schema_version: str,
-    errors: list[str],
-) -> str:
-    if schema_version == AUDIT_SCHEMA_VERSION_V1:
-        return DEFAULT_AUDIT_DATA_MODE
-    if schema_version == AUDIT_SCHEMA_VERSION_V3:
-        # V3 removed the wire-level data-mode field and has one intrinsically
-        # safe-only posture. Keep that posture visible in Goggles' normalized
-        # filters/classification without pretending the legacy V2 token was
-        # present in the uploaded evidence.
-        return SAFE_ONLY_AUDIT_DATA_MODE
-
-    value = data.get("audit_data_mode")
-    if not isinstance(value, str):
-        errors.append("audit_data_mode must be present and be a string")
-        return ""
-    if value not in AUDIT_DATA_MODES:
-        errors.append("audit_data_mode must be one of " + ", ".join(sorted(AUDIT_DATA_MODES)))
-        return ""
-    return value
 
 
 def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, Any]) -> list[str]:
@@ -815,12 +593,7 @@ def normalize_kind(event_type: str, kind: dict[str, Any], normalized: dict[str, 
         case "peeler_outcome":
             copy_msg_id(kind, normalized, errors)
             copy_str(kind, normalized, errors, "outcome")
-            allowed_outcomes = (
-                V3_PEELER_OUTCOMES
-                if normalized.get("schema_version") == AUDIT_SCHEMA_VERSION_V3
-                else PEELER_OUTCOMES
-            )
-            if normalized.get("outcome") not in allowed_outcomes:
+            if normalized.get("outcome") not in V4_PEELER_OUTCOMES:
                 errors.append("outcome must be a known peeler outcome")
             fallback = kind.get("fallback_snapshot_used")
             if not isinstance(fallback, bool):
@@ -1226,59 +999,35 @@ def file_metadata(parsed_lines: list[ParsedLine]) -> dict[str, Any]:
     }
 
 
-def body_account_identity(parsed_lines: list[ParsedLine]) -> dict[str, str]:
-    """Derive the file's account label and pubkey from the JSONL body.
-
-    Account identity travels in the ``source_context`` object (stored per-event
-    as ``context_source``); ``account_pubkey_hex`` is only present in full-data
-    mode. One account per file is enforced by ``file_validation_errors``, so the
-    first non-empty value from a valid line is representative. Returns "" for any
-    field the body does not carry.
-    """
-    account_label = ""
-    account_pubkey_hex = ""
+def body_source_metadata(parsed_lines: list[ParsedLine]) -> dict[str, str]:
+    # Only schema-validated source context may populate these fields.
+    fields = {
+        "device_id": 255,
+        "hardware_model": 255,
+        "platform": 120,
+        "app_version": 120,
+        "upload_trigger": 160,
+    }
+    result = {}
     for line in parsed_lines:
-        if line.errors:
-            continue
-        source = line.normalized.get("context_source")
-        if not isinstance(source, dict):
-            continue
-        if not account_label:
-            account_label = value_if_str(source.get("account_label"))
-        if not account_pubkey_hex:
-            account_pubkey_hex = value_if_str(source.get("account_pubkey_hex"))
-        if account_label and account_pubkey_hex:
-            break
-    return {"account_label": account_label, "account_pubkey_hex": account_pubkey_hex}
+        source = line.normalized.get("context_source", {})
+        for key, limit in fields.items():
+            if source.get(key):
+                result.setdefault("source_" + key, source[key][:limit])
+    return result
 
 
-def file_validation_errors(parsed_lines: list[ParsedLine]) -> list[str]:
-    errors = []
-    engine_ids = sorted(
-        {
-            line.normalized.get("engine_id")
-            for line in parsed_lines
-            if is_hex(line.normalized.get("engine_id"), exact_len=32)
-        }
-    )
-    if len(engine_ids) > 1:
-        errors.append(
-            "audit log contains multiple engine_ids; expected one engine per file: "
-            + ", ".join(engine_ids)
-        )
-    account_refs = sorted(
-        {
-            line.normalized.get("account_ref")
-            for line in parsed_lines
-            if is_hex(line.normalized.get("account_ref"), exact_len=32)
-        }
-    )
-    if len(account_refs) > 1:
-        errors.append(
-            "audit log contains multiple account_refs; expected one account per file: "
-            + ", ".join(account_refs)
-        )
-    return errors
+def has_inconsistent_identity(parsed_lines: list[ParsedLine]) -> bool:
+    # Compare identities without building diagnostic strings containing their values.
+    for field in ("engine_id", "account_ref"):
+        first = None
+        for line in parsed_lines:
+            value = line.normalized.get(field)
+            if value:
+                if first is not None and value != first:
+                    return True
+                first = value
+    return False
 
 
 def normalized_fields() -> tuple[str, ...]:
@@ -1504,15 +1253,11 @@ def copy_msg_field(
 
 
 def is_valid_message_id(value: Any, normalized: dict[str, Any]) -> bool:
-    if normalized.get("schema_version") in CURRENT_AUDIT_SCHEMA_VERSIONS:
-        return is_hex(value, exact_len=64)
-    return is_hex(value, even=True)
+    return is_hex(value, exact_len=64)
 
 
 def message_id_requirement_label(normalized: dict[str, Any]) -> str:
-    if normalized.get("schema_version") in CURRENT_AUDIT_SCHEMA_VERSIONS:
-        return "64 hex characters"
-    return "even-length hex"
+    return "64 hex characters"
 
 
 def copy_digest(
@@ -1690,7 +1435,7 @@ def is_hex(value: Any, *, exact_len: int | None = None, even: bool = False) -> b
 
 
 def valid_group_ref(value: Any) -> bool:
-    return is_hex(value, even=True) and len(value) <= group_ref_max_length()
+    return is_hex(value) and len(value) <= group_ref_max_length()
 
 
 def group_ref_max_length() -> int:

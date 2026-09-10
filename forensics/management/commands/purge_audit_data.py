@@ -1,7 +1,22 @@
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import transaction
 
-from forensics.models import AnalysisRun, AuditEvent, AuditFile, AuditGroup, UploadRejection
+from forensics.models import (
+    AnalysisRun,
+    AuditEvent,
+    AuditFile,
+    AuditGroup,
+    ConvergenceCandidate,
+    ConvergenceRuleEvaluation,
+    ConvergenceRun,
+    DeliveryArtifact,
+    DeliveryObservation,
+    EpochStateTransition,
+    NetworkObservation,
+    RecipientExpectation,
+    StateDelta,
+    UploadRejection,
+)
 
 CONFIRM_FLAG = "--confirm-delete-audit-data"
 
@@ -9,8 +24,7 @@ CONFIRM_FLAG = "--confirm-delete-audit-data"
 class Command(BaseCommand):
     help = (
         "Delete preserved audit uploads, raw events, group workspaces, projections, "
-        "saved reports, and recorded upload rejections while preserving users and "
-        "upload tokens."
+        "and saved reports while preserving users, upload tokens and personal access tokens."
     )
 
     def add_arguments(self, parser: CommandParser) -> None:
@@ -46,9 +60,6 @@ class Command(BaseCommand):
             AuditFile.objects.all().delete()
             # AuditGroup cascades to projections and saved reports.
             AuditGroup.objects.all().delete()
-            # Rejections hang off the preserved UploadToken, so no cascade above
-            # reaches them; they carry an IP and user agent and must not outlive
-            # the evidence they failed to become.
             UploadRejection.objects.all().delete()
 
         after_counts = audit_data_counts()
@@ -63,6 +74,15 @@ def audit_data_counts() -> dict[str, int]:
         "audit_groups": AuditGroup.objects.count(),
         "saved_reports": AnalysisRun.objects.count(),
         "upload_rejections": UploadRejection.objects.count(),
+        "delivery_artifacts": DeliveryArtifact.objects.count(),
+        "delivery_observations": DeliveryObservation.objects.count(),
+        "recipient_expectations": RecipientExpectation.objects.count(),
+        "network_observations": NetworkObservation.objects.count(),
+        "convergence_runs": ConvergenceRun.objects.count(),
+        "convergence_candidates": ConvergenceCandidate.objects.count(),
+        "convergence_rules": ConvergenceRuleEvaluation.objects.count(),
+        "state_deltas": StateDelta.objects.count(),
+        "epoch_transitions": EpochStateTransition.objects.count(),
     }
 
 

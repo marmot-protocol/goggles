@@ -1,6 +1,6 @@
 # Goggles Audit Debugging Platform PRD
 
-Status: Draft  
+Status: Historical design draft (v4 acceptance is authoritative in `deployment.md`)
 Date: 2026-06-24  
 Audience: MDK, Goggles, and client application engineers
 

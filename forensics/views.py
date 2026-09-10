@@ -3,13 +3,15 @@ from __future__ import annotations
 import ipaddress
 import logging
 from datetime import datetime
+from io import BytesIO
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
-from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
+from django.core.exceptions import RequestDataTooBig, TooManyFieldsSent, TooManyFilesSent
+from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
 from django.db import DatabaseError
@@ -48,7 +50,7 @@ from .analysis import (
     structural_quarantine_exclusion,
     valid_events_for_group,
 )
-from .ingest import ingest_audit_log_bytes
+from .ingest import UploadRejected, ingest_audit_log_bytes
 from .models import (
     AnalysisRun,
     AuditEvent,
@@ -185,16 +187,14 @@ def upload_log_list(request: HttpRequest):
             "validation_status",
             "validation_error",
             "source_name",
-            "source_account_label",
-            "source_device_label",
             "source_platform",
+            "source_hardware_model",
             "source_app_version",
             "valid_event_count",
             "invalid_event_count",
             "duplicate_event_count",
             "engine_ids",
             "group_refs",
-            "source_ip",
             # select_related("upload_token") joins these columns; list them so the
             # related row is populated without a deferred-field follow-up query.
             "upload_token__name",
@@ -211,16 +211,13 @@ def upload_log_list(request: HttpRequest):
     stats = AuditFile.objects.aggregate(
         total=Count("id"),
         valid=Count("id", filter=Q(validation_status=AuditFile.STATUS_VALID)),
-        invalid=Count("id", filter=Q(validation_status=AuditFile.STATUS_INVALID)),
     )
     # Attempts refused before ingestion never become an AuditFile; list them
     # alongside so a device that keeps failing is visible from the same page.
     stats["rejected"] = UploadRejection.objects.count()
-    rejections = (
-        UploadRejection.objects.select_related("upload_token")
-        .defer("user_agent")
-        .order_by("-created_at", "-id")[:UPLOAD_REJECTION_LIST_LIMIT]
-    )
+    rejections = UploadRejection.objects.select_related("upload_token").order_by(
+        "-created_at", "-id"
+    )[:UPLOAD_REJECTION_LIST_LIMIT]
     # The template only renders latest_upload.created_at, so restrict this row to
     # that column too — otherwise .first() loads the full row (incl. raw_text) for
     # one potentially near-limit upload. See #39.
@@ -353,15 +350,11 @@ def group_epoch_count(valid_events) -> int:
 
 
 ENGINE_SOURCE_FIELD_MAP = (
-    ("account_labels", "source_account_label", "account_label"),
-    ("device_labels", "source_device_label", "device_label"),
+    ("hardware_models", "source_hardware_model", "hardware_model"),
     ("device_ids", "source_device_id", "device_id"),
-    ("device_names", "source_device_name", "device_name"),
     ("platforms", "source_platform", "platform"),
     ("app_versions", "source_app_version", "app_version"),
     ("upload_triggers", "source_upload_trigger", "upload_trigger"),
-    ("account_pubkeys_hex", "source_account_pubkey_hex", "account_pubkey_hex"),
-    ("account_npubs", "source_account_npub", "account_npub"),
 )
 
 
@@ -424,15 +417,11 @@ def engine_source_values(group: AuditGroup) -> dict[str, dict[str, list[str]]]:
             "engine_id",
             "account_ref",
             "context_source",
-            "audit_file__source_account_label",
-            "audit_file__source_device_label",
             "audit_file__source_device_id",
-            "audit_file__source_device_name",
+            "audit_file__source_hardware_model",
             "audit_file__source_platform",
             "audit_file__source_app_version",
             "audit_file__source_upload_trigger",
-            "audit_file__source_account_pubkey_hex",
-            "audit_file__source_account_npub",
         )
     )
     for event in events.iterator(chunk_size=2_000):
@@ -466,14 +455,9 @@ def empty_engine_source_metadata() -> dict[str, list[str]]:
 
 
 def engine_display_label(metadata: dict[str, list[str]], engine_id: str) -> str:
-    account = first_metadata_value(metadata, "account_labels")
-    device = first_metadata_value(metadata, "device_names") or first_metadata_value(
-        metadata,
-        "device_labels",
-    )
     platform = first_metadata_value(metadata, "platforms")
-    parts = [part for part in (account, device, platform) if part]
-    return " / ".join(parts) or engine_id[:8]
+    model = first_metadata_value(metadata, "hardware_models")
+    return " / ".join(part for part in (platform, model, engine_id[:12]) if part)
 
 
 def first_metadata_value(metadata: dict[str, list[str]], key: str) -> str:
@@ -487,10 +471,6 @@ def engine_sensitive_field_paths(metadata: dict[str, list[str]]) -> list[str]:
         field_paths.append("account_refs")
     if metadata.get("device_ids"):
         field_paths.append("source_metadata.device_ids")
-    if metadata.get("account_pubkeys_hex"):
-        field_paths.append("source_metadata.account_pubkeys_hex")
-    if metadata.get("account_npubs"):
-        field_paths.append("source_metadata.account_npubs")
     return field_paths
 
 
@@ -1811,10 +1791,7 @@ def audit_data_mode_change_payload_severity(payload: dict) -> str:
 
 
 def delivery_artifact_queryset():
-    observation_evidence = evidence_ref_event_queryset(
-        "context_source",
-        "audit_file__source_account_pubkey_hex",
-    ).select_related("audit_file")
+    observation_evidence = evidence_ref_event_queryset("context_source", "schema_version")
     expectation_evidence = evidence_ref_event_queryset(
         "engine_id",
         "account_ref",
@@ -2342,8 +2319,8 @@ def delivery_identity_index(group: AuditGroup) -> dict[str, set[str]]:
     Computed with SQL ``DISTINCT`` pulls rather than a Python scan of every event:
     the result is bounded by identity cardinality, not event count. This matters on
     the streaming export's hot path, where materializing every event would break the
-    constant-memory guarantee. Account pubkeys come from two places — the backing
-    audit file and each event's ``context_source`` JSON — unioned here.
+    constant-memory guarantee. V4 joins use opaque account and engine references;
+    full account public keys are not emitted by the schema.
     """
     valid_events = AuditEvent.objects.filter(group=group, parse_status=AuditEvent.STATUS_VALID)
 
@@ -2356,15 +2333,33 @@ def delivery_identity_index(group: AuditGroup) -> dict[str, set[str]]:
             value for value in queryset.order_by().values_list(field, flat=True).distinct() if value
         }
 
-    context_pubkeys = valid_events.annotate(
-        context_account_pubkey_hex=KeyTextTransform("account_pubkey_hex", "context_source")
-    )
     return {
         "account_refs": distinct_values(valid_events, "account_ref"),
         "engine_ids": distinct_values(valid_events, "engine_id"),
-        "pubkeys_hex": distinct_values(valid_events, "audit_file__source_account_pubkey_hex")
-        | distinct_values(context_pubkeys, "context_account_pubkey_hex"),
+        # Read existing legacy evidence until the explicitly approved purge. This
+        # compatibility read never admits public keys through the v4 boundary.
+        "pubkeys_hex": {
+            value
+            for value in distinct_values(
+                valid_events.filter(schema_version__in=LEGACY_AUDIT_SCHEMAS).annotate(
+                    legacy_pubkey=KeyTextTransform("account_pubkey_hex", "context_source")
+                ),
+                "legacy_pubkey",
+            )
+            if is_legacy_pubkey(value)
+        },
     }
+
+
+LEGACY_AUDIT_SCHEMAS = tuple(f"marmot-forensics-audit/v{version}" for version in (1, 2, 3))
+
+
+def is_legacy_pubkey(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
 
 
 def attach_delivery_matrices(
@@ -2375,6 +2370,7 @@ def attach_delivery_matrices(
 ) -> None:
     identity_index = delivery_identity_index(group)
     delivery_engines = engines if engines is not None else group_engine_rows(group)
+    legacy_pubkeys = legacy_engine_pubkeys(group)
     for artifact in artifacts:
         matrix = delivery_recipient_matrix(artifact, identity_index)
         artifact.recipient_matrix = matrix
@@ -2382,6 +2378,7 @@ def attach_delivery_matrices(
             artifact,
             delivery_engines,
             matrix,
+            legacy_pubkeys=legacy_pubkeys,
         )
         artifact.has_inferred_missing = any(
             row["status"]
@@ -2390,10 +2387,30 @@ def attach_delivery_matrices(
         )
 
 
+def legacy_engine_pubkeys(group: AuditGroup) -> dict[str, set[str]]:
+    """Internal matching only; never attach this index to public engine metadata."""
+    rows = (
+        valid_group_event_queryset(group)
+        .filter(schema_version__in=LEGACY_AUDIT_SCHEMAS)
+        .exclude(engine_id="")
+        .annotate(legacy_pubkey=KeyTextTransform("account_pubkey_hex", "context_source"))
+        .order_by()
+        .values_list("engine_id", "legacy_pubkey")
+        .distinct()
+    )
+    result: dict[str, set[str]] = {}
+    for engine_id, pubkey in rows:
+        if is_legacy_pubkey(pubkey):
+            result.setdefault(engine_id, set()).add(pubkey)
+    return result
+
+
 def delivery_engine_cells(
     artifact: DeliveryArtifact,
     engines: list[dict],
     recipient_matrix: list[dict],
+    *,
+    legacy_pubkeys: dict[str, set[str]] | None = None,
 ) -> list[dict]:
     observations_by_engine = {
         observation.engine_id: observation for observation in artifact.engine_observations.all()
@@ -2403,6 +2420,7 @@ def delivery_engine_cells(
             engine,
             observations_by_engine.get(engine["engine_id"]),
             recipient_matrix,
+            legacy_pubkeys=(legacy_pubkeys or {}).get(engine["engine_id"], set()),
         )
         for engine in engines
     ]
@@ -2412,6 +2430,8 @@ def delivery_engine_cell(
     engine: dict,
     observation: DeliveryObservation | None,
     recipient_matrix: list[dict],
+    *,
+    legacy_pubkeys: set[str] | None = None,
 ) -> dict:
     if observation is not None:
         status = observation.latest_state or "observed"
@@ -2431,7 +2451,9 @@ def delivery_engine_cell(
             "latest_evidence_id": latest_evidence_id,
         }
 
-    missing_status = delivery_missing_status_for_engine(engine, recipient_matrix)
+    missing_status = delivery_missing_status_for_engine(
+        engine, recipient_matrix, legacy_pubkeys=legacy_pubkeys
+    )
     status = missing_status or "not_observed"
     return {
         "engine": engine,
@@ -2445,23 +2467,28 @@ def delivery_engine_cell(
     }
 
 
-def delivery_missing_status_for_engine(engine: dict, recipient_matrix: list[dict]) -> str:
+def delivery_missing_status_for_engine(
+    engine: dict, recipient_matrix: list[dict], *, legacy_pubkeys: set[str] | None = None
+) -> str:
     missing_statuses = {"missing_inferred", "partial_count_inferred", "missing_count_inferred"}
     for row in recipient_matrix:
-        if row["status"] in missing_statuses and delivery_engine_matches_recipient(engine, row):
+        if row["status"] in missing_statuses and delivery_engine_matches_recipient(
+            engine, row, legacy_pubkeys=legacy_pubkeys
+        ):
             return row["status"]
     return ""
 
 
-def delivery_engine_matches_recipient(engine: dict, recipient: dict) -> bool:
+def delivery_engine_matches_recipient(
+    engine: dict, recipient: dict, *, legacy_pubkeys: set[str] | None = None
+) -> bool:
     recipient_id = recipient.get("recipient_id")
     if not recipient_id:
         return False
     if recipient.get("recipient_type") == "member_ref":
         return recipient_id in set(engine.get("account_refs") or [engine.get("account_ref")])
     if recipient.get("recipient_type") == "pubkey_hex":
-        source = engine.get("source_metadata") or {}
-        return recipient_id in set(source.get("account_pubkeys_hex") or [])
+        return recipient_id in (legacy_pubkeys or set())
     return False
 
 
@@ -2642,12 +2669,10 @@ def observation_identity_values(observation: DeliveryObservation) -> dict[str, s
     if observation.engine_id:
         identities["engine_ids"].add(observation.engine_id)
     for event in observation.evidence_events.all():
-        if event.audit_file.source_account_pubkey_hex:
-            identities["pubkeys_hex"].add(event.audit_file.source_account_pubkey_hex)
-        if isinstance(event.context_source, dict) and event.context_source.get(
-            "account_pubkey_hex"
-        ):
-            identities["pubkeys_hex"].add(event.context_source["account_pubkey_hex"])
+        if event.schema_version in LEGACY_AUDIT_SCHEMAS and isinstance(event.context_source, dict):
+            pubkey = event.context_source.get("account_pubkey_hex")
+            if is_legacy_pubkey(pubkey):
+                identities["pubkeys_hex"].add(pubkey)
     return identities
 
 
@@ -3111,28 +3136,41 @@ def revoke_access_token(request: HttpRequest, pk: int):
 
 
 class MaxDumpSizeUploadHandler(FileUploadHandler):
-    """Abort multipart file parsing once the uploaded bytes exceed the app limit.
-
-    The byte counter is *cumulative* across every file part in the request and
-    is intentionally not reset in ``new_file``. A single multipart request can
-    contain many parts, each individually under ``GOGGLES_MAX_DUMP_BYTES``; a
-    per-file cap would let their sum buffer in memory and exhaust the worker.
-    Capping the aggregate bounds total resident upload memory at roughly one
-    ``GOGGLES_MAX_DUMP_BYTES``, matching the documented single-file ceiling.
-    """
+    """Buffer one bounded file in memory, never spooling unvalidated bytes to disk."""
 
     def __init__(self, request: HttpRequest | None = None):
         super().__init__(request)
         self.bytes_received = 0
+        self.file_count = 0
 
-    def receive_data_chunk(self, raw_data: bytes, start: int) -> bytes:
+    def new_file(self, *args, **kwargs):
+        self.file_count += 1
+        if self.file_count > 1:
+            raise TooManyFilesSent
+        super().new_file(*args, **kwargs)
+        self.file = BytesIO()
+
+    def receive_data_chunk(self, raw_data: bytes, start: int) -> None:
         self.bytes_received += len(raw_data)
         if self.bytes_received > settings.GOGGLES_MAX_DUMP_BYTES:
             raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
-        return raw_data
+        self.file.write(raw_data)
 
     def file_complete(self, file_size: int):
-        return None
+        self.file.seek(0)
+        return InMemoryUploadedFile(
+            self.file,
+            self.field_name,
+            self.file_name,
+            self.content_type,
+            file_size,
+            self.charset,
+            self.content_type_extra,
+        )
+
+    def upload_interrupted(self):
+        if hasattr(self, "file"):
+            self.file.close()
 
 
 @csrf_exempt
@@ -3149,31 +3187,29 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
         )
 
     try:
-        audit_bytes, source_name, content_type = verified_audit_bytes(request)
+        audit_bytes = verified_audit_bytes(request)
     except UploadRefused as refusal:
         return reject_upload(request, token, group_slug, refusal)
 
     fallback_slug, fallback_name = fallback_group_from_request(request, group_slug)
-    source_metadata = source_metadata_from_request(request)
-    result = ingest_audit_log_bytes(
-        dump_bytes=audit_bytes,
-        fallback_group_slug=fallback_slug,
-        fallback_group_name=fallback_name,
-        upload_token=token,
-        source_ip=client_ip(request),
-        user_agent=request.headers.get("User-Agent", ""),
-        source_name=source_name,
-        **source_metadata,
-        content_type=content_type or request.content_type or "",
-    )
+    try:
+        result = ingest_audit_log_bytes(
+            dump_bytes=audit_bytes,
+            fallback_group_slug=fallback_slug,
+            fallback_group_name=fallback_name,
+            upload_token=token,
+        )
+    except UploadRejected as exc:
+        return JsonResponse(
+            {"error": exc.code, "reason": exc.code, "line_number": exc.line_number},
+            status=exc.status_code,
+        )
 
     token.mark_used()
     audit_file = result.audit_file
     groups = groups_for_audit_file(audit_file)
     group_slugs = [group.slug for group in groups]
     response_status = 201 if result.created else 200
-    if audit_file.validation_status == AuditFile.STATUS_INVALID:
-        response_status = 400
 
     body = {
         "id": audit_file.id,
@@ -3192,8 +3228,6 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
         "duplicate_event_count": audit_file.duplicate_event_count,
         "engine_ids": audit_file.engine_ids,
     }
-    if audit_file.validation_status == AuditFile.STATUS_INVALID:
-        body["error"] = audit_file.validation_error
     return JsonResponse(body, status=response_status)
 
 
@@ -3335,7 +3369,7 @@ class UploadRefused(Exception):
         self.received = received
 
 
-def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
+def verified_audit_bytes(request: HttpRequest) -> bytes:
     """Read the upload body, refusing anything that cannot be trusted whole.
 
     A transfer cut mid-body (app killed, mobile link dropped, socket write timed
@@ -3364,8 +3398,8 @@ def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
 
     install_max_dump_size_upload_handler(request)
     try:
-        audit_bytes, source_name, content_type = audit_bytes_from_request(request)
-    except TooManyFilesSent as exc:
+        audit_bytes = audit_bytes_from_request(request)
+    except (TooManyFilesSent, TooManyFieldsSent) as exc:
         # More parts than DATA_UPLOAD_MAX_NUMBER_FILES: same 413 as an oversized
         # body so a multi-part memory-exhaustion attempt cannot bypass the ceiling.
         raise UploadRefused(
@@ -3414,31 +3448,33 @@ def verified_audit_bytes(request: HttpRequest) -> tuple[bytes, str, str]:
             declared=declared,
             received=received,
         )
-    return audit_bytes, source_name, content_type
+    return audit_bytes
 
 
 def install_max_dump_size_upload_handler(request: HttpRequest) -> None:
     if is_multipart_request(request):
-        request.upload_handlers.insert(0, MaxDumpSizeUploadHandler(request))
+        request.upload_handlers = [MaxDumpSizeUploadHandler(request)]
 
 
-def audit_bytes_from_request(request: HttpRequest) -> tuple[bytes, str, str]:
+def audit_bytes_from_request(request: HttpRequest) -> bytes:
     if request.FILES:
+        if sum(len(files) for _, files in request.FILES.lists()) != 1:
+            raise TooManyFilesSent
         upload = (
             request.FILES.get("audit_log")
             or request.FILES.get("dump")
             or next(iter(request.FILES.values()))
         )
-        return read_upload_bytes(upload), upload.name, getattr(upload, "content_type", "")
+        return read_upload_bytes(upload)
     if is_multipart_request(request):
         # The parser consumed the multipart body and found no file part (an
         # empty form, or a transfer cut before the part completed). request.body
         # is unavailable after that read and would raise; there is nothing to
         # ingest either way.
-        return b"", "", ""
+        return b""
     if request.body:
-        return request.body, "", request.content_type or ""
-    return b"", "", ""
+        return request.body
+    return b""
 
 
 def read_upload_bytes(upload) -> bytes:
@@ -3447,9 +3483,8 @@ def read_upload_bytes(upload) -> bytes:
     if upload_size is not None and upload_size > max_dump_bytes:
         raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
 
-    # Multipart uploads larger than FILE_UPLOAD_MAX_MEMORY_SIZE have already
-    # spooled to disk. Read at most one byte beyond the accepted limit instead
-    # of retaining a chunk list and then allocating a second full-size join.
+    # Also bound reads from internal callers; the API's multipart handler uses
+    # only memory, so invalid uploads never create temporary raw files.
     data = upload.read(max_dump_bytes + 1)
     if len(data) > max_dump_bytes:
         raise RequestDataTooBig(UPLOAD_TOO_LARGE_ERROR)
@@ -3509,8 +3544,7 @@ def record_upload_rejection(
 ) -> None:
     """Persist the refusal for operators; best effort.
 
-    Reads only headers and the URL -- never ``request.POST``/``request.body`` --
-    because several refusals exist precisely so the body is *not* read. The row
+    Uses only the fixed refusal code and numeric transport counts. The row
     is a side effect of a response already decided, so a database failure here
     is logged rather than allowed to turn a deliberate 400/413 into a 500.
     """
@@ -3521,59 +3555,17 @@ def record_upload_rejection(
             status_code=refusal.status,
             declared_content_length=refusal.declared,
             received_bytes=refusal.received,
-            content_type=(request.content_type or "")[:120],
-            group_slug=rejected_upload_group_slug(request, group_slug),
-            source_device_label=request.headers.get("X-Goggles-Device-Label", "")[:255],
-            source_platform=request.headers.get("X-Goggles-Platform", "")[:120],
-            source_app_version=request.headers.get("X-Goggles-App-Version", "")[:120],
-            source_ip=client_ip(request),
-            user_agent=request.headers.get("User-Agent", "")[:5000],
         )
     except DatabaseError:
-        logger.exception("could not record upload rejection")
-
-
-def rejected_upload_group_slug(request: HttpRequest, group_slug: str | None) -> str:
-    """The fallback group a rejected attempt targeted, from URL/query/header only."""
-    candidate = group_slug or request.GET.get("group") or request.headers.get("X-Goggles-Group")
-    if not candidate:
-        return ""
-    return slugify(candidate)[:160] or "incoming"
-
-
-def source_metadata_from_request(request: HttpRequest) -> dict[str, str]:
-    # Account identity (account_label, account_pubkey_hex) now arrives in the
-    # JSONL body via the source_context object and is backfilled onto the
-    # AuditFile at ingest -- it is no longer sent as an X-Goggles-* header.
-    # Likewise device_id/device_name/upload_trigger/account_npub, when present,
-    # ride along in source_context. Only the device label, platform, and app
-    # version are still carried as upload headers (alongside Authorization).
-    return {
-        "source_device_label": request.POST.get("device_label")
-        or request.headers.get("X-Goggles-Device-Label", ""),
-        "source_platform": request.POST.get("platform")
-        or request.headers.get("X-Goggles-Platform", ""),
-        "source_app_version": request.POST.get("app_version")
-        or request.headers.get("X-Goggles-App-Version", ""),
-    }
+        logger.warning("could not record upload rejection")
 
 
 def source_response(audit_file: AuditFile) -> dict[str, str]:
-    response = {
-        "account_label": audit_file.source_account_label,
-        "device_label": audit_file.source_device_label,
-        "platform": audit_file.source_platform,
-        "app_version": audit_file.source_app_version,
+    return {
+        key: getattr(audit_file, "source_" + key)
+        for key in ("platform", "hardware_model", "app_version", "device_id", "upload_trigger")
+        if getattr(audit_file, "source_" + key)
     }
-    optional = {
-        "device_id": audit_file.source_device_id,
-        "device_name": audit_file.source_device_name,
-        "upload_trigger": audit_file.source_upload_trigger,
-        "account_pubkey_hex": audit_file.source_account_pubkey_hex,
-        "account_npub": audit_file.source_account_npub,
-    }
-    response.update({key: value for key, value in optional.items() if value})
-    return response
 
 
 def fallback_group_from_request(

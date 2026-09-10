@@ -2,7 +2,7 @@
 
 ## Audit Evidence Retention
 
-The web container prunes aged audit evidence on every startup (migrations, then
+The web container normally prunes aged audit evidence on startup (migrations, then
 `prune_audit_data`, then `collectstatic` and gunicorn — see
 `docker-compose.yml`). Retention defaults to 14 days and is configurable via
 `GOGGLES_AUDIT_RETENTION_DAYS`; uploads (and their events) older than the window
@@ -13,107 +13,108 @@ no-op startups skip the VACUUM. Preview what would be pruned with
 `uv run python manage.py prune_audit_data --dry-run`, or override the window for
 a one-off run with `uv run python manage.py prune_audit_data --retention-days N`.
 
-## Upload Limits and Rejected Uploads
+## V4-only acceptance and historical data reset
 
-Marmot clients refuse to upload a segment larger than 64 MiB, so the server accepts
-exactly that (`GOGGLES_MAX_DUMP_BYTES`, default 64 MiB). The record cap
-`GOGGLES_MAX_DUMP_RECORDS` defaults to `GOGGLES_MAX_DUMP_BYTES // 256` (262,144 at
-64 MiB), derived rather than fixed so it cannot become the binding limit when the
-byte ceiling changes: the smallest line that passes validation is 138 bytes and
-real audit lines run 600–1,000, so only a pathological tiny-line body ever hits
-it. The limits are layered and must stay in this order:
+The [read-only production inventory](v4-cutover-inventory-2026-09-10.md) records
+the initial dry-run counts and known backup copies.
 
-| Layer | Limit | Why |
-| --- | --- | --- |
-| Marmot client | 64 MiB per file | Anything the client would send must be accepted somewhere, or it is re-posted forever. |
-| Django (`GOGGLES_MAX_DUMP_BYTES`) | 64 MiB | Decides the 413 on the `Content-Length` header before reading, and records it. The header check applies to non-multipart bodies; a multipart body is bounded while its file part streams, so multipart framing is not counted against the 64 MiB. |
-| Caddy `request_body max_size` | 68MiB | Safety net only. Must exceed Django's limit: a body Caddy refuses leaves no server-side record beyond the edge access log, which rotates daily and is age-bounded to 14 days. |
+This is a staged, destructive cutover. Implementation does not authorize the
+production purge. Older clients intentionally receive HTTP 400 until they emit
+v4 files. Do not rename or translate legacy files to bypass the boundary.
 
-Each authenticated attempt the upload API refuses before ingesting is recorded as
-an `UploadRejection` (reason `incomplete_body`, `too_large`, `too_many_parts`,
-`length_required`, or `malformed_body`; declared vs received bytes; client platform/version headers;
-token; IP). Recording is best effort: the row is written after the response is
-decided, and a database or transaction failure is logged (`could not record upload
-rejection`) rather than turned into a 500, so a missing row does not prove no
-refusal occurred; check the application log for that message when the edge log
-shows a 4xx with no matching row. Rejections appear on the **Upload logs** page,
-in the admin under *Upload rejections*, and are pruned by `prune_audit_data` on
-the same retention window as evidence. A body shorter than its `Content-Length` is refused with `400`
-and **not** ingested: gunicorn hands Django whatever arrived before the connection
-closed, and until this check the truncated prefix was ingested, its cut-off last
-line quarantined, and the client (seeing a 400) re-posted the whole file anyway.
+### Schema and deployment gate
 
-Memory: one 64 MiB upload holds the raw bytes, the decoded text, and every parsed
-line in the worker while it ingests. Measured locally (gunicorn, one worker, a
-64 MiB / 71,365-line synthetic log): worker RSS peaked at **1.23 GiB**, i.e. about
-19× the body. With the default `3 workers × 4 threads` the worst case of twelve
-simultaneous maximum-size uploads is ~14.7 GiB, inside the 16 GiB
-`GOGGLES_WEB_MEMORY_LIMIT` but with little headroom; lower `GOGGLES_WEB_THREADS`
-if such uploads are ever concurrent in practice. A maximum-size ingest can also
-take longer than a mobile client's read timeout; the client then reports a
-failure, but its re-post of the identical body is answered `200` immediately
-because the file is already stored.
+The committed `docs/schemas/audit-log-event.v4.schema.json` is a byte-for-byte
+copy of MDK's finalized `crates/marmot-forensics/schema/audit-log-event.v4.schema.json`.
+Its SHA-256 is `7da683d30c3ab5ae9a11c9998e61634d41cfd242c95bbf01bd98aadc54b60200`.
+The source task confirmed this field set on 2026-09-10, initially on
+`codex/audit-v4` based on `c1289eedaa62813da1876605d29d42e7e43ce84b`.
+Before deployment, record the final MDK commit and compare both checksums again.
+Do not deploy if they differ. Run `just check`, `just ci`, and
+`just validate-schema fixtures/*.jsonl` on the final Goggles revision.
+Also confirm MDK's actual emitted value domains against the documented Goggles
+storage/display limits in [the upload contract](api-v1.md#v4-upload-rejection-diagnostics):
+engine IDs and other bounded columns, integer ranges, reference widths and the
+year-2100 wall-time ceiling. Exercise representative maximum-sized MDK segments.
+A schema-valid value outside these limits rejects the whole file with
+`storage_limit_exceeded`; that engine cannot upload that segment until its values
+or Goggles' limits are corrected. Treat this compatibility check as a deployment
+gate, not evidence established by the schema checksum alone.
 
-### Deploying the new limits
+1. Inventory the existing installation, database, backups and exports before
+   changing it. Record a production `purge_audit_data --dry-run` count (using
+   `docker compose exec -T web python manage.py purge_audit_data --dry-run`).
+   The existing command counts uploads, events, groups, reports and rejections;
+   the new command additionally counts every projection table.
+2. Pause uploads on **all** old workers and drain/stop them, including in-flight
+   ingestion and exports. Keep exports disabled during the cutover with
+   `GOGGLES_EXPORTS_ENABLED=0`. An already streaming export must be drained;
+   changing the flag does not terminate it. Do not permit a rolling deployment
+   to leave a v1-v3 accepting worker reachable.
+3. Deploy the v4-only release and apply migrations. Migration 0015 removes the
+   old source-label/pubkey columns, adds `source_hardware_model`, and removes
+   sensitive metadata columns from the existing rejection table. It does not purge raw evidence or reports.
+   **Normal Compose startup also runs retention pruning.** Before any restart,
+   set `GOGGLES_PRUNE_ON_STARTUP=0` in the deployment environment. Keep it at 0
+   until deletion is authorized. The new Compose command then runs migrations,
+   collectstatic and gunicorn without pruning. Existing old workers do not honor
+   this flag: stop/drain them before recreating with the new Compose definition.
+4. Re-enable uploads only on v4-only workers. Test authenticated raw NDJSON and
+   multipart requests with synthetic invalid/legacy/mixed bodies; they must
+   return 400 with no new `AuditFile`, `AuditEvent`, group or projection rows.
+   Rejections contain only time, credential reference, declared/received byte
+   counts, HTTP status, fixed reason code and optional line number. Requests
+   with multiple file parts
+   return 413 and store no evidence. Test a synthetic valid v4 record as well.
+   Never use actual private data for these probes. Source metadata is derived
+   from validated body source contexts; client filenames, source headers and
+   form metadata do not populate file identity. Segments without source context
+   are valid. Hardware model must be a system model, never a user-assigned name,
+   hostname or serial number; its provenance is enforced by the MDK producer,
+   not by guessing from arbitrary strings in Goggles.
+5. Confirm the new boundary is the only reachable ingress, then pause v4 uploads
+   briefly and drain in-flight requests for an exact reset. Run the **new**
+   `purge_audit_data --dry-run` and retain counts, timestamp and release revision.
+   Obtain explicit approval for these concrete production counts before step 6.
+6. **Only after approval**, execute:
+   `docker compose exec -T web python manage.py purge_audit_data --confirm-delete-audit-data`.
+   This deletes audit uploads, raw events, group workspaces, derived projections,
+   saved reports and upload-rejection records. Users, permissions, sessions,
+   upload tokens and personal access tokens remain intact. Verify all audit
+   counts are zero using another `--dry-run` while uploads are still paused.
+7. Resume v4 uploads and exports. Verify a new valid v4 file and its projections.
+   Replay synthetic legacy and forbidden-field uploads; assert evidence counts
+   do not increase (a body-free rejection record may increase). Resume normal
+   retention startup behavior (`GOGGLES_PRUNE_ON_STARTUP=1`) only after the
+   deletion approval is fulfilled.
 
-1. A production `.env` copied from an older `.env.example` pins
-   `GOGGLES_MAX_DUMP_BYTES=52428800` and `GOGGLES_MAX_DUMP_RECORDS=50000`. Set the
-   byte value to `67108864` and remove the records line; otherwise the settings
-   defaults in this release never apply and the old ceilings remain in force.
-2. Apply `deploy/Caddyfile.goggles.ipf.dev` on the host, create `/var/log/caddy`
-   writable by the caddy user, and reload Caddy.
-3. Recreate the web service so the gunicorn access-log flags and the new
-   environment take effect; the migration runs at startup:
+The acceptance boundary must be deployed **before** the purge. Never roll back
+to a legacy-accepting application after the reset. If v4 needs rollback, disable
+uploads/exports and roll forward with a corrected v4-only build. Restoring an old
+backup reintroduces prohibited data and requires a separate, approved cleanup.
 
-   ```sh
-   export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
-   docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web
-   ```
+### Backups and exported copies: separate inventory
 
-### Investigating rejected or missing uploads
+A database purge is not deletion of every historical copy. Inventory each
+storage location by owner, location, creation range, retention and deletion
+status, without copying raw contents into a ticket or report:
 
-- `docker compose logs web` carries a gunicorn access line per request:
-  `time "METHOD path" status bytes durations cl=<Content-Length> platform=<X-Goggles-Platform> app=<X-Goggles-App-Version>`.
-  Count non-2xx by status and platform, or look at the duration column (`%(L)s`)
-  for the request-time distribution during an incident window.
-- Caddy's access log (`/var/log/caddy/goggles-access.log`, JSON, rotated daily,
-  kept 14 days)
-  is the only record of requests Caddy refused itself (413 over `max_size`,
-  client aborts). Filter on `"status":413` and group by
-  `request.headers.User-Agent`.
-- A device whose file never gets through shows up as repeated `too_large`
-  rejections from the same token/platform; a lossy or overloaded path shows up
-  as `incomplete_body` rejections whose `received_bytes` vary per attempt.
-  `received_bytes` is known only when the client closed the connection cleanly;
-  a connection reset discards what gunicorn had buffered, so those rows record
-  it as unknown (`null`).
+- Postgres volume, replicas, WAL archives, PITR retention and managed snapshots.
+- Repository/deployment `backups/` SQL dumps and compressed database archives;
+  filesystem/VM snapshots and backup jobs, including offsite destinations.
+- Raw JSONL downloads, group NDJSON exports, agent-state JSON, saved report JSON,
+  analyst workspaces and downstream CGKA pipeline inputs/archives.
+- Proxy/application log stores and error-monitoring retention; review configured
+  request logging without printing credential values or request bodies.
 
-## Audit Redesign Cutover
+Use read-only provider listings and file metadata. Do not make a fresh copy of
+historical sensitive data by default. Any required rollback backup retains the
+same sensitive data and must have an explicitly recorded owner and expiry.
+Purge approvals for the live DB do not authorize deletion of these other copies.
 
-The audit-log redesign does not require dropping the whole database. Keep the
-existing database so Django users, groups, permissions, sessions, and reusable
-upload tokens remain intact.
-
-Recommended cutover:
-
-1. Take a database backup or managed snapshot.
-2. Pause audit uploads by setting `GOGGLES_UPLOADS_ENABLED=0` and restarting the
-   app process.
-3. Deploy the new code.
-4. Run migrations with `uv run python manage.py migrate`.
-5. Inspect current audit-data counts:
-   `uv run python manage.py purge_audit_data --dry-run`.
-6. Purge only forensic audit data:
-   `uv run python manage.py purge_audit_data --confirm-delete-audit-data`.
-7. Resume audit uploads by setting `GOGGLES_UPLOADS_ENABLED=1` and restarting
-   the app process.
-
-The purge command deletes audit uploads, raw events, group workspaces, derived
-projections, saved reports, and recorded upload rejections. It preserves user
-accounts and upload tokens.
-
-On large Postgres databases, run `VACUUM ANALYZE` after the purge if reclaiming
-space or refreshing planner statistics matters for the deployment window.
+`VACUUM ANALYZE` makes deleted space reusable and updates statistics; it is not
+secure erasure, and does not remove old backups, WAL or exported files. Coordinate
+physical retention/erasure separately with the storage operator.
 
 ## Streaming Group Export
 
@@ -143,6 +144,32 @@ Capacity model — size the database for it:
 The edge proxy (Caddy) streams `reverse_proxy` responses by default, so no proxy
 change is required; `nginx` serves only static assets and is not in the export
 request path.
+
+## Upload capacity model
+
+The default is three workers with **two threads each**, limiting concurrent
+requests to six across the container. This is lower than the previous four-thread
+setting because v4 multipart uploads must stay in RAM until validation. Update
+existing explicit `GOGGLES_WEB_THREADS=4` overrides too; rebuilding an image does
+not replace operator environment settings. Streaming exports share these slots.
+
+Budget for the multipart `BytesIO`, its bytes read copy, decoded text, parsed
+records, normalized values and projection/database work, plus worker baseline
+and concurrent exports. The pre-v4 capacity exercise measured approximately
+1.23 GiB RSS for a 64 MiB upload (about 19 times the body). That is historical
+baseline evidence, **not a v4 peak-memory measurement**. The extra in-memory
+multipart buffer and allocation transients require more headroom. The former
+12-slot extrapolation was already about 14.7 GiB under the default 16 GiB
+container limit; do not use that concurrency for the v4 cutover without new
+measurements.
+
+Before deployment, load-test synthetic near-limit v4 multipart and raw uploads
+at the configured concurrency together with representative exports. Record peak
+container RSS, latency, OOM/restart count and rejection outcomes. Keep substantial
+headroom below `GOGGLES_WEB_MEMORY_LIMIT`; reduce workers/threads or the upload
+ceiling if needed. The two-thread default is a conservative reduction, not a
+substitute for that measurement. Never regain memory headroom by spooling
+unvalidated uploads to disk.
 
 ## Memory-pressure deployment
 
@@ -183,3 +210,37 @@ swap. CPU, PID, and Docker log rotation limits are configurable through the
 adjacent `GOGGLES_WEB_*` settings. During an incident, set
 `GOGGLES_WEB_WORKERS=1` before the recreate to prevent concurrent amplification;
 restore the measured production worker count only after memory remains stable.
+
+## Upload body integrity and operational diagnostics
+
+V4 retains the transport checks introduced before this cutover: missing
+Content-Length returns 411; a truncated body or malformed multipart returns 400;
+oversized bodies or multiple file parts return 413. No prefix is ingested.
+The default file limit is 64 MiB; Caddy's 68 MiB limit leaves room for multipart
+framing. The record limit defaults to the byte limit divided by 256.
+
+Rejection persistence is best effort and contains only the approved operational
+fields listed above. A database failure records a fixed warning without exception
+values or SQL. Upload request events are suppressed from GlitchTip/Sentry,
+including arbitrary exception values and breadcrumbs. Gunicorn access logs contain time, method, status, response size
+and duration; Caddy removes the entire request object. Apply the committed Caddy
+configuration as part of deployment, validate it and reload Caddy before exposing
+the new ingress. Existing proxy/container/error-monitoring logs remain part of
+the separate historical-copy inventory. Do not log source headers for diagnosis.
+
+These privacy settings intentionally limit attribution: edge refusals can be
+counted by status/time but cannot be assigned to a client, group or endpoint.
+Do not reconstruct those values from request logs. Django's body-free rejection
+records support credential-level attribution only after a request reaches the
+application. Unexpected upload exceptions outside the ingestion guard are also
+suppressed from external telemetry; aggregate HTTP 500 monitoring will not
+provide their stack traces. Any future endpoint diagnostics must use fixed
+server-side route names and exclude request values, exception messages, frame
+locals and breadcrumbs. Do not restore literal URIs or exception payloads as a
+workaround.
+
+Multipart files are buffered only in memory under the upload size limit;
+unvalidated bytes never spool to temporary files. Validation occurs before
+deduplication as well as before persistence. A previously
+stored hash never authorizes a legacy replay. All evidence and projection writes
+are atomic; a later ingestion failure rolls them back and returns a fixed error.

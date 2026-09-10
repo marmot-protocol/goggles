@@ -61,12 +61,12 @@ class Command(BaseCommand):
                     f"{user.username}"
                 )
             )
-        for audit_file, created in seeded_files:
+        for audit_file, created, source_name in seeded_files:
             verb = "imported" if created else "already present"
             groups = ", ".join(audit_file.group_refs) or "no group refs"
             self.stdout.write(
                 self.style.SUCCESS(
-                    f"Sample audit log {verb}: {audit_file.source_name}, "
+                    f"Sample audit log {verb}: {source_name}, "
                     f"groups {groups}, {audit_file.valid_event_count} events"
                 )
             )
@@ -102,22 +102,14 @@ class Command(BaseCommand):
         return user, True
 
     def seed_log(self, log: SeededLog):
-        # Account label and pubkey are intentionally left to body backfill from
-        # the JSONL source_context (mirroring how real recorders now send them);
-        # device label and platform are the header-equivalent upload metadata.
+        # Source identity comes only from validated v4 body metadata.
         result = ingest_audit_log_bytes(
             dump_bytes=log.dump_bytes,
-            source_name=log.source_name,
-            source_device_label=log.device_label,
-            source_platform=log.platform,
-            content_type="application/x-ndjson",
         )
-        return result.audit_file, result.created
+        return result.audit_file, result.created, log.source_name
 
     def seed_fixture(self, fixture_path: Path):
         result = ingest_audit_log_bytes(
             dump_bytes=fixture_path.read_bytes(),
-            source_name=fixture_path.name,
-            content_type="application/x-ndjson",
         )
-        return result.audit_file, result.created
+        return result.audit_file, result.created, fixture_path.name

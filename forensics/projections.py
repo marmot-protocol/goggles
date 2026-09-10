@@ -39,9 +39,7 @@ NETWORK_EVENT_TYPES = {
     "publish_failure",
 }
 CONVERGENCE_EVENT_TYPES = {"convergence_run_state", "convergence_decision"}
-AUDIT_SCHEMA_VERSION_V2 = "marmot-forensics-audit/v2"
-AUDIT_SCHEMA_VERSION_V3 = "marmot-forensics-audit/v3"
-PROJECTION_AUDIT_SCHEMA_VERSIONS = {AUDIT_SCHEMA_VERSION_V2, AUDIT_SCHEMA_VERSION_V3}
+PROJECTION_AUDIT_SCHEMA_VERSIONS = {"marmot-forensics-audit/v4"}
 INFERRED_CONVERGENCE_TERMINAL_PHASES = {
     "applied",
     "blocked",

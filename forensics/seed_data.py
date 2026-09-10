@@ -11,10 +11,9 @@ gaps, group-state and epoch changes, and a fork/convergence decision.
 
 A "participant" in goggles is a distinct engine that logged events for a
 shared ``group_ref``; an N-participant group is therefore N separate uploaded
-audit logs that reference one ``group_ref``. Each participant's account label,
-pubkey, and device ride in the JSONL body via ``source_context`` (the same
-place real recorders now put them), so the seeded app exercises the
-body-derived identity path rather than upload headers.
+audit logs that reference one ``group_ref``. Each participant's platform and system model
+ride in the validated JSONL ``source_context``. Accounts and devices use opaque
+identifiers; the seeded app exercises body-derived metadata.
 
 Everything is derived deterministically from human labels via SHA-256, so
 re-seeding (``just reset-db``) reproduces byte-identical logs.
@@ -28,9 +27,7 @@ from dataclasses import dataclass
 
 from django.template.defaultfilters import slugify
 
-SCHEMA_V2 = "marmot-forensics-audit/v2"
-OBFUSCATED = "obfuscated_sensitive_data"
-FULL_DATA = "full_data"
+SCHEMA_V4 = "marmot-forensics-audit/v4"
 
 # Relays the synthetic recorders publish through / receive from. Real public
 # Nostr relays, used only as plausible-looking strings in seed data.
@@ -51,7 +48,7 @@ def _hex32(label: str) -> str:
 @dataclass(frozen=True)
 class Participant:
     name: str
-    device_label: str
+    hardware_model: str
     platform: str
 
     @property
@@ -63,10 +60,6 @@ class Participant:
         return _hex32(f"engine:{self.name}")
 
     @property
-    def account_pubkey_hex(self) -> str:
-        return _hex64(f"pubkey:{self.name}")
-
-    @property
     def session_id(self) -> str:
         return f"recorder-{self.engine_id[:8]}"
 
@@ -76,10 +69,8 @@ class SeededLog:
     """One participant's audit log, ready to hand to ``ingest_audit_log_bytes``."""
 
     source_name: str
-    account_label: str
-    device_label: str
+    hardware_model: str
     platform: str
-    account_pubkey_hex: str
     jsonl: str
 
     @property
@@ -115,17 +106,15 @@ class GroupScript:
         participant: Participant,
         kind: dict,
         *,
-        mode: str = FULL_DATA,
         context: dict | None = None,
     ) -> None:
         seq = self._seqs[participant.name]
         self._seqs[participant.name] = seq + 1
         event = {
-            "schema_version": SCHEMA_V2,
+            "schema_version": SCHEMA_V4,
             "seq": seq,
             "wall_time_ms": self.clock,
             "recorder_session_id": participant.session_id,
-            "audit_data_mode": mode,
             "account_ref": participant.account_ref,
             "engine_id": participant.engine_id,
             "group_ref": self.group_ref,
@@ -138,44 +127,14 @@ class GroupScript:
     # -- narrative beats ---------------------------------------------------
 
     def start(self, participant: Participant) -> None:
-        """Bootstrap a participant's log: recorder up, then forensic capture on.
-
-        The recorder comes up in obfuscated mode (where the schema forbids a
-        pubkey in ``source``), escalates to full-data capture, then records the
-        account pubkey via a full-data ``source_context`` event. Account
-        identity therefore arrives in the JSONL body -- the path goggles now
-        relies on -- rather than upload headers.
-        """
-        self.emit(
-            participant,
-            {"type": "recorder_started", "recorder": "mdk"},
-            mode=OBFUSCATED,
-            context={
-                "source": {
-                    "account_label": participant.name,
-                    "device_name": participant.device_label,
-                    "platform": participant.platform,
-                }
-            },
-        )
-        self.emit(
-            participant,
-            {
-                "type": "audit_data_mode_changed",
-                "previous_mode": OBFUSCATED,
-                "new_mode": FULL_DATA,
-                "reason": "forensic_capture_enabled",
-                "recorder_restarted": True,
-            },
-        )
+        """Bootstrap a recorder with only v4 system metadata."""
+        self.emit(participant, {"type": "recorder_started", "recorder": "mdk"})
         self.emit(
             participant,
             {
                 "type": "source_context",
                 "source": {
-                    "account_label": participant.name,
-                    "account_pubkey_hex": participant.account_pubkey_hex,
-                    "device_name": participant.device_label,
+                    "hardware_model": participant.hardware_model,
                     "platform": participant.platform,
                 },
             },
@@ -208,24 +167,15 @@ class GroupScript:
         observed_by = recipients if observed_by is None else observed_by
         msg_id = self._next_msg_id(sender)
         payload_digest = _hex64(f"payload:{msg_id}")
-        author = {"member_ref": sender.account_ref, "account_pubkey_hex": sender.account_pubkey_hex}
 
         self.emit(
             sender,
             {
-                "type": "message_content_decoded",
+                "type": "message_state_changed",
                 "msg_id": msg_id,
-                "artifact_kind": "application_message",
-                "author": author,
-                "decoded_payload": {"content_type": "text/plain", "text": text},
-                "decoded_app_event": {
-                    "format": "nostr",
-                    "kind": 9,
-                    "content": text,
-                    "pubkey_hex": sender.account_pubkey_hex,
-                },
+                "new_state": "processed",
+                "reason": "application_message",
             },
-            mode=FULL_DATA,
         )
         self.emit(
             sender,
@@ -240,7 +190,6 @@ class GroupScript:
                     "expected_count": len(recipients),
                 },
             },
-            mode=FULL_DATA,
         )
         self.emit(
             sender,
@@ -300,13 +249,11 @@ class GroupScript:
             self.emit(
                 recipient,
                 {
-                    "type": "message_content_decoded",
+                    "type": "message_state_changed",
                     "msg_id": msg_id,
-                    "artifact_kind": "application_message",
-                    "author": author,
-                    "decoded_payload": {"content_type": "text/plain", "text": text},
+                    "new_state": "processed",
+                    "reason": "application_message",
                 },
-                mode=FULL_DATA,
             )
         return msg_id
 
@@ -317,13 +264,12 @@ class GroupScript:
             {
                 "type": "group_state_changed",
                 "epoch": epoch,
-                "change_kind": "topic_changed",
+                "change_kind": "group_renamed",
                 "actor_member_ref": actor.account_ref,
                 "origin_commit_id": commit_id,
                 "fields": ["topic"],
-                "value": {"digest": _hex64(f"topic:{self.name}:{text}"), "text": text},
+                "value": {"digest": _hex64(f"topic:{self.name}:{text}"), "len": len(text.encode())},
             },
-            mode=FULL_DATA,
         )
 
     def promote_admin(
@@ -349,7 +295,6 @@ class GroupScript:
                 "from_epoch": from_epoch,
                 "to_epoch": to_epoch,
             },
-            mode=FULL_DATA,
             context={
                 "operation_id": f"op-promote-{slugify(subject.name)}",
                 "human_action": {
@@ -373,7 +318,6 @@ class GroupScript:
                 "origin_commit_id": commit_id,
                 "fields": ["admins"],
             },
-            mode=FULL_DATA,
         )
 
     def commit_epoch(
@@ -395,7 +339,6 @@ class GroupScript:
                 "pending_ref": epoch,
                 "pending_kind": "commit",
             },
-            mode=FULL_DATA,
         )
 
     def resolve_fork(self, actor: Participant, run_id: str, *, tip_epoch: int) -> None:
@@ -443,20 +386,7 @@ class GroupScript:
                         },
                     },
                 ],
-                "rule_trace": [
-                    {
-                        "rule_name": "highest_weight",
-                        "scope": "candidate_pair",
-                        "candidate_branch_id": winner,
-                        "other_candidate_branch_id": loser,
-                        "inputs": {"branch_a_weight": 9, "branch_b_weight": 2},
-                        "result": {"winner": winner},
-                        "decisive": True,
-                        "selected_branch_id": winner,
-                    }
-                ],
             },
-            mode=FULL_DATA,
             context={"convergence": {"run_id": run_id, "phase": "selected"}},
         )
 
@@ -552,26 +482,6 @@ class GroupScript:
                 ],
                 "losing_branch_ids": [branch_a, branch_b],
                 "error_kinds": ["no_eligible_branch"],
-                "rule_trace": [
-                    {
-                        "rule_name": "witness_quorum",
-                        "scope": "candidate",
-                        "candidate_branch_id": branch_a,
-                        "inputs": {"required_witnesses": 2, "observed_witnesses": 1},
-                        "result": {"eligible": False},
-                        "decisive": True,
-                        "rejected_branch_id": branch_a,
-                    },
-                    {
-                        "rule_name": "witness_quorum",
-                        "scope": "candidate",
-                        "candidate_branch_id": branch_b,
-                        "inputs": {"required_witnesses": 2, "observed_witnesses": 1},
-                        "result": {"eligible": False},
-                        "decisive": True,
-                        "rejected_branch_id": branch_b,
-                    },
-                ],
             },
             context={"convergence": {"run_id": run_id, "phase": "evaluating"}},
         )
@@ -646,10 +556,8 @@ class GroupScript:
             logs.append(
                 SeededLog(
                     source_name=f"{slugify(self.name)}-{slugify(participant.name)}.jsonl",
-                    account_label=participant.name,
-                    device_label=participant.device_label,
+                    hardware_model=participant.hardware_model,
                     platform=participant.platform,
-                    account_pubkey_hex=participant.account_pubkey_hex,
                     jsonl=jsonl,
                 )
             )
