@@ -59,9 +59,10 @@ interchangeable.
 
 - `prune_audit_data` enforces audit evidence retention (default 14 days,
   `GOGGLES_AUDIT_RETENTION_DAYS`) by deleting aged uploads, events, and recorded
-  upload rejections (`UploadRejection`, which carry an IP and user agent), then
-  rebuilding the touched groups' projections. The web container runs it on every
-  startup in `docker-compose.yml`, so every deploy/restart prunes. It is distinct
+  body-free upload rejections (`UploadRejection`), then
+  rebuilding the touched groups' projections. The web container runs it on
+  startup by default in `docker-compose.yml`; set `GOGGLES_PRUNE_ON_STARTUP=0`
+  for the v4 boundary deployment before deletion is approved. It is distinct
   from `purge_audit_data`, which wipes *all* audit data but still requires
   `--confirm-delete-audit-data`.
 - Keep upload and forensic behavior grounded in the JSONL schema and existing
@@ -71,3 +72,17 @@ interchangeable.
 - Do not log bearer tokens or raw upload bodies.
 - Keep UI changes compact and operational; this is an internal investigation
   tool, not a marketing surface.
+
+## V4 acceptance boundary
+
+- The committed `docs/schemas/audit-log-event.v4.schema.json` must match MDK's
+  finalized schema byte for byte. Accept only valid complete v4 files.
+- Validate before deduplication or any raw-body/raw-line write; no quarantine
+  persistence for rejected files, including multipart and internal callers.
+- Never consume account/device labels or names from headers or form metadata.
+  Source metadata comes from validated bodies; hardware_model is system model
+  information supplied by MDK, never a user-assigned device name.
+- Keep rejection diagnostics to fixed reasons, status, time, byte counts,
+  optional line number and credential reference. Do not log request values.
+- Follow `docs/deployment.md`: deploy the boundary before an explicitly approved
+  historical purge. Implementation does not authorize production deletion.

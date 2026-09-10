@@ -267,7 +267,7 @@
 <section class="card card--flush">
   <header class="card__header">
     <span class="card__title">Engines and devices</span>
-    <span class="is-muted">source labels from uploads and V2 context</span>
+    <span class="is-muted">platform, system model and opaque identifiers</span>
   </header>
   <div class="card__body table-scroll">
     {% if overview.engines_limited %}
@@ -293,32 +293,18 @@
                 <span class="is-mono is-muted">{{ engine.engine_id|truncatechars:13 }}</span>
               </td>
               <td class="is-wrap">
-                {% for label in engine.source_metadata.account_labels %}
-                  <span class="badge">{{ label }}</span>
-                {% empty %}
-                  {% if not engine.account_refs and not engine.source_metadata.account_pubkeys_hex %}<span class="is-muted">–</span>{% endif %}
-                {% endfor %}
-                {% for pubkey in engine.source_metadata.account_pubkeys_hex %}
-                  <br><span class="is-mono is-muted" title="{{ pubkey }}">{{ pubkey|truncatechars:17 }}</span>
-                {% endfor %}
                 {% for account_ref in engine.account_refs %}
                   <br><span class="is-mono is-muted" title="{{ account_ref }}">{{ account_ref|truncatechars:13 }}</span>
                 {% endfor %}
-                {% for npub in engine.source_metadata.account_npubs %}
-                  <br><span class="is-mono is-muted" title="{{ npub }}">{{ npub|truncatechars:24 }}</span>
-                {% endfor %}
               </td>
               <td class="is-wrap">
-                {% for name in engine.source_metadata.device_names %}
-                  <span class="badge">{{ name }}</span>
-                {% endfor %}
-                {% for label in engine.source_metadata.device_labels %}
-                  <span class="badge">{{ label }}</span>
+                {% for model in engine.source_metadata.hardware_models %}
+                  <span class="badge">{{ model }}</span>
                 {% endfor %}
                 {% for device_id in engine.source_metadata.device_ids %}
                   <br><span class="is-mono is-muted" title="{{ device_id }}">{{ device_id|truncatechars:18 }}</span>
                 {% empty %}
-                  {% if not engine.source_metadata.device_names and not engine.source_metadata.device_labels %}<span class="is-muted">–</span>{% endif %}
+                  {% if not engine.source_metadata.hardware_models %}<span class="is-muted">–</span>{% endif %}
                 {% endfor %}
               </td>
               <td class="is-wrap">

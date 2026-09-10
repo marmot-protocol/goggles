@@ -2,11 +2,10 @@
 
 Internal Marmot audit-log explorer.
 
-Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from MDK clients (current safe-only schema `marmot-forensics-audit/v3`; legacy `v1` and `v2` are still accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
+Goggles accepts sensitive `marmot-forensics-audit` JSONL audit logs from MDK clients (only `marmot-forensics-audit/v4` is accepted), preserves the exact uploaded text and raw lines, normalizes common forensic columns into PostgreSQL tables, and gives the team a login-gated dashboard for comparing what multiple account-device engines saw and decided inside each group.
 
-The current and legacy normalized audit event schemas are committed at
-`docs/schemas/audit-log-event.v3.schema.json` and
-`docs/schemas/audit-log-event.v2.schema.json`.
+The authoritative MDK audit event schema is committed at
+`docs/schemas/audit-log-event.v4.schema.json`.
 See also `docs/audit-log-glossary.md` for a plain-English term guide,
 `docs/api-v1.md` for the authenticated read API, `docs/deployment.md` for VM
 deployment notes, and `docs/audit-debugging-platform-prd.md` for the platform's
@@ -43,7 +42,7 @@ just purge-audit-data    # delete audit uploads/events/groups/projections/report
 just migrate             # apply migrations to the dev database
 just makemigrations      # create migrations from model changes
 just shell               # open a Django shell against the dev database
-just validate-schema P   # validate JSONL paths against committed V2/V3 schemas
+just validate-schema P   # validate JSONL paths against committed v4 schema
 just django-check        # run Django's system checks
 just lint                # run Ruff lint checks
 just format              # format Python code with Ruff
@@ -69,25 +68,34 @@ format checking, migration drift checking, and the locked dependency audit.
 
 ## Upload An Audit Log
 
-Each line must be one JSON object in the `marmot-forensics-audit` JSONL shape. Current `marmot-forensics-audit/v3` rows include `schema_version`, `seq`, `wall_time_ms`, a non-empty `engine_id`, and a `kind` object; v3 has one safe-only privacy posture and no `audit_data_mode` field. Historical `marmot-forensics-audit/v2` rows remain accepted with their required `audit_data_mode` (`obfuscated_sensitive_data` or `full_data`). Legacy `marmot-forensics-audit/v1` rows are also accepted, but they must additionally carry a human action (`kind.type = "human_action"` or `context.human_action.action`); action-less v1 rows are quarantined. If the JSONL includes valid `group_ref` values, Goggles will create or reuse those groups automatically. One uploaded file can contain multiple groups, but it should normally contain one `engine_id` and one `account_ref`. The bundled `fixtures/*.jsonl` samples remain v2 compatibility fixtures.
+Each line must conform to the committed MDK `marmot-forensics-audit/v4`
+JSON Schema. Only v4 is accepted. Legacy v1-v3, unknown versions, mixed-version
+files, malformed JSON/UTF-8, duplicate JSON keys, and schema-prohibited fields
+are rejected before any raw body, event line or group is stored. A renamed file
+is validated by content. Invalid files are never quarantined as raw evidence.
 
 ```sh
 curl -X POST http://127.0.0.1:8000/api/v1/audit-logs/ \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
   -H "Content-Type: application/x-ndjson" \
-  -H "X-Goggles-Device-Label: Alice iPhone" \
-  -H "X-Goggles-Platform: ios" \
-  -H "X-Goggles-App-Version: 2026.6.8" \
   --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
-Account identity comes from the JSONL body: `source_context.account_label`, the
-top-level `account_ref`, and (in full-data mode) `source_context.account_pubkey_hex`.
-Goggles surfaces the account label as the primary identifier with the pubkey hex
-shown alongside it. The remaining upload headers (`X-Goggles-Device-Label`,
-`X-Goggles-Platform`, `X-Goggles-App-Version`) are optional human labels; the
-forensic joins still come from the JSONL `account_ref`, `engine_id`, and
-`group_ref` fields.
+V4 removes `account_label`, `device_label` and `device_name`. Optional
+`hardware_model` is the system model (for example `iPhone17,2`), never a
+user-assigned device name, hostname or serial number. Platform, app version,
+opaque engine/device identifiers and deterministic correlation hashes remain.
+Goggles derives source metadata only from validated JSONL `source_context` or
+`context.source`; upload headers/form labels and filenames are ignored.
+Rotated segments without source context are valid. Engines display platform,
+hardware model when known, and an opaque engine identifier.
+
+HTTP 400 rejections return a fixed operational error code and optional line
+number. They never echo values, unknown field names or JSON fragments. The
+body-free rejection table retains only a timestamp, upload-token reference,
+byte count, reason code and line number. Internal ingest failures roll back
+all evidence writes and return HTTP 503. Size limits remain HTTP 413.
+See [the staged deployment/reset procedure](docs/deployment.md#v4-only-acceptance-and-historical-data-reset).
 
 The group URL is only a fallback for group-less lines or broken logs. Event-level `group_ref` values take precedence:
 
@@ -106,7 +114,7 @@ curl -X POST "http://127.0.0.1:8000/api/v1/audit-logs/?group=qa-fork" \
   --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
-Upload another one-engine file, such as `fixtures/sample-audit-log-trailhead-theo.jsonl`, to compare multiple clients in the same group. Invalid JSONL, mixed-engine uploads, or mixed-account uploads return `400` and are still saved as quarantined audit files so damaged lines can be inspected.
+Upload another one-engine file, such as `fixtures/sample-audit-log-trailhead-theo.jsonl`, to compare multiple clients in the same group. Invalid JSONL, mixed-engine uploads, or mixed-account uploads return `400` without storing raw evidence.
 
 ## Production Deployment: goggles.ipf.dev
 
@@ -241,11 +249,9 @@ and `/static/*` to the static sidecar on `127.0.0.1:8001`, and it encodes two ru
   leaves no `UploadRejection` row and the device that keeps failing is invisible.
   Mind the units — Caddy's `50MB` meant 50,000,000 bytes, *below* the app's old
   50 MiB ceiling; the file uses `MiB`.
-- The `log` block is the only record of requests Caddy itself refuses. It strips
-  bearer tokens, cookies, the group ref (header and `?group=` query parameter),
-  and the device label; the client IP and user agent remain, so the file rotates
-  daily and is age-bounded to the audit retention window (14 days) rather than
-  kept until it rolls by size.
+- The `log` block records operational status, size and duration. The entire
+  request object is removed, including headers, URI, IP and user agent. Logs
+  rotate daily and are retained for at most 14 days.
 
 The static sidecar avoids requiring the Caddy system user to read inside the app checkout. It serves generated CSS, JavaScript, and admin assets only.
 
@@ -276,19 +282,17 @@ Upload a sample log through the public endpoint:
 curl -X POST https://goggles.ipf.dev/api/v1/audit-logs/ \
   -H "Authorization: Bearer $GOGGLES_UPLOAD_TOKEN" \
   -H "Content-Type: application/x-ndjson" \
-  -H "X-Goggles-Device-Label: Alice iPhone" \
-  -H "X-Goggles-Platform: ios" \
   --data-binary @fixtures/sample-audit-log-trailhead-maya.jsonl
 ```
 
-Invalid JSONL is saved as a quarantined upload and returns `400`. A body that
+Invalid JSONL returns `400` without storing its body or lines. A body that
 arrives **shorter than its `Content-Length`** (the transfer was cut: app killed,
 link dropped, proxy abort) is refused with `400` and `"reason": "incomplete_body"`
 *without* ingesting the prefix — the client will re-post the whole file anyway, and
 storing a truncated copy only double-counted its lines. Uploads without a
 `Content-Length` get `411`; bodies over the size ceiling get `413`. Every such
-refusal is recorded as an `UploadRejection` (declared vs received bytes, client
-platform/version headers, token) and shown on the **Upload logs** page and in the
+refusal is recorded as an `UploadRejection` (time, HTTP status, fixed reason,
+declared vs received bytes, optional line number and credential reference) and shown on the **Upload logs** page and in the
 admin, so a device that never gets a file through is visible even though no audit
 file exists for it. Rejections age out with the audit retention window.
 
@@ -321,16 +325,14 @@ file exists for it. Rejections age out with the audit retention window.
 docker compose exec web python manage.py shell -c "from forensics.models import UploadToken; UploadToken.objects.filter(token_prefix='OLDPREFIX').update(is_active=False)"
 ```
 
-- Audit logs preserve raw engine ids, group refs, message ids, digests, payload metadata, raw lines, raw uploaded text, user agents, and source IPs; protect the database and backups accordingly.
-- Brain disk encryption is the expected at-rest protection for v1.
+- Audit logs preserve raw engine ids, group refs, message ids, digests, payload metadata, raw lines, validated raw uploaded text; protect the database and backups accordingly.
+- Brain disk encryption is the expected at-rest protection for the service.
 - Upload size defaults to 64 MiB via `GOGGLES_MAX_DUMP_BYTES`, matching the
   largest segment Marmot clients will send; the edge proxy limit must be higher
   (see Caddy above). The record cap derives from the byte ceiling
   (`GOGGLES_MAX_DUMP_BYTES // 256`, 262,144 at 64 MiB) and exists only to catch
   pathological tiny-line bodies; each JSONL line is further bounded to 2 MiB, and
-  multipart bodies spool to disk after 1 MiB. Over-complex uploads are retained
-  as one quarantined raw artifact instead of being expanded into per-line ORM
-  objects.
+  audit multipart files use a bounded memory-only handler, without disk spooling. Over-complex uploads are rejected without persisting their body or lines.
 - Projection APIs default to 100 rows and cap requests at 500. Action-history
   scans and synchronous agent exports have separate 50,000-event safety caps.
 - The Compose web service defaults to a configurable 16 GiB no-swap cgroup
@@ -342,11 +344,9 @@ docker compose exec web python manage.py shell -c "from forensics.models import 
   `--confirm-delete-audit-data` to perform a deployment cutover. Rebuild the
   normalized projections from the preserved raw lines with
   `manage.py rebuild_audit_projections` if a projection needs to be regenerated.
-- Validate V2/V3 JSONL against the committed schema selected from each row's
-  `schema_version` with
+- Validate complete v4 JSONL files against the committed MDK schema with
   `manage.py validate_audit_schema <path>` (or `just validate-schema <path>`)
-  before relying on a third-party export. Pass `--schema <path>` to force one
-  schema for every row.
+  before relying on a third-party export. `--schema <path>` must be byte-identical to the committed v4 schema.
 - Do not log bearer tokens or raw upload bodies. Keep Caddy access logs away from `Authorization` headers.
 - Back up the Postgres named volume with `pg_dump`, store backups encrypted, and test restore before relying on them:
 
@@ -358,7 +358,7 @@ cat backups/goggles-YYYY-MM-DD.sql | docker compose exec -T db psql -U goggles g
 
 ## What The Dashboard Shows
 
-- Imported audit files (`/uploads/`), validation status, duplicate counts, and quarantined bad lines.
+- Imported audit files (`/uploads/`), validation status, duplicate counts, and body-free rejection diagnostics.
 - A per-group dashboard with tabs for overview, state deltas, network observations, message delivery, convergence, evidence (raw lines), and exports.
 - Per-account and per-engine investigations that correlate every group a subject touched, with hover correlation and click-to-inspect event details.
 - Message traces across engines, including missing observations when one engine saw a message and another did not.

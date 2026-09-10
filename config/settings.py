@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -66,6 +67,9 @@ SENSITIVE_EVENT_KEYS = {
 }
 SENSITIVE_EVENT_KEY_PARTS = (
     "account_ref",
+    "account_label",
+    "device_label",
+    "device_name",
     "audit",
     "authorization",
     "bearer",
@@ -104,6 +108,19 @@ def _scrub_glitchtip_value(value):
 
 
 def scrub_glitchtip_event(event, _hint):
+    # Upload errors can contain arbitrary request values in exception messages,
+    # breadcrumbs or parser details. Keep their diagnostics in the body-free
+    # local operational channel instead of sending request events to telemetry.
+    request = event.get("request")
+    if isinstance(request, dict):
+        url = request.get("url", "")
+        if isinstance(url, str):
+            try:
+                path = urlsplit(url).path.rstrip("/")
+            except ValueError:
+                return None
+            if path.startswith("/api/v1/") and path.endswith("/audit-logs"):
+                return None
     event = _scrub_glitchtip_value(event)
     request = event.get("request")
     if isinstance(request, dict):
@@ -326,12 +343,9 @@ for setting_name in (
 ):
     if globals()[setting_name] <= 0:
         raise ImproperlyConfigured(f"{setting_name} must be a positive integer.")
-# The upload endpoint only ever ingests a single file part, and every part at
-# or under FILE_UPLOAD_MAX_MEMORY_SIZE is buffered in RAM. Keep that threshold
-# much smaller than the accepted dump size so normal multipart uploads spool to
-# a temporary file before ingestion. Capping the number of files at 1 stops a
-# multipart request from accumulating many sub-threshold parts, while
-# MaxDumpSizeUploadHandler additionally bounds cumulative bytes across parts.
+# Audit uploads replace Django's default handlers with one bounded memory-only
+# handler. Unvalidated files must not spool to disk. This count also bounds
+# multipart parsing before application validation.
 DATA_UPLOAD_MAX_NUMBER_FILES = 1
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

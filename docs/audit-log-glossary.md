@@ -2,9 +2,9 @@
 
 This glossary explains the Marmot forensic audit-log terms as Goggles uses
 them. It is a reader's guide, not the canonical schema. For exact field
-requirements, use `docs/schemas/audit-log-event.v3.schema.json` for current
-safe-only logs or `docs/schemas/audit-log-event.v2.schema.json` for historical
-v2 logs.
+requirements, use `docs/schemas/audit-log-event.v4.schema.json`. Only valid
+v4 uploads are accepted. Historical terminology below describes data retained
+until the separately approved purge; it does not extend the acceptance schema.
 
 Treat the fields described here as sensitive forensic data. Raw uploads,
 bearer tokens, engine ids, account refs, group refs, message ids, payload
@@ -34,18 +34,19 @@ convergence run, state change, and evidence line.
 | Audit event | One JSONL line describing something the recorder saw or did. |
 | Raw line | The original preserved JSONL line. This is the source evidence. |
 | Evidence ref | A pointer back to source evidence, usually file id, line number, line hash, and event kind. Derived rows should link to evidence instead of embedding raw JSON everywhere. |
-| `schema_version` | The audit-log schema version. Current logs use safe-only `marmot-forensics-audit/v3`; legacy v1 and v2 logs remain accepted. |
+| `schema_version` | The audit-log schema version. Only `marmot-forensics-audit/v4` is accepted. |
 | `seq` | Per-recorder sequence number for ordering events emitted by one recorder session. |
 | `wall_time_ms` | Milliseconds since Unix epoch according to the client/engine that recorded the event. Useful for timelines, but it is not a cryptographic ordering guarantee. |
 | `recorder_session_id` | Identifier for a recorder session. Recorder restarts or reopens may create a new session. |
-| `audit_data_mode` | Historical v2 sensitivity mode. `obfuscated_sensitive_data` avoids decrypted content and full identifiers where possible; `full_data` may include them. V3 removed this wire field and Goggles derives the normalized `safe_only` posture from `schema_version`. |
+| `audit_data_mode` | Historical v2 sensitivity mode. `obfuscated_sensitive_data` avoids decrypted content and full identifiers where possible; `full_data` may include them. V4 omits this wire field and Goggles derives the normalized `safe_only` posture from `schema_version`. |
 | `account_ref` | Stable obfuscated account reference used for joins. It is sensitive. |
 | `engine_id` | The specific account-device engine that emitted the event. One uploaded file should normally contain one engine id. |
 | `group_ref` | Stable group reference used to put events into a Goggles group workspace. |
-| `context` | Optional event context, such as operation id, source device/account labels, human action, transport, engine, group, or convergence context. |
+| `context` | Optional event context, such as operation id, source system metadata, human action, transport, engine, group, or convergence context. |
 | `kind` | The event-specific payload. `kind.type` is the event type. |
 | Projection | A derived database row built from raw audit events, such as a delivery artifact or convergence run. |
-| Quarantine | Storage of invalid or structurally untrustworthy input as preserved evidence, while excluding it from trusted projections where appropriate. |
+| Rejected upload | Invalid files are refused before any raw body or line is stored. Historical quarantined files are removed only by the approved purge. |
+| `hardware_model` | Optional system model, such as iPhone17,2; never a user-assigned device name, hostname or serial number. |
 
 ## Message And Delivery Terms
 
@@ -70,8 +71,8 @@ convergence run, state change, and evidence line.
 | `missing_inferred` | Goggles expected evidence but did not find comparable observation evidence. This is an inference, not proof of non-delivery. |
 | `unobserved_no_uploaded_engine` | The expected recipient has no comparable uploaded engine evidence, so Goggles cannot say much. |
 | `observed_not_expected` | An engine observed an artifact that was not in the expected recipient set. |
-| `decoded_payload` | Historical v2 full-data decoded content. Safe-only v3 does not emit it. |
-| `decoded_app_event` | Historical v2 application-protocol details extracted from decoded content. Safe-only v3 does not emit them. |
+| `decoded_payload` | Historical v2 full-data decoded content. V4 does not emit it. |
+| `decoded_app_event` | Historical v2 application-protocol details extracted from decoded content. V4 does not emit them. |
 | Attachment metadata | Optional decoded-app-event metadata about attachments, such as content type, file name, byte length, digest, and app-specific metadata. |
 | Peeler | The layer that tries to unwrap, decrypt, or peel incoming transport/application envelopes. |
 | Peeler outcome | Result of peeling: `success`, `decrypt_failed`, `stale_epoch`, `malformed`, or `other`. |
@@ -151,7 +152,7 @@ convergence run, state change, and evidence line.
 | Score | Structured branch scoring details, such as valid commit depth, effective depth, witness quorum, witness score, tip priority, and tip digest. |
 | App witness | Evidence from application-level messages that supports a candidate branch. |
 | Rule trace / rule evaluation | Historical v2 sequence of branch-selection rules, their inputs, their result, and whether each rule was decisive. |
-| Decisive rule | Rule that directly selected or rejected a branch. Safe-only v3 records its name as a scalar instead of retaining the free-form v2 rule trace. |
+| Decisive rule | Rule that directly selected or rejected a branch. V4 records its name as a scalar instead of retaining the free-form v2 rule trace. |
 | Auto-commit decision | Event explaining whether the engine decided to commit a proposal automatically and why. |
 
 ## Event Family Map

@@ -162,15 +162,11 @@ class AuditFile(models.Model):
     )
 
     source_name = models.CharField(max_length=255, blank=True)
-    source_account_label = models.CharField(max_length=255, blank=True)
-    source_device_label = models.CharField(max_length=255, blank=True)
+    source_hardware_model = models.CharField(max_length=255, blank=True)
     source_device_id = models.CharField(max_length=255, blank=True)
-    source_device_name = models.CharField(max_length=255, blank=True)
     source_platform = models.CharField(max_length=120, blank=True)
     source_app_version = models.CharField(max_length=120, blank=True)
     source_upload_trigger = models.CharField(max_length=160, blank=True)
-    source_account_pubkey_hex = models.CharField(max_length=64, blank=True)
-    source_account_npub = models.CharField(max_length=120, blank=True)
     content_type = models.CharField(max_length=120, blank=True)
     file_sha256 = models.CharField(max_length=64)
     byte_size = models.PositiveBigIntegerField()
@@ -227,18 +223,7 @@ class AuditFile(models.Model):
 
 
 class UploadRejection(models.Model):
-    """An authenticated upload attempt the API refused before ingesting anything.
-
-    Refusals used to be invisible: a body cut mid-transfer was parsed as-is, and
-    an oversized body died at the edge proxy with no server-side trace at all.
-    Each row records *why* an attempt was refused and what the client declared
-    versus what arrived, so a device that keeps failing can be found without
-    access to proxy logs. Only authenticated attempts are recorded, which bounds
-    the table by token holders rather than by anyone who can reach the endpoint.
-
-    Rows carry a source IP and user agent (sensitive, like ``AuditFile``) and are
-    pruned by ``prune_audit_data`` on the same retention window as evidence.
-    """
+    """Body-free operational refusals, retained and purged with audit data."""
 
     REASON_TOO_LARGE = "too_large"
     REASON_TOO_MANY_PARTS = "too_many_parts"
@@ -260,17 +245,11 @@ class UploadRejection(models.Model):
         null=True,
         blank=True,
     )
-    reason = models.CharField(max_length=32, choices=REASON_CHOICES)
+    reason = models.CharField(max_length=40)
+    line_number = models.PositiveIntegerField(null=True)
     status_code = models.PositiveSmallIntegerField()
     declared_content_length = models.PositiveBigIntegerField(null=True, blank=True)
     received_bytes = models.PositiveBigIntegerField(null=True, blank=True)
-    content_type = models.CharField(max_length=120, blank=True)
-    group_slug = models.CharField(max_length=160, blank=True)
-    source_device_label = models.CharField(max_length=255, blank=True)
-    source_platform = models.CharField(max_length=120, blank=True)
-    source_app_version = models.CharField(max_length=120, blank=True)
-    source_ip = models.GenericIPAddressField(null=True, blank=True)
-    user_agent = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

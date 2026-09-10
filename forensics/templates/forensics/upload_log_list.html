@@ -18,7 +18,6 @@
 <dl class="metrics">
   <div class="metric"><dt>Total</dt><dd>{{ stats.total }}</dd></div>
   <div class="metric"><dt>Valid</dt><dd>{{ stats.valid }}</dd></div>
-  <div class="metric"><dt>Failed</dt><dd>{{ stats.invalid }}</dd></div>
   <div class="metric"><dt>Rejected</dt><dd>{{ stats.rejected }}</dd></div>
   <div class="metric"><dt>Latest</dt><dd><small>{% if latest_upload %}{{ latest_upload.created_at|date:"Y-m-d H:i" }}{% else %}–{% endif %}</small></dd></div>
 </dl>
@@ -26,7 +25,7 @@
 <section class="card card--flush">
   <header class="card__header">
     <span class="card__title">Recent uploads</span>
-    <span class="card__subtitle">validation failures &amp; client metadata</span>
+    <span class="card__subtitle">validated evidence &amp; system metadata</span>
   </header>
   <div class="card__body table-scroll">
     <table class="data-table">
@@ -39,7 +38,6 @@
           <th>Events</th>
           <th>Groups</th>
           <th>Engines</th>
-          <th>IP</th>
         </tr>
       </thead>
       <tbody>
@@ -60,9 +58,9 @@
             </td>
             <td>
               <span class="cell-lines">
-                <span class="cell-title">{% if audit_file.source_name %}{{ audit_file.source_name }}{% else %}Direct body{% endif %}</span>
+                <span class="cell-title">{% if audit_file.source_name %}{{ audit_file.source_name }}{% else %}audit-file-{{ audit_file.id }}{% endif %}</span>
                 <span class="cell-sub">
-                  {{ audit_file.source_account_label|default:"–" }}{% if audit_file.source_device_label %} · {{ audit_file.source_device_label }}{% endif %}{% if audit_file.source_platform %} · {{ audit_file.source_platform }}{% endif %}{% if audit_file.source_app_version %} · {{ audit_file.source_app_version }}{% endif %}
+                  {% if audit_file.source_platform %}{{ audit_file.source_platform }}{% endif %}{% if audit_file.source_hardware_model %}{% if audit_file.source_platform %} · {% endif %}{{ audit_file.source_hardware_model }}{% endif %}{% if audit_file.source_app_version %}{% if audit_file.source_platform or audit_file.source_hardware_model %} · {% endif %}{{ audit_file.source_app_version }}{% endif %}{% if not audit_file.source_platform and not audit_file.source_hardware_model and not audit_file.source_app_version %}–{% endif %}
                 </span>
               </span>
             </td>
@@ -97,82 +95,36 @@
                 –
               {% endfor %}
             </td>
-            <td class="is-mono is-muted">{{ audit_file.source_ip|default:"–" }}</td>
           </tr>
           {% if audit_file.validation_error %}
             <tr>
-              <td colspan="8" class="is-wrap"><span class="badge badge--warning">failure</span> {{ audit_file.validation_error|truncatechars:240 }}</td>
+              <td colspan="7" class="is-wrap"><span class="badge badge--warning">failure</span> {{ audit_file.validation_error|truncatechars:240 }}</td>
             </tr>
           {% endif %}
         {% empty %}
           <tr>
-            <td colspan="8" class="empty">No uploads yet.</td>
+            <td colspan="7" class="empty">No uploads yet.</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
-
 <section class="card card--flush">
-  <header class="card__header">
-    <span class="card__title">Rejected attempts</span>
-    <span class="card__subtitle">refused before ingestion &middot; incomplete or oversized bodies</span>
-  </header>
+  <header class="card__header"><span class="card__title">Recent rejections</span></header>
   <div class="card__body table-scroll">
     <table class="data-table">
-      <thead>
+      <thead><tr><th>Received</th><th>Status</th><th>Reason</th><th>Token</th><th>Declared bytes</th><th>Received bytes</th><th>Line</th></tr></thead>
+      <tbody>{% for rejection in rejections %}
         <tr>
-          <th>Rejected</th>
-          <th>Reason</th>
-          <th>Bytes</th>
-          <th>Source</th>
-          <th>Token</th>
-          <th>Group</th>
-          <th>IP</th>
+          <td>{{ rejection.created_at|date:"Y-m-d H:i:s" }}</td>
+          <td>{{ rejection.status_code }}</td><td>{{ rejection.reason }}</td>
+          <td>{% if rejection.upload_token %}{{ rejection.upload_token.name }} <span class="cell-sub">{{ rejection.upload_token.token_prefix }}</span>{% else %}–{% endif %}</td>
+          <td>{{ rejection.declared_content_length|default_if_none:"–" }}</td>
+          <td>{{ rejection.received_bytes|default_if_none:"–" }}</td>
+          <td>{{ rejection.line_number|default_if_none:"–" }}</td>
         </tr>
-      </thead>
-      <tbody>
-        {% for rejection in rejections %}
-          <tr>
-            <td>
-              <span class="cell-lines">
-                <span class="cell-title">{{ rejection.created_at|date:"Y-m-d H:i:s" }}</span>
-                <span class="cell-sub">HTTP {{ rejection.status_code }}</span>
-              </span>
-            </td>
-            <td><span class="badge badge--danger"><span class="badge__dot"></span>{{ rejection.reason }}</span></td>
-            <td>
-              <span class="cell-lines">
-                <span class="is-mono">{% if rejection.received_bytes is not None %}{{ rejection.received_bytes }} received{% else %}unknown received{% endif %}</span>
-                <span class="cell-sub">{% if rejection.declared_content_length is not None %}{{ rejection.declared_content_length }} declared{% else %}no Content-Length{% endif %}</span>
-              </span>
-            </td>
-            <td>
-              <span class="cell-lines">
-                <span class="cell-title">{{ rejection.source_device_label|default:"–" }}</span>
-                <span class="cell-sub">{{ rejection.source_platform|default:"–" }}{% if rejection.source_app_version %} · {{ rejection.source_app_version }}{% endif %}{% if rejection.content_type %} · {{ rejection.content_type }}{% endif %}</span>
-              </span>
-            </td>
-            <td>
-              {% if rejection.upload_token %}
-                <span class="cell-lines">
-                  <span class="cell-title">{{ rejection.upload_token.name }}</span>
-                  <span class="cell-sub">{{ rejection.upload_token.token_prefix }}</span>
-                </span>
-              {% else %}
-                <span class="empty">–</span>
-              {% endif %}
-            </td>
-            <td class="is-mono is-muted">{{ rejection.group_slug|default:"–"|truncatechars:20 }}</td>
-            <td class="is-mono is-muted">{{ rejection.source_ip|default:"–" }}</td>
-          </tr>
-        {% empty %}
-          <tr>
-            <td colspan="7" class="empty">No rejected attempts.</td>
-          </tr>
-        {% endfor %}
-      </tbody>
+      {% empty %}<tr><td colspan="7">No rejected uploads.</td></tr>{% endfor %}</tbody>
     </table>
   </div>
 </section>
