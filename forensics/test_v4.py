@@ -303,7 +303,9 @@ class V4BoundaryTests(TestCase):
                 with self.subTest(multipart=multipart, expected=expected):
                     response = self.post(payload, multipart)
                     self.assertEqual(response.status_code, 400)
-                    self.assertEqual(response.json(), {"error": expected, "line_number": 1})
+                    self.assertEqual(
+                        response.json(), {"error": expected, "reason": expected, "line_number": 1}
+                    )
                     self.assertEqual(UploadRejection.objects.latest("id").reason, expected)
                     self.assert_no_evidence()
 

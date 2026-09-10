@@ -146,7 +146,6 @@ def valid_events_for_group(group, *, include_export_fields=False):
         "id",
         "audit_file_id",
         "audit_file__source_hardware_model",
-        "audit_file__engine_ids",
         "audit_file__source_platform",
         "line_number",
         "parse_status",

@@ -66,7 +66,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='uploadrejection',
             name='line_number',
-            field=models.PositiveIntegerField(null=True),
+            field=models.PositiveIntegerField(blank=True, null=True),
         ),
         migrations.AlterField(
             model_name='uploadrejection',

@@ -3201,7 +3201,7 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
         )
     except UploadRejected as exc:
         return JsonResponse(
-            {"error": exc.code, "line_number": exc.line_number},
+            {"error": exc.code, "reason": exc.code, "line_number": exc.line_number},
             status=exc.status_code,
         )
 

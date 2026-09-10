@@ -114,17 +114,39 @@
   <header class="card__header"><span class="card__title">Recent rejections</span></header>
   <div class="card__body table-scroll">
     <table class="data-table">
-      <thead><tr><th>Received</th><th>Status</th><th>Reason</th><th>Token</th><th>Declared bytes</th><th>Received bytes</th><th>Line</th></tr></thead>
-      <tbody>{% for rejection in rejections %}
+      <thead>
         <tr>
-          <td>{{ rejection.created_at|date:"Y-m-d H:i:s" }}</td>
-          <td>{{ rejection.status_code }}</td><td>{{ rejection.reason }}</td>
-          <td>{% if rejection.upload_token %}{{ rejection.upload_token.name }} <span class="cell-sub">{{ rejection.upload_token.token_prefix }}</span>{% else %}–{% endif %}</td>
-          <td>{{ rejection.declared_content_length|default_if_none:"–" }}</td>
-          <td>{{ rejection.received_bytes|default_if_none:"–" }}</td>
-          <td>{{ rejection.line_number|default_if_none:"–" }}</td>
+          <th>Received</th>
+          <th>Status</th>
+          <th>Reason</th>
+          <th>Token</th>
+          <th>Declared bytes</th>
+          <th>Received bytes</th>
+          <th>Line</th>
         </tr>
-      {% empty %}<tr><td colspan="7">No rejected uploads.</td></tr>{% endfor %}</tbody>
+      </thead>
+      <tbody>
+        {% for rejection in rejections %}
+          <tr>
+            <td>{{ rejection.created_at|date:"Y-m-d H:i:s" }}</td>
+            <td>{{ rejection.status_code }}</td>
+            <td>{{ rejection.reason }}</td>
+            <td>
+              {% if rejection.upload_token %}
+                {{ rejection.upload_token.name }}
+                <span class="cell-sub">{{ rejection.upload_token.token_prefix }}</span>
+              {% else %}
+                –
+              {% endif %}
+            </td>
+            <td>{{ rejection.declared_content_length|default_if_none:"–" }}</td>
+            <td>{{ rejection.received_bytes|default_if_none:"–" }}</td>
+            <td>{{ rejection.line_number|default_if_none:"–" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7">No rejected uploads.</td></tr>
+        {% endfor %}
+      </tbody>
     </table>
   </div>
 </section>

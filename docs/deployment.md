@@ -228,6 +228,17 @@ configuration as part of deployment, validate it and reload Caddy before exposin
 the new ingress. Existing proxy/container/error-monitoring logs remain part of
 the separate historical-copy inventory. Do not log source headers for diagnosis.
 
+These privacy settings intentionally limit attribution: edge refusals can be
+counted by status/time but cannot be assigned to a client, group or endpoint.
+Do not reconstruct those values from request logs. Django's body-free rejection
+records support credential-level attribution only after a request reaches the
+application. Unexpected upload exceptions outside the ingestion guard are also
+suppressed from external telemetry; aggregate HTTP 500 monitoring will not
+provide their stack traces. Any future endpoint diagnostics must use fixed
+server-side route names and exclude request values, exception messages, frame
+locals and breadcrumbs. Do not restore literal URIs or exception payloads as a
+workaround.
+
 Multipart files are buffered only in memory under the upload size limit;
 unvalidated bytes never spool to temporary files. Validation occurs before
 deduplication as well as before persistence. A previously

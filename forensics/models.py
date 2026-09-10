@@ -230,14 +230,6 @@ class UploadRejection(models.Model):
     REASON_INCOMPLETE_BODY = "incomplete_body"
     REASON_LENGTH_REQUIRED = "length_required"
     REASON_MALFORMED_BODY = "malformed_body"
-    REASON_CHOICES = [
-        (REASON_TOO_LARGE, "Body exceeds the upload size limit"),
-        (REASON_TOO_MANY_PARTS, "Multipart body carries more than one file part"),
-        (REASON_INCOMPLETE_BODY, "Body shorter than its Content-Length"),
-        (REASON_LENGTH_REQUIRED, "Content-Length header missing"),
-        (REASON_MALFORMED_BODY, "Body could not be parsed as multipart"),
-    ]
-
     upload_token = models.ForeignKey(
         UploadToken,
         related_name="rejections",
@@ -246,7 +238,7 @@ class UploadRejection(models.Model):
         blank=True,
     )
     reason = models.CharField(max_length=40)
-    line_number = models.PositiveIntegerField(null=True)
+    line_number = models.PositiveIntegerField(null=True, blank=True)
     status_code = models.PositiveSmallIntegerField()
     declared_content_length = models.PositiveBigIntegerField(null=True, blank=True)
     received_bytes = models.PositiveBigIntegerField(null=True, blank=True)

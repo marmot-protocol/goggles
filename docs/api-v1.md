@@ -325,7 +325,11 @@ server timestamp, credential reference, HTTP status, fixed reason, optional byte
 counts and optional line number. Failed ingestion logs only an allowlisted
 exception class, never its message or traceback.
 
-Validation failures return `{"error": "<code>", "line_number": <number-or-null>}`:
+Validation failures return
+`{"error": "<code>", "reason": "<code>", "line_number": <number-or-null>}`.
+Use `reason` as the machine-readable field for both validation and transport
+rejections. Existing `error` values are retained for compatibility: validation
+uses the code, while transport failures use a fixed human-readable message.
 
 | Code | HTTP | Meaning |
 | --- | --- | --- |
