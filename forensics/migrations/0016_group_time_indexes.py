@@ -8,7 +8,7 @@ def _indexes():
         (
             "AuditEvent",
             models.Index(
-                fields=["group", "parse_status", "wall_time_ms", "engine_id", "line_number"],
+                fields=["group", "parse_status", "wall_time_ms", "engine_id", "line_number", "id"],
                 name="forensics_a_grp_stat_time_idx",
             ),
         ),
@@ -22,28 +22,28 @@ def _indexes():
         (
             "NetworkObservation",
             models.Index(
-                fields=["group", "wall_time_ms", "engine_id"],
+                fields=["group", "wall_time_ms", "engine_id", "id"],
                 name="forensics_n_grp_time_idx",
             ),
         ),
         (
             "ConvergenceRun",
             models.Index(
-                fields=["group", "started_at_ms", "engine_id"],
+                fields=["group", "started_at_ms", "engine_id", "run_id"],
                 name="forensics_c_grp_start_idx",
             ),
         ),
         (
             "StateDelta",
             models.Index(
-                fields=["group", "epoch", "wall_time_ms"],
+                fields=["group", "epoch", "wall_time_ms", "id"],
                 name="forensics_s_grp_epoch_time_idx",
             ),
         ),
         (
             "EpochStateTransition",
             models.Index(
-                fields=["group", "wall_time_ms", "engine_id"],
+                fields=["group", "wall_time_ms", "engine_id", "id"],
                 name="forensics_e_grp_time_idx",
             ),
         ),
@@ -84,6 +84,7 @@ class Migration(migrations.Migration):
                             "wall_time_ms",
                             "engine_id",
                             "line_number",
+                            "id",
                         ],
                         name="forensics_a_grp_stat_time_idx",
                     ),
@@ -98,28 +99,28 @@ class Migration(migrations.Migration):
                 migrations.AddIndex(
                     model_name="networkobservation",
                     index=models.Index(
-                        fields=["group", "wall_time_ms", "engine_id"],
+                        fields=["group", "wall_time_ms", "engine_id", "id"],
                         name="forensics_n_grp_time_idx",
                     ),
                 ),
                 migrations.AddIndex(
                     model_name="convergencerun",
                     index=models.Index(
-                        fields=["group", "started_at_ms", "engine_id"],
+                        fields=["group", "started_at_ms", "engine_id", "run_id"],
                         name="forensics_c_grp_start_idx",
                     ),
                 ),
                 migrations.AddIndex(
                     model_name="statedelta",
                     index=models.Index(
-                        fields=["group", "epoch", "wall_time_ms"],
+                        fields=["group", "epoch", "wall_time_ms", "id"],
                         name="forensics_s_grp_epoch_time_idx",
                     ),
                 ),
                 migrations.AddIndex(
                     model_name="epochstatetransition",
                     index=models.Index(
-                        fields=["group", "wall_time_ms", "engine_id"],
+                        fields=["group", "wall_time_ms", "engine_id", "id"],
                         name="forensics_e_grp_time_idx",
                     ),
                 ),

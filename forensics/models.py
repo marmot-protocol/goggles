@@ -372,7 +372,14 @@ class AuditEvent(models.Model):
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["group_ref", "wall_time_ms"]),
             models.Index(
-                fields=["group", "parse_status", "wall_time_ms", "engine_id", "line_number"],
+                fields=[
+                    "group",
+                    "parse_status",
+                    "wall_time_ms",
+                    "engine_id",
+                    "line_number",
+                    "id",
+                ],
                 name="forensics_a_grp_stat_time_idx",
             ),
             models.Index(fields=["msg_id"]),
@@ -569,7 +576,7 @@ class NetworkObservation(models.Model):
             models.Index(fields=["nostr_event_id"]),
             models.Index(fields=["relay_url"]),
             models.Index(
-                fields=["group", "wall_time_ms", "engine_id"],
+                fields=["group", "wall_time_ms", "engine_id", "id"],
                 name="forensics_n_grp_time_idx",
             ),
         ]
@@ -607,7 +614,7 @@ class ConvergenceRun(models.Model):
             models.Index(fields=["group", "phase"]),
             models.Index(fields=["engine_id", "started_at_ms"]),
             models.Index(
-                fields=["group", "started_at_ms", "engine_id"],
+                fields=["group", "started_at_ms", "engine_id", "run_id"],
                 name="forensics_c_grp_start_idx",
             ),
         ]
@@ -693,7 +700,7 @@ class StateDelta(models.Model):
             models.Index(fields=["change_kind"]),
             models.Index(fields=["origin_commit_id"]),
             models.Index(
-                fields=["group", "epoch", "wall_time_ms"],
+                fields=["group", "epoch", "wall_time_ms", "id"],
                 name="forensics_s_grp_epoch_time_idx",
             ),
         ]
@@ -727,7 +734,7 @@ class EpochStateTransition(models.Model):
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["new_state"]),
             models.Index(
-                fields=["group", "wall_time_ms", "engine_id"],
+                fields=["group", "wall_time_ms", "engine_id", "id"],
                 name="forensics_e_grp_time_idx",
             ),
         ]

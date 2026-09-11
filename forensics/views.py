@@ -361,8 +361,11 @@ def group_engine_rows(
     )
     if limit is not None:
         rows = rows[:limit]
-
-    source_values = engine_source_values(group)
+    rows = list(rows)
+    source_values = engine_source_values(
+        group,
+        engine_ids=[row["engine_id"] for row in rows],
+    )
     engines = []
     for idx, row in enumerate(rows):
         engine_id = row["engine_id"]
@@ -390,12 +393,20 @@ def group_engine_rows(
     return engines
 
 
-def engine_source_values(group: AuditGroup) -> dict[str, dict[str, list[str]]]:
+def engine_source_values(
+    group: AuditGroup,
+    *,
+    engine_ids: list[str] | None = None,
+) -> dict[str, dict[str, list[str]]]:
     # Ingest already copied context.source onto AuditFile. Don't rescan events.
+    # Account pairing stays on the event aggregate in group_engine_rows; a file
+    # can list several account_refs and engine_ids independently.
+    if engine_ids is not None and not engine_ids:
+        return {}
+    wanted = set(engine_ids) if engine_ids is not None else None
     values_by_engine: dict[str, dict[str, set[str]]] = {}
     files = AuditFile.objects.filter(groups=group).only(
         "engine_ids",
-        "account_refs",
         "source_device_id",
         "source_hardware_model",
         "source_platform",
@@ -404,15 +415,13 @@ def engine_source_values(group: AuditGroup) -> dict[str, dict[str, list[str]]]:
     )
     for audit_file in files:
         for engine_id in audit_file.engine_ids or []:
-            if not engine_id:
+            if not engine_id or (wanted is not None and engine_id not in wanted):
                 continue
             engine_values = values_by_engine.setdefault(
                 engine_id,
                 {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
                 | {"account_refs": set()},
             )
-            for account_ref in audit_file.account_refs or []:
-                append_engine_source_value(engine_values["account_refs"], account_ref)
             for key, file_field, _context_key in ENGINE_SOURCE_FIELD_MAP:
                 append_engine_source_value(engine_values[key], getattr(audit_file, file_field, ""))
 

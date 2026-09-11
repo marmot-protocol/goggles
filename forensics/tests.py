@@ -7204,6 +7204,37 @@ class GroupOverviewLazyContextTests(TestCase):
             )
         )
 
+    def test_engine_source_values_limits_to_rendered_engines(self):
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=1_700_000_000_000,
+                )
+            ),
+            source_hardware_model="Pixel 9",
+        )
+        values = engine_source_values(self.group, engine_ids=[ENGINE_ALICE])
+        self.assertEqual(list(values), [ENGINE_ALICE])
+
+    def test_group_engine_rows_keep_account_refs_per_engine(self):
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    engine_id=ENGINE_BOB,
+                    account_ref=ACCOUNT_BOB,
+                    wall_time_ms=1_700_000_000_000,
+                )
+            ),
+            source_hardware_model="Pixel 9",
+        )
+        rows = {row["engine_id"]: row for row in group_engine_rows(self.group)}
+        self.assertEqual(rows[ENGINE_ALICE]["account_refs"], [ACCOUNT_ALICE])
+        self.assertEqual(rows[ENGINE_BOB]["account_refs"], [ACCOUNT_BOB])
+
 
 class ProfileTests(TestCase):
     OLD_PASSWORD = "correct horse battery staple"
