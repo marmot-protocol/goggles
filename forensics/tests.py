@@ -76,23 +76,23 @@ from .token_crypto import MAX_TOKEN_EXPIRY_DAYS, expiry_from_days
 from .views import (
     AUDIT_FILE_EVENT_PAGE_SIZE,
     GROUP_DETAIL_TAB_EVENT_LIMIT,
-    GROUP_EPOCH_FIELDS,
     GROUP_EXPORT_SCHEMA_VERSION,
     GROUP_PROJECTION_API_DEFAULT_LIMIT,
     RAW_TEXT_PREVIEW_CHARS,
+    action_groups_for_api,
     audit_bytes_from_request,
     client_ip,
+    default_action_filters,
     delivery_identity_index,
+    engine_source_values,
     group_api_payload,
     group_detail_shell_context,
     group_engine_rows,
-    group_epoch_count,
     group_overview_context,
     group_summary_context,
     groups_for_audit_file,
     paginated_payloads,
     saved_report_projection_summary,
-    valid_group_event_queryset,
 )
 
 SCHEMA_VERSION = "marmot-forensics-audit/v4"
@@ -3827,6 +3827,25 @@ class HumanActionGroupingTests(TestCase):
         self.assertEqual(response.json()["pagination"]["scan_limit"], 1)
         self.assertEqual(heavy_bulk_selects(captured.captured_queries), [])
 
+    def test_action_api_skips_kind_name_echoed_as_action(self):
+        ingest_body(
+            jsonl(
+                audit_event(
+                    0,
+                    wall_time_ms=T0,
+                    context={"human_action": {"action": "ingest_entry", "origin": "system"}},
+                ),
+                audit_event(
+                    1,
+                    wall_time_ms=T0 + 1000,
+                    context={"human_action": self._human_action("send_message")},
+                ),
+            )
+        )
+        group = AuditGroup.objects.get(slug=GROUP_REF)
+        action_groups = action_groups_for_api(group, {**default_action_filters(), "limit": 100})
+        self.assertEqual([row["action"] for row in action_groups], ["send_message"])
+
 
 class UploadTokenLifecycleTests(TestCase):
     """Lock in the documented upload-token lifecycle: reusable by default,
@@ -5403,72 +5422,6 @@ class DashboardTests(TestCase):
         self.assertContains(response, visible_msg_ids[0][:16])
         self.assertNotContains(response, hidden_msg_id[:16])
 
-    def test_group_epoch_count_counts_distinct_epochs_in_database(self):
-        group = AuditGroup.objects.create(
-            name="Epoch union group",
-            slug="epoch-union-group",
-            group_ref=GROUP_REF,
-        )
-        audit_file = AuditFile.objects.create(
-            file_sha256="c" * 64,
-            byte_size=1024,
-            raw_text="{}\n",
-            validation_status=AuditFile.STATUS_VALID,
-            source_name="epochs.jsonl",
-            total_line_count=3,
-            valid_event_count=3,
-        )
-        AuditEvent.objects.bulk_create(
-            [
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=1,
-                    line_hash="epoch-1".ljust(64, "0"),
-                    raw_line="{}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="convergence_decision",
-                    epoch=1,
-                    source_epoch=2,
-                    to_epoch=3,
-                    current_tip_epoch=4,
-                    selected_tip_epoch=5,
-                ),
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=2,
-                    line_hash="epoch-2".ljust(64, "0"),
-                    raw_line="{}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="epoch_rolled_back",
-                    epoch=1,
-                    source_epoch=6,
-                    pending_epoch=5,
-                    current_tip_epoch=7,
-                    selected_tip_epoch=7,
-                ),
-                AuditEvent(
-                    audit_file=audit_file,
-                    group=group,
-                    line_number=3,
-                    line_hash="epoch-3".ljust(64, "0"),
-                    raw_line="{}",
-                    parse_status=AuditEvent.STATUS_VALID,
-                    event_type="send_entry",
-                ),
-            ]
-        )
-
-        with CaptureQueriesContext(connection) as captured:
-            epoch_count = group_epoch_count(valid_group_event_queryset(group))
-
-        self.assertEqual(epoch_count, 7)
-        self.assertEqual(len(captured), 1)
-        sql = captured[0]["sql"].upper()
-        self.assertIn("COUNT", sql)
-        self.assertEqual(sql.count("UNION"), len(GROUP_EPOCH_FIELDS) - 1)
-
     def test_group_detail_shell_size_stays_bounded_for_large_groups(self):
         group = AuditGroup.objects.create(
             name="Large response group",
@@ -5516,10 +5469,7 @@ class DashboardTests(TestCase):
         self.assertEqual(
             heavy_bulk_selects(
                 shell_queries.captured_queries,
-                allowed_columns=(
-                    HEAVY_EVENT_SELECT_COLUMNS["raw_kind"],
-                    HEAVY_EVENT_SELECT_COLUMNS["context_source"],
-                ),
+                allowed_columns=(HEAVY_EVENT_SELECT_COLUMNS["raw_kind"],),
             ),
             [],
         )
@@ -7235,6 +7185,24 @@ class GroupOverviewLazyContextTests(TestCase):
 
         overview.assert_called_once_with(self.group)
         self.assertIn("overview", context)
+
+    def test_engine_source_values_reads_file_columns_not_events(self):
+        ingest_body(
+            representative_audit_log(source={"hardware_model": "iPhone17,2", "platform": "ios"})
+        )
+        group = AuditGroup.objects.get(group_ref=GROUP_REF)
+
+        with CaptureQueriesContext(connection) as captured:
+            values = engine_source_values(group)
+
+        self.assertEqual(values[ENGINE_ALICE]["hardware_models"], ["iPhone17,2"])
+        self.assertEqual(values[ENGINE_ALICE]["platforms"], ["ios"])
+        self.assertFalse(
+            any(
+                "forensics_auditevent" in query["sql"].lower()
+                for query in captured.captured_queries
+            )
+        )
 
 
 class ProfileTests(TestCase):

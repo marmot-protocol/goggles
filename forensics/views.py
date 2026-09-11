@@ -15,7 +15,7 @@ from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.core.files.uploadhandler import FileUploadHandler
 from django.core.paginator import Paginator
 from django.db import DatabaseError
-from django.db.models import Count, Max, Min, Prefetch, Q
+from django.db.models import Count, F, Max, Min, Prefetch, Q
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Length, Substr
 from django.http import (
@@ -101,14 +101,6 @@ WARNING_SEVERITY_TOKENS = (
     "rollback",
     "stale",
     "warning",
-)
-GROUP_EPOCH_FIELDS = (
-    "epoch",
-    "source_epoch",
-    "to_epoch",
-    "pending_epoch",
-    "current_tip_epoch",
-    "selected_tip_epoch",
 )
 GROUP_DETAIL_TAB_TEMPLATES = {
     "overview": "forensics/partials/group_overview.html",
@@ -334,19 +326,10 @@ def group_summary_context(group: AuditGroup) -> dict:
         "timeline_summary": {
             "engines": engine_preview,
             "engine_overflow_count": max(engine_count - len(engine_preview), 0),
-            "epoch_count": group_epoch_count(valid_events),
         },
         "tab_counts": header_context["tab_counts"],
         "tab_event_limit": header_context["tab_event_limit"],
     }
-
-
-def group_epoch_count(valid_events) -> int:
-    epoch_queries = [
-        valid_events.exclude(**{f"{field}__isnull": True}).order_by().values_list(field, flat=True)
-        for field in GROUP_EPOCH_FIELDS
-    ]
-    return epoch_queries[0].union(*epoch_queries[1:]).count()
 
 
 ENGINE_SOURCE_FIELD_MAP = (
@@ -408,36 +391,30 @@ def group_engine_rows(
 
 
 def engine_source_values(group: AuditGroup) -> dict[str, dict[str, list[str]]]:
+    # Ingest already copied context.source onto AuditFile. Don't rescan events.
     values_by_engine: dict[str, dict[str, set[str]]] = {}
-    events = (
-        valid_group_event_queryset(group)
-        .exclude(engine_id="")
-        .select_related("audit_file")
-        .only(
-            "engine_id",
-            "account_ref",
-            "context_source",
-            "audit_file__source_device_id",
-            "audit_file__source_hardware_model",
-            "audit_file__source_platform",
-            "audit_file__source_app_version",
-            "audit_file__source_upload_trigger",
-        )
+    files = AuditFile.objects.filter(groups=group).only(
+        "engine_ids",
+        "account_refs",
+        "source_device_id",
+        "source_hardware_model",
+        "source_platform",
+        "source_app_version",
+        "source_upload_trigger",
     )
-    for event in events.iterator(chunk_size=2_000):
-        engine_values = values_by_engine.setdefault(
-            event.engine_id,
-            {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
-            | {"account_refs": set()},
-        )
-        if event.account_ref:
-            engine_values["account_refs"].add(event.account_ref)
-        context_source = event.context_source if isinstance(event.context_source, dict) else {}
-        for key, file_field, context_key in ENGINE_SOURCE_FIELD_MAP:
-            append_engine_source_value(
-                engine_values[key], getattr(event.audit_file, file_field, "")
+    for audit_file in files:
+        for engine_id in audit_file.engine_ids or []:
+            if not engine_id:
+                continue
+            engine_values = values_by_engine.setdefault(
+                engine_id,
+                {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
+                | {"account_refs": set()},
             )
-            append_engine_source_value(engine_values[key], context_source.get(context_key))
+            for account_ref in audit_file.account_refs or []:
+                append_engine_source_value(engine_values["account_refs"], account_ref)
+            for key, file_field, _context_key in ENGINE_SOURCE_FIELD_MAP:
+                append_engine_source_value(engine_values[key], getattr(audit_file, file_field, ""))
 
     return {
         engine_id: {key: sorted(values) for key, values in engine_values.items()}
@@ -476,16 +453,11 @@ def engine_sensitive_field_paths(metadata: dict[str, list[str]]) -> list[str]:
 
 def group_overview_context(group: AuditGroup) -> dict:
     audit_files = list(audit_files_for_group(group)[:GROUP_DETAIL_TAB_EVENT_LIMIT])
-    engines = group_engine_rows(group, limit=GROUP_DETAIL_TAB_EVENT_LIMIT)
+    engine_rows = group_engine_rows(group, limit=GROUP_DETAIL_TAB_EVENT_LIMIT + 1)
+    engines_limited = len(engine_rows) > GROUP_DETAIL_TAB_EVENT_LIMIT
+    engines = engine_rows[:GROUP_DETAIL_TAB_EVENT_LIMIT]
     action_filters = {**default_action_filters(), "limit": 5}
     action_groups = action_groups_for_api(group, action_filters)
-    engine_count = (
-        valid_group_event_queryset(group)
-        .exclude(engine_id="")
-        .values("engine_id")
-        .distinct()
-        .count()
-    )
     mode_change_events = list(
         audit_data_mode_change_queryset(group).order_by("-wall_time_ms", "-id")[
             :GROUP_DETAIL_TAB_EVENT_LIMIT
@@ -520,7 +492,7 @@ def group_overview_context(group: AuditGroup) -> dict:
         "audit_files": file_rows_for_group(audit_files, group),
         "audit_files_limited": len(audit_files) == GROUP_DETAIL_TAB_EVENT_LIMIT,
         "engines": engines,
-        "engines_limited": engine_count > len(engines),
+        "engines_limited": engines_limited,
         "audit_data_mode_changes": [
             audit_data_mode_change_payload(event) for event in mode_change_events
         ],
@@ -2080,6 +2052,10 @@ def action_event_queryset(group: AuditGroup):
     return (
         valid_group_event_queryset(group)
         .exclude(human_action_action="")
+        # MDK stamps context.human_action.action = kind.type on almost every
+        # event. Those copies are not attribution records; treating them as
+        # such materializes the whole group for a 5-item overview preview.
+        .exclude(human_action_action=F("event_type"))
         .only(*EVENT_ROW_FIELDS)
         .order_by("wall_time_ms", "engine_id", "line_number", "id")
     )

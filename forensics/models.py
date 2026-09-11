@@ -371,6 +371,10 @@ class AuditEvent(models.Model):
             models.Index(fields=["recorder_session_id"]),
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["group_ref", "wall_time_ms"]),
+            models.Index(
+                fields=["group", "parse_status", "wall_time_ms", "engine_id", "line_number"],
+                name="forensics_a_grp_stat_time_idx",
+            ),
             models.Index(fields=["msg_id"]),
             models.Index(fields=["event_type"]),
             models.Index(fields=["human_action_action"]),
@@ -436,6 +440,10 @@ class DeliveryArtifact(models.Model):
             models.Index(fields=["group", "artifact_kind"]),
             models.Index(fields=["artifact_id"]),
             models.Index(fields=["first_seen_ms"]),
+            models.Index(
+                fields=["group", "first_seen_ms", "artifact_id"],
+                name="forensics_d_grp_seen_idx",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -560,6 +568,10 @@ class NetworkObservation(models.Model):
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["nostr_event_id"]),
             models.Index(fields=["relay_url"]),
+            models.Index(
+                fields=["group", "wall_time_ms", "engine_id"],
+                name="forensics_n_grp_time_idx",
+            ),
         ]
 
 
@@ -594,6 +606,10 @@ class ConvergenceRun(models.Model):
         indexes = [
             models.Index(fields=["group", "phase"]),
             models.Index(fields=["engine_id", "started_at_ms"]),
+            models.Index(
+                fields=["group", "started_at_ms", "engine_id"],
+                name="forensics_c_grp_start_idx",
+            ),
         ]
 
 
@@ -676,6 +692,10 @@ class StateDelta(models.Model):
             models.Index(fields=["group", "epoch"]),
             models.Index(fields=["change_kind"]),
             models.Index(fields=["origin_commit_id"]),
+            models.Index(
+                fields=["group", "epoch", "wall_time_ms"],
+                name="forensics_s_grp_epoch_time_idx",
+            ),
         ]
 
 
@@ -706,4 +726,8 @@ class EpochStateTransition(models.Model):
             models.Index(fields=["group", "epoch"]),
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["new_state"]),
+            models.Index(
+                fields=["group", "wall_time_ms", "engine_id"],
+                name="forensics_e_grp_time_idx",
+            ),
         ]
