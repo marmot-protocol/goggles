@@ -56,7 +56,6 @@ services:
       - -c
       - >-
         python manage.py migrate --noinput &&
-        if [ "$${GOGGLES_PRUNE_ON_STARTUP:-1}" = "1" ]; then python manage.py prune_audit_data; fi &&
         python manage.py collectstatic --noinput &&
         exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${GOGGLES_WEB_WORKERS:-3} --threads $${GOGGLES_WEB_THREADS:-2} --timeout $${GOGGLES_WEB_TIMEOUT_SECONDS:-300} --max-requests $${GOGGLES_WEB_MAX_REQUESTS:-500} --max-requests-jitter $${GOGGLES_WEB_MAX_REQUESTS_JITTER:-50} --access-logfile - --access-logformat '%(t)s %(m)s %(s)s %(B)s %(L)s'
     logging:
@@ -74,6 +73,27 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  retention:
+    build: .
+    init: true
+    restart: unless-stopped
+    # Bound catch-up deletes and projection rebuilds just like web workloads.
+    mem_limit: ${GOGGLES_WEB_MEMORY_LIMIT:-16g}
+    memswap_limit: ${GOGGLES_WEB_MEMORY_LIMIT:-16g}
+    mem_swappiness: 0
+    cpus: ${GOGGLES_WEB_CPUS:-2.0}
+    pids_limit: ${GOGGLES_WEB_PIDS_LIMIT:-256}
+    env_file: ${GOGGLES_ENV_FILE:-.env}
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["python", "deploy/prune_nightly.py"]
+    logging:
+      driver: json-file
+      options:
+        max-size: ${GOGGLES_WEB_LOG_MAX_SIZE:-20m}
+        max-file: ${GOGGLES_WEB_LOG_MAX_FILES:-5}
 
   static:
     image: nginx:1.31-alpine

@@ -26,7 +26,7 @@ class Command(BaseCommand):
         "Delete audit evidence (uploaded files and their events) and recorded upload "
         "rejections older than the retention window, and rebuild projections for "
         "affected groups. "
-        "Retention defaults to settings.GOGGLES_AUDIT_RETENTION_DAYS (14 days); "
+        "Retention defaults to settings.GOGGLES_AUDIT_RETENTION_DAYS (30 days); "
         "override with --retention-days."
     )
 

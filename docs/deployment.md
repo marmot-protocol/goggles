@@ -2,16 +2,54 @@
 
 ## Audit Evidence Retention
 
-The web container normally prunes aged audit evidence on startup (migrations, then
-`prune_audit_data`, then `collectstatic` and gunicorn — see
-`docker-compose.yml`). Retention defaults to 14 days and is configurable via
-`GOGGLES_AUDIT_RETENTION_DAYS`; uploads (and their events) older than the window
-are deleted and the affected groups' projections are rebuilt from surviving
-evidence. On Postgres, a successful prune also runs `VACUUM ANALYZE` scoped to
-the file and event tables so deleted `raw_text` rows actually free disk space;
-no-op startups skip the VACUUM. Preview what would be pruned with
-`uv run python manage.py prune_audit_data --dry-run`, or override the window for
-a one-off run with `uv run python manage.py prune_audit_data --retention-days N`.
+Audit uploads and their events use one retention window, defaulting to **30 days
+from server receipt** (`AuditFile.created_at`), not the event's timestamp or the
+age of its group. Pruning deletes entire expired uploads and their events, ages
+out body-free rejection records, and rebuilds affected groups' projections from
+surviving evidence. There is no historical rollup. Saved investigation reports,
+group metadata, backups and exported copies are outside this command's scope.
+The 30-day window is the chosen investigation-history policy, replacing the
+previous 14-day default; scheduling separately ensures that policy runs regularly.
+
+The Compose `retention` service is the sole automatic pruning trigger. It waits
+for a healthy web service (after migrations), runs an immediate catch-up
+prune, then runs nightly at **03:00 UTC**, independent of web restarts. Failed
+runs retry every five minutes. Each run finishes before another begins within
+that service; keep one retention replica. Expired evidence can remain until the
+next nightly run (normally less than 31 days total), or longer during an outage.
+
+For existing installations, set `GOGGLES_AUDIT_RETENTION_DAYS=30` in the deployment
+environment: an existing value of 14 overrides the new default. Both catch-up and
+nightly runs use this same setting. Preview against the deployed database with:
+
+```sh
+docker compose exec -T web python manage.py prune_audit_data --dry-run
+```
+
+Deploy with `docker compose up -d --build` to include the new retention service.
+Verify it with `docker compose ps retention` and
+`docker compose logs --since 24h retention`; successful runs report aggregate
+counts, including when there is nothing to prune. Monitor these logs for failures
+or missing daily completion. A running container alone does not prove pruning
+succeeded. This repository does not configure external alert delivery.
+
+Despite its legacy name, `GOGGLES_PRUNE_ON_STARTUP=0` disables both catch-up and
+nightly runs in `retention`. The existing name is retained so deployment disable
+settings continue to work. Recreate `retention` after changing this flag; changing
+the environment file or restarting `web` alone does not change a running scheduler.
+Stop `retention` and confirm its pruning child has exited before a historical
+purge or maintenance that must exclude pruning.
+
+The retention container uses the web memory/swap, CPU and PID limit settings.
+These limits apply per container: budget capacity for web, retention and Postgres
+running together. Postgres-side query and VACUUM work uses the database container's
+resources, not the retention container's limits.
+
+Manual `prune_audit_data` calls remain explicit operations and support
+`--dry-run` and `--retention-days N`.
+
+On Postgres, pruning runs `VACUUM ANALYZE` on the file and event tables to make
+deleted space reusable. This is not secure erasure or removal of backups.
 
 ## V4-only acceptance and historical data reset
 
@@ -41,8 +79,11 @@ A schema-valid value outside these limits rejects the whole file with
 or Goggles' limits are corrected. Treat this compatibility check as a deployment
 gate, not evidence established by the schema checksum alone.
 
-1. Inventory the existing installation, database, backups and exports before
-   changing it. Record a production `purge_audit_data --dry-run` count (using
+1. Stop any running `retention` service and confirm its pruning child has exited
+   **before beginning the cutover**; it can delete nightly without a web restart.
+   Set `GOGGLES_PRUNE_ON_STARTUP=0` in the deployment environment and keep it at 0
+   until deletion is approved. Inventory the installation, database, backups and
+   exports before changing it. Record a production `purge_audit_data --dry-run` count (using
    `docker compose exec -T web python manage.py purge_audit_data --dry-run`).
    The existing command counts uploads, events, groups, reports and rejections;
    the new command additionally counts every projection table.
@@ -54,10 +95,12 @@ gate, not evidence established by the schema checksum alone.
 3. Deploy the v4-only release and apply migrations. Migration 0015 removes the
    old source-label/pubkey columns, adds `source_hardware_model`, and removes
    sensitive metadata columns from the existing rejection table. It does not purge raw evidence or reports.
-   **Normal Compose startup also runs retention pruning.** Before any restart,
-   set `GOGGLES_PRUNE_ON_STARTUP=0` in the deployment environment. Keep it at 0
-   until deletion is authorized. The new Compose command then runs migrations,
-   collectstatic and gunicorn without pruning. Existing old workers do not honor
+   **The retention service must stay disabled.** Confirm the flag from step 1
+   is 0, then recreate both `web` and `retention` with the new Compose definition
+   and environment. Confirm `retention` logs "Automatic retention pruning is
+   disabled." Recreating only `web` does not update the scheduler's environment.
+   The new web command runs migrations, collectstatic and gunicorn without pruning.
+   Older releases may prune on web startup, and the oldest workers do not honor
    this flag: stop/drain them before recreating with the new Compose definition.
 4. Re-enable uploads only on v4-only workers. Test authenticated raw NDJSON and
    multipart requests with synthetic invalid/legacy/mixed bodies; they must
@@ -85,8 +128,11 @@ gate, not evidence established by the schema checksum alone.
 7. Resume v4 uploads and exports. Verify a new valid v4 file and its projections.
    Replay synthetic legacy and forbidden-field uploads; assert evidence counts
    do not increase (a body-free rejection record may increase). Resume normal
-   retention startup behavior (`GOGGLES_PRUNE_ON_STARTUP=1`) only after the
-   deletion approval is fulfilled.
+   automatic retention only after the deletion approval is fulfilled: set
+   `GOGGLES_PRUNE_ON_STARTUP=1` and recreate `retention` so it loads the new value.
+   This immediately runs catch-up pruning and enables nightly runs. Verify its
+   completion in the retention logs; changing the environment file alone does
+   not re-enable an already-running disabled scheduler.
 
 The acceptance boundary must be deployed **before** the purge. Never roll back
 to a legacy-accepting application after the reset. If v4 needs rollback, disable

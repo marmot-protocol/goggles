@@ -4855,8 +4855,21 @@ class PurgeAuditDataCommandTests(TestCase):
 
 
 class PruneAuditDataCommandTests(TransactionTestCase):
+    def test_thirty_day_boundary_uses_server_receipt(self):
+        old_file, recent_file, _group = self.ingest_paired_evidence()
+        now = timezone.now()
+        cutoff = now - timedelta(days=30)
+        AuditFile.objects.filter(pk=old_file.pk).update(
+            created_at=cutoff - timedelta(microseconds=1)
+        )
+        AuditFile.objects.filter(pk=recent_file.pk).update(created_at=cutoff)
+        with mock.patch("django.utils.timezone.now", return_value=now):
+            call_command("prune_audit_data", stdout=StringIO())
+        self.assertFalse(AuditFile.objects.filter(pk=old_file.pk).exists())
+        self.assertTrue(AuditFile.objects.filter(pk=recent_file.pk).exists())
+
     def ingest_paired_evidence(self):
-        """One group holding a 20-day-old upload and a fresh upload."""
+        """One group holding a 40-day-old upload and a fresh upload."""
         _raw_token, token = UploadToken.issue("ios qa")
         old_file = ingest_audit_log_bytes(
             dump_bytes=representative_audit_log(engine_id=ENGINE_ALICE).encode("utf-8"),
@@ -4867,7 +4880,7 @@ class PruneAuditDataCommandTests(TransactionTestCase):
             upload_token=token,
         ).audit_file
         AuditFile.objects.filter(pk=old_file.pk).update(
-            created_at=timezone.now() - timedelta(days=20)
+            created_at=timezone.now() - timedelta(days=40)
         )
         group = AuditGroup.objects.get(slug=GROUP_REF)
         return old_file, recent_file, group
@@ -4900,7 +4913,7 @@ class PruneAuditDataCommandTests(TransactionTestCase):
     def test_retention_days_override_spans_both_files(self):
         old_file, recent_file, _group = self.ingest_paired_evidence()
 
-        call_command("prune_audit_data", "--retention-days", "21", stdout=StringIO())
+        call_command("prune_audit_data", "--retention-days", "45", stdout=StringIO())
 
         self.assertTrue(AuditFile.objects.filter(pk=old_file.pk).exists())
         self.assertTrue(AuditFile.objects.filter(pk=recent_file.pk).exists())
@@ -4910,7 +4923,7 @@ class PruneAuditDataCommandTests(TransactionTestCase):
             call_command("prune_audit_data", "--retention-days", "0", stdout=StringIO())
 
     def test_retention_default_uses_setting(self):
-        with override_settings(GOGGLES_AUDIT_RETENTION_DAYS=21):
+        with override_settings(GOGGLES_AUDIT_RETENTION_DAYS=45):
             old_file, _recent_file, _group = self.ingest_paired_evidence()
 
             call_command("prune_audit_data", stdout=StringIO())
@@ -4938,7 +4951,7 @@ class PruneAuditDataCommandTests(TransactionTestCase):
             received_bytes=60,
         )
         UploadRejection.objects.filter(pk=old.pk).update(
-            created_at=timezone.now() - timedelta(days=20)
+            created_at=timezone.now() - timedelta(days=40)
         )
         recent = UploadRejection.objects.create(
             upload_token=token, reason=UploadRejection.REASON_TOO_LARGE, status_code=413
@@ -4957,7 +4970,7 @@ class PruneAuditDataCommandTests(TransactionTestCase):
             upload_token=token, reason=UploadRejection.REASON_TOO_LARGE, status_code=413
         )
         UploadRejection.objects.filter(pk=old.pk).update(
-            created_at=timezone.now() - timedelta(days=20)
+            created_at=timezone.now() - timedelta(days=40)
         )
 
         call_command("prune_audit_data", "--dry-run", stdout=StringIO())
