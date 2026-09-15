@@ -2,16 +2,43 @@
 
 ## Audit Evidence Retention
 
-The web container normally prunes aged audit evidence on startup (migrations, then
-`prune_audit_data`, then `collectstatic` and gunicorn — see
-`docker-compose.yml`). Retention defaults to 14 days and is configurable via
-`GOGGLES_AUDIT_RETENTION_DAYS`; uploads (and their events) older than the window
-are deleted and the affected groups' projections are rebuilt from surviving
-evidence. On Postgres, a successful prune also runs `VACUUM ANALYZE` scoped to
-the file and event tables so deleted `raw_text` rows actually free disk space;
-no-op startups skip the VACUUM. Preview what would be pruned with
-`uv run python manage.py prune_audit_data --dry-run`, or override the window for
-a one-off run with `uv run python manage.py prune_audit_data --retention-days N`.
+Audit uploads and their events use one retention window, defaulting to **30 days
+from server receipt** (`AuditFile.created_at`), not the event's timestamp or the
+age of its group. Pruning deletes entire expired uploads and their events, ages
+out body-free rejection records, and rebuilds affected groups' projections from
+surviving evidence. There is no historical rollup. Saved investigation reports,
+group metadata, backups and exported copies are outside this command's scope.
+
+The web container prunes after migrations on startup. The separate Compose
+`retention` service waits for a healthy web service, runs an immediate catch-up
+prune, then runs nightly at **03:00 UTC**, independent of web restarts. Failed
+runs retry every five minutes. Each run finishes before another begins within
+that service; keep one retention replica. Expired evidence can remain until the
+next nightly run (normally less than 31 days total), or longer during an outage.
+
+For existing installations, set `GOGGLES_AUDIT_RETENTION_DAYS=30` in the deployment
+environment: an existing value of 14 overrides the new default. Both startup and
+nightly runs use this same setting. Preview against the deployed database with:
+
+```sh
+docker compose exec -T web python manage.py prune_audit_data --dry-run
+```
+
+Deploy with `docker compose up -d --build` to include the new retention service.
+Verify it with `docker compose ps retention` and
+`docker compose logs --since 24h retention`; successful runs report aggregate
+counts, including when there is nothing to prune. Monitor these logs for failures
+or missing daily completion. A running container alone does not prove pruning
+succeeded. This repository does not configure external alert delivery.
+
+`GOGGLES_PRUNE_ON_STARTUP=0` disables **both** automatic paths for the v4 cutover
+below. Recreate both `web` and `retention` after changing the environment. Stop
+`retention` before a historical purge or maintenance that must exclude pruning.
+Manual `prune_audit_data` calls remain explicit operations and support
+`--dry-run` and `--retention-days N`.
+
+On Postgres, pruning runs `VACUUM ANALYZE` on the file and event tables to make
+deleted space reusable. This is not secure erasure or removal of backups.
 
 ## V4-only acceptance and historical data reset
 

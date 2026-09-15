@@ -236,6 +236,12 @@ The web container runs `python manage.py migrate --noinput` before Gunicorn star
 docker compose exec web python manage.py migrate --noinput
 ```
 
+Audit evidence defaults to 30 days of retention from server receipt. The
+`retention` Compose service prunes on startup and nightly at 03:00 UTC, rebuilding
+group projections from the surviving events. Existing deployments must update
+`GOGGLES_AUDIT_RETENTION_DAYS=30` in their environment. See
+[retention operations and scope](docs/deployment.md#audit-evidence-retention).
+
 The web container runs `collectstatic` into the Docker-managed `static-assets` volume. The `static` Compose service serves that volume on `127.0.0.1:8001`, and Caddy proxies `/static/*` to it. Django/Gunicorn handles the application and upload API.
 
 ### Caddy

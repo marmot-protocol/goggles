@@ -75,6 +75,21 @@ services:
       retries: 3
       start_period: 20s
 
+  retention:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: ${GOGGLES_ENV_FILE:-.env}
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["python", "deploy/prune_nightly.py"]
+    logging:
+      driver: json-file
+      options:
+        max-size: ${GOGGLES_WEB_LOG_MAX_SIZE:-20m}
+        max-file: ${GOGGLES_WEB_LOG_MAX_FILES:-5}
+
   static:
     image: nginx:1.31-alpine
     restart: unless-stopped
