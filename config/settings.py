@@ -319,9 +319,9 @@ GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
 GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 50_000))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
 # How long raw audit evidence (uploaded files and their events) is kept. The
-# prune_audit_data management command runs at web startup and nightly in the
-# retention service. It deletes evidence older than this window and rebuilds
-# the affected groups' projections. Both paths use the same retention window.
+# prune_audit_data management command runs at retention-service startup and
+# nightly. It deletes evidence older than this window and rebuilds the affected
+# groups' projections. Both runs use the same retention window.
 GOGGLES_AUDIT_RETENTION_DAYS = int(os.environ.get("GOGGLES_AUDIT_RETENTION_DAYS", 30))
 # Operational kill-switch for the streaming group-export endpoint, mirroring the
 # upload toggle. Lets an operator shed a resource-intensive read surface without a
