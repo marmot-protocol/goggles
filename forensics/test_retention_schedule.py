@@ -7,6 +7,28 @@ from deploy import prune_nightly
 
 
 class RetentionScheduleTests(SimpleTestCase):
+    def test_pruning_switch_accepts_project_boolean_spellings(self):
+        for value, enabled in (
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("NO", False),
+            ("off", False),
+        ):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict("os.environ", {"GOGGLES_PRUNE_ON_STARTUP": value}),
+                mock.patch.object(prune_nightly.subprocess, "run") as run,
+                mock.patch.object(prune_nightly.time, "sleep", side_effect=InterruptedError),
+            ):
+                run.return_value.returncode = 0
+                with self.assertRaises(InterruptedError):
+                    prune_nightly.main()
+                self.assertEqual(run.call_count, int(enabled))
+
     def test_next_run_is_three_utc_across_day_boundary(self):
         for now, seconds in (
             (datetime(2026, 9, 15, 2, 59, 59, tzinfo=UTC), 1),

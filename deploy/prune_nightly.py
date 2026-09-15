@@ -22,7 +22,7 @@ def seconds_until_next_run(now: datetime) -> float:
 
 def main() -> None:
     while True:
-        if os.environ.get("GOGGLES_PRUNE_ON_STARTUP", "1") == "1":
+        if os.environ.get("GOGGLES_PRUNE_ON_STARTUP", "1").lower() in {"1", "true", "yes", "on"}:
             result = subprocess.run([sys.executable, "manage.py", "prune_audit_data"])
             if result.returncode:
                 print("Retention prune failed; retrying in 300 seconds.", flush=True)
