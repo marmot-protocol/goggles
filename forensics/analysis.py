@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from . import normalized_fields as normalized_field_config
 from .audit_schema import SCHEMA_VERSION
+from .evidence import structural_quarantine_exclusion as structural_quarantine_exclusion
 from .models import AuditEvent, AuditFile, AuditGroup
 from .source_metadata import session_source_contexts
 
@@ -85,34 +86,6 @@ EXPORT_SENSITIVITY = {
 VIZ_PALETTE_SIZE = 8
 GROUP_REF_FULL_DISPLAY_MAX = 80
 GROUP_REF_EDGE_DISPLAY_CHARS = 32
-STRUCTURAL_QUARANTINE_ERRORS = (
-    "audit log contains multiple engine_ids",
-    "audit log contains multiple account_refs",
-)
-
-
-def structural_quarantine_exclusion(field_prefix: str = "") -> Q:
-    """The ``Q`` that excludes events belonging to a *structurally* quarantined
-    file (multi-engine / multi-account uploads), the single definition shared by
-    every "events that count for a group" path.
-
-    A file marked ``validation_status=INVALID`` for a non-structural reason
-    (e.g. one malformed JSONL line) still contributes its ``parse_status=VALID``
-    events to the group: those events are real evidence and are rendered in the
-    timeline/tabs/export (goggles#80, commit ``0ac4442``). Only the structural
-    quarantine errors above mean the *whole* file's engine/account attribution
-    is untrustworthy and must be dropped wholesale.
-
-    ``field_prefix`` adapts the predicate to the relation path of the caller:
-    ``""`` for a queryset already rooted on ``AuditEvent``
-    (``audit_file__validation_error``), or ``"audit_events__"`` for the
-    reverse relation used when annotating ``AuditGroup``
-    (``audit_events__audit_file__validation_error``).
-    """
-    predicate = Q()
-    for error in STRUCTURAL_QUARANTINE_ERRORS:
-        predicate &= ~Q(**{f"{field_prefix}audit_file__validation_error__icontains": error})
-    return predicate
 
 
 def audit_files_for_group(group):
@@ -166,7 +139,6 @@ def valid_events_for_group(group, *, include_export_fields=False):
         fields.extend(
             [
                 "line_hash",
-                "schema_version",
                 "raw_context",
                 "raw_kind",
             ]
@@ -1183,12 +1155,13 @@ def timeline_engines(events):
     file_ids: dict[str, set] = defaultdict(set)
     source_metadata: dict[str, dict[str, str]] = defaultdict(dict)
     sessions = set()
+    fallback_metadata: dict[str, dict[str, str]] = defaultdict(dict)
     for event in events:
         engine_id = event.engine_id
         if not engine_id:
             continue
-        session = (engine_id, event.account_ref, getattr(event, "recorder_session_id", ""))
-        if getattr(event, "schema_version", "") != SCHEMA_VERSION:
+        session = (engine_id, event.account_ref, event.recorder_session_id)
+        if event.schema_version != SCHEMA_VERSION:
             session = (engine_id, event.account_ref, "")
         sessions.add(session)
         info = by_engine.setdefault(
@@ -1212,19 +1185,21 @@ def timeline_engines(events):
             info["last_event_ms"] = max(
                 info["last_event_ms"] or event.wall_time_ms, event.wall_time_ms
             )
-        metadata = source_metadata[engine_id]
-        for field in ("source_platform", "source_hardware_model"):
-            if all(session):
-                continue
-            value = getattr(event.audit_file, field)
-            if value:
-                metadata.setdefault(field, value)
+        if not all(session):
+            for field in ("source_platform", "source_hardware_model"):
+                value = getattr(event.audit_file, field)
+                if value:
+                    fallback_metadata[engine_id].setdefault(field, value)
         file_ids[engine_id].add(event.audit_file_id)
 
     for engine_id, source in session_source_contexts(sessions):
         for key in ("platform", "hardware_model"):
             if source.get(key):
                 source_metadata[engine_id].setdefault("source_" + key, source[key])
+
+    for engine_id, metadata in fallback_metadata.items():
+        for key, value in metadata.items():
+            source_metadata[engine_id].setdefault(key, value)
 
     engines = sorted(
         by_engine.values(),

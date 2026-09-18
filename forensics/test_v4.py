@@ -338,6 +338,8 @@ class V4BoundaryTests(TestCase):
                 SimpleNamespace(
                     engine_id="a" * 32,
                     account_ref="b" * 32,
+                    recorder_session_id="",
+                    schema_version=SCHEMA_VERSION,
                     wall_time_ms=idx,
                     audit_file_id=idx,
                     audit_file=SimpleNamespace(

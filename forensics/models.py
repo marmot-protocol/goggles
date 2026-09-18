@@ -369,6 +369,25 @@ class AuditEvent(models.Model):
             models.Index(fields=["account_ref", "engine_id"]),
             models.Index(fields=["audit_data_mode"]),
             models.Index(fields=["recorder_session_id"]),
+            # Metadata reads project only these columns, never wide event bodies.
+            models.Index(
+                fields=[
+                    "group",
+                    "parse_status",
+                    "schema_version",
+                    "engine_id",
+                    "account_ref",
+                    "recorder_session_id",
+                    "audit_file",
+                ],
+                name="goggles_group_sessions_idx",
+            ),
+            # Most events have no source context. Seek only retained source rows.
+            models.Index(
+                fields=["engine_id", "account_ref", "recorder_session_id"],
+                condition=~models.Q(context_source={}),
+                name="goggles_session_source_idx",
+            ),
             models.Index(fields=["engine_id", "wall_time_ms"]),
             models.Index(fields=["group_ref", "wall_time_ms"]),
             models.Index(

@@ -7199,6 +7199,13 @@ class GroupOverviewLazyContextTests(TestCase):
         overview.assert_called_once_with(self.group)
         self.assertIn("overview", context)
 
+    def test_group_detail_shell_resolves_engine_metadata_once(self):
+        with mock.patch(
+            "forensics.views.engine_source_values", wraps=engine_source_values
+        ) as sources:
+            group_detail_shell_context(self.group)
+        self.assertEqual(sources.call_count, 1)
+
     def test_engine_source_values_does_not_hydrate_raw_evidence(self):
         ingest_body(
             representative_audit_log(source={"hardware_model": "iPhone17,2", "platform": "ios"})

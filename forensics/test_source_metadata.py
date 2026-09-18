@@ -1,15 +1,61 @@
 import json
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from .analysis import timeline_engines, valid_events_for_group
 from .audit_schema import SCHEMA_VERSION
 from .ingest import ingest_audit_log_bytes
-from .models import AuditGroup
+from .models import AuditFile, AuditGroup
 from .views import engine_source_values, group_engine_rows
 
 
 class RotatedSourceMetadataTests(TestCase):
+    def test_metadata_query_count_and_sqlite_index_plans(self):
+        for index in range(5):
+            self.upload(session=f"session-{index}", source={"app_version": str(index)})
+            self.upload(session=f"session-{index}", group="dd" * 16, seq=100)
+        group = AuditGroup.objects.get()
+        if connection.vendor == "sqlite":
+            with connection.cursor() as cursor:
+                cursor.execute("ANALYZE")
+        with self.assertNumQueries(3), CaptureQueriesContext(connection) as queries:
+            values = engine_source_values(group)
+        self.assertEqual(values["bb" * 16]["app_versions"], [str(i) for i in range(5)])
+        if connection.vendor == "sqlite":
+            with connection.cursor() as cursor:
+                cursor.execute("EXPLAIN QUERY PLAN " + queries[0]["sql"])
+                plan = str(cursor.fetchall())
+                self.assertIn("COVERING INDEX goggles_group_sessions_idx", plan)
+                cursor.execute("EXPLAIN QUERY PLAN " + queries[2]["sql"])
+                self.assertIn("goggles_session_source_idx", str(cursor.fetchall()))
+
+    def test_exact_timeline_metadata_precedes_incomplete_file_fallback(self):
+        self.upload(session=None, group="dd" * 16, source={"hardware_model": "Fallback"})
+        self.upload(source={"hardware_model": "Exact"})
+        self.upload(group="dd" * 16, seq=100)
+        engines, _ = timeline_engines(valid_events_for_group(AuditGroup.objects.get()))
+        self.assertEqual(engines[0]["label"], "Exact / bbbbbbbbbbbb")
+
+    def test_source_validity_matches_group_evidence_validity(self):
+        startup = self.upload(source={"app_version": "1.0"})
+        self.upload(group="dd" * 16, seq=100)
+        group = AuditGroup.objects.get()
+        startup.validation_status = AuditFile.STATUS_INVALID
+        startup.validation_error = "another line is invalid"
+        startup.save(update_fields=["validation_status", "validation_error"])
+        self.assertEqual(engine_source_values(group)["bb" * 16]["app_versions"], ["1.0"])
+        startup.validation_error = "audit log contains multiple engine_ids"
+        startup.save(update_fields=["validation_error"])
+        self.assertEqual(engine_source_values(group)["bb" * 16]["app_versions"], [])
+
+    def test_group_engine_rows_preserve_each_session_account(self):
+        for account in ("aa" * 16, "ee" * 16):
+            self.upload(account=account, group="dd" * 16, seq=100)
+        row = group_engine_rows(AuditGroup.objects.get())[0]
+        self.assertEqual(row["account_refs"], ["aa" * 16, "ee" * 16])
+
     def upload(
         self,
         *,

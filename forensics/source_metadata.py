@@ -4,11 +4,14 @@ Never join by engine alone: a later app launch may have a different version.
 Missing session/account identity is unknown, not permission to borrow metadata.
 """
 
+from collections import defaultdict
+
 from django.db.models import Q
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Substr
 
 from .audit_schema import SCHEMA_VERSION
+from .evidence import structural_quarantine_exclusion
 from .models import AuditEvent, AuditFile
 
 SOURCE_KEYS = ("device_id", "hardware_model", "platform", "app_version", "upload_trigger")
@@ -18,19 +21,22 @@ def session_source_contexts(sessions):
     sessions = sorted({tuple(session) for session in sessions if all(session)})
     # Bound SQL parameters/expression depth even for long-lived groups.
     for offset in range(0, len(sessions), 100):
-        matches = Q()
+        by_identity = defaultdict(list)
         for engine_id, account_ref, recorder_session_id in sessions[offset : offset + 100]:
+            by_identity[engine_id, account_ref].append(recorder_session_id)
+        matches = Q()
+        for (engine_id, account_ref), session_ids in by_identity.items():
             matches |= Q(
                 engine_id=engine_id,
                 account_ref=account_ref,
-                recorder_session_id=recorder_session_id,
+                recorder_session_id__in=session_ids,
             )
         rows = (
             AuditEvent.objects.filter(
                 matches,
+                structural_quarantine_exclusion(),
                 schema_version=SCHEMA_VERSION,
                 parse_status=AuditEvent.STATUS_VALID,
-                audit_file__validation_status=AuditFile.STATUS_VALID,
             )
             .exclude(context_source={})
             .annotate(
