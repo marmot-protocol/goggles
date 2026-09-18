@@ -228,6 +228,20 @@ class V4BoundaryTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(AuditFile.objects.get().source_hardware_model, "")
 
+    def test_local_member_ref_is_accepted_and_preserved_without_becoming_account_identity(self):
+        for multipart in (False, True):
+            event = self.event(seq=int(multipart))
+            event["kind"]["source"]["local_member_ref"] = "dd" * 16
+            self.assertEqual(self.post(event, multipart=multipart).status_code, 201)
+            stored = AuditEvent.objects.latest("id")
+            self.assertEqual(stored.context_source["local_member_ref"], "dd" * 16)
+            self.assertEqual(stored.account_ref, "aa" * 16)
+        for bad_ref in ("not-a-reference", "dd" * 15, "dd" * 32):
+            event = self.event(seq=9)
+            event["kind"]["source"]["local_member_ref"] = bad_ref
+            self.assertEqual(self.post(event).status_code, 400)
+        self.assertEqual(AuditFile.objects.count(), 2)
+
     def test_rejected_legacy_hash_does_not_deduplicate_into_historical_file(self):
         body = json.dumps(self.event(schema_version="marmot-forensics-audit/v3")).encode()
         old = AuditFile.objects.create(

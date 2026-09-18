@@ -8,7 +8,9 @@ from django.db.models import Count, Max, Min, Q
 from django.utils import timezone
 
 from . import normalized_fields as normalized_field_config
+from .audit_schema import SCHEMA_VERSION
 from .models import AuditEvent, AuditFile, AuditGroup
+from .source_metadata import session_source_contexts
 
 FORK_EVENT_TYPES = (
     "fork_resolution",
@@ -154,6 +156,8 @@ def valid_events_for_group(group, *, include_export_fields=False):
         "wall_time_ms",
         "account_ref",
         "engine_id",
+        "recorder_session_id",
+        "schema_version",
         "group_ref",
         "event_type",
         *AGENT_EXPORT_NORMALIZED_FIELDS,
@@ -1178,10 +1182,15 @@ def timeline_engines(events):
     by_engine: dict[str, dict] = {}
     file_ids: dict[str, set] = defaultdict(set)
     source_metadata: dict[str, dict[str, str]] = defaultdict(dict)
+    sessions = set()
     for event in events:
         engine_id = event.engine_id
         if not engine_id:
             continue
+        session = (engine_id, event.account_ref, getattr(event, "recorder_session_id", ""))
+        if getattr(event, "schema_version", "") != SCHEMA_VERSION:
+            session = (engine_id, event.account_ref, "")
+        sessions.add(session)
         info = by_engine.setdefault(
             engine_id,
             {
@@ -1205,10 +1214,17 @@ def timeline_engines(events):
             )
         metadata = source_metadata[engine_id]
         for field in ("source_platform", "source_hardware_model"):
+            if all(session):
+                continue
             value = getattr(event.audit_file, field)
             if value:
                 metadata.setdefault(field, value)
         file_ids[engine_id].add(event.audit_file_id)
+
+    for engine_id, source in session_source_contexts(sessions):
+        for key in ("platform", "hardware_model"):
+            if source.get(key):
+                source_metadata[engine_id].setdefault("source_" + key, source[key])
 
     engines = sorted(
         by_engine.values(),
