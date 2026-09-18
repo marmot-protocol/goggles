@@ -50,6 +50,7 @@ from .analysis import (
     structural_quarantine_exclusion,
     valid_events_for_group,
 )
+from .audit_schema import SCHEMA_VERSION
 from .ingest import UploadRejected, ingest_audit_log_bytes
 from .models import (
     AnalysisRun,
@@ -68,6 +69,7 @@ from .models import (
     UploadToken,
 )
 from .request_body import counted_body_bytes, declared_content_length
+from .source_metadata import session_source_contexts
 from .streaming import ExportSection, stream_ndjson
 from .token_crypto import expiry_from_days
 
@@ -255,9 +257,12 @@ def valid_group_event_queryset(group: AuditGroup):
 
 
 def group_detail_shell_context(group: AuditGroup) -> dict:
+    overview = group_overview_context(group)
     return {
-        **group_summary_context(group),
-        "overview": group_overview_context(group),
+        **group_summary_context(
+            group, engine_preview=overview["engines"][:GROUP_ENGINE_PREVIEW_LIMIT]
+        ),
+        "overview": overview,
     }
 
 
@@ -310,14 +315,15 @@ def group_summary_header_context(group: AuditGroup, *, valid_events=None) -> dic
     }
 
 
-def group_summary_context(group: AuditGroup) -> dict:
+def group_summary_context(group: AuditGroup, *, engine_preview=None) -> dict:
     valid_events = valid_group_event_queryset(group)
     header_context = group_summary_header_context(group, valid_events=valid_events)
-    engine_preview = group_engine_rows(
-        group,
-        valid_events=valid_events,
-        limit=GROUP_ENGINE_PREVIEW_LIMIT,
-    )
+    if engine_preview is None:
+        engine_preview = group_engine_rows(
+            group,
+            valid_events=valid_events,
+            limit=GROUP_ENGINE_PREVIEW_LIMIT,
+        )
     # summary.engine_count is already coalesced to an integer by the cheap
     # header builder, so the overflow math stays safe for empty groups.
     engine_count = header_context["summary"]["engine_count"]
@@ -398,12 +404,23 @@ def engine_source_values(
     *,
     engine_ids: list[str] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
-    # Ingest already copied context.source onto AuditFile. Don't rescan events.
+    # Keep direct file metadata, including uploads without recorder session IDs.
+    # Rotated segments also resolve source evidence from their exact sessions.
     # Account pairing stays on the event aggregate in group_engine_rows; a file
     # can list several account_refs and engine_ids independently.
     if engine_ids is not None and not engine_ids:
         return {}
     wanted = set(engine_ids) if engine_ids is not None else None
+    session_events = valid_group_event_queryset(group).filter(schema_version=SCHEMA_VERSION)
+    if wanted is not None:
+        session_events = session_events.filter(engine_id__in=wanted)
+    session_rows = list(
+        session_events.order_by()
+        .values_list("audit_file_id", "engine_id", "account_ref", "recorder_session_id")
+        .distinct()
+    )
+    session_files = {file_id for file_id, *identity in session_rows if all(identity)}
+    fallback_files = {file_id for file_id, *identity in session_rows if not all(identity)}
     values_by_engine: dict[str, dict[str, set[str]]] = {}
     files = AuditFile.objects.filter(groups=group).only(
         "engine_ids",
@@ -422,8 +439,25 @@ def engine_source_values(
                 {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
                 | {"account_refs": set()},
             )
+            # File summaries use the first source value, which may belong to a
+            # different launch in the same file. Prefer exact session evidence.
+            if audit_file.id in session_files and audit_file.id not in fallback_files:
+                continue
             for key, file_field, _context_key in ENGINE_SOURCE_FIELD_MAP:
                 append_engine_source_value(engine_values[key], getattr(audit_file, file_field, ""))
+
+    sessions = [identity for _file_id, *identity in session_rows]
+    for engine_id, account_ref, _session_id in sessions:
+        if account_ref and engine_id in values_by_engine:
+            values_by_engine[engine_id]["account_refs"].add(account_ref)
+    for engine_id, source in session_source_contexts(sessions):
+        engine_values = values_by_engine.setdefault(
+            engine_id,
+            {key: set() for key, _file_field, _context_key in ENGINE_SOURCE_FIELD_MAP}
+            | {"account_refs": set()},
+        )
+        for key, _file_field, context_key in ENGINE_SOURCE_FIELD_MAP:
+            append_engine_source_value(engine_values[key], source.get(context_key))
 
     return {
         engine_id: {key: sorted(values) for key, values in engine_values.items()}

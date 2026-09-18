@@ -1,5 +1,23 @@
 # Goggles Deployment Notes
 
+## V4 source metadata compatibility
+
+The committed v4 schema is synchronized byte for byte with MDK commit
+`8cf083167d1db488033e9d37acb2bf132b12df37`, including `local_member_ref`.
+Deploy the updated web application to accept newer MDK source-context records.
+Previously rejected bodies were not retained: they must be retried from the
+client if still available. Apply migration 0017 to add a covering group-session
+index and a partial index containing only source-bearing events. Index creation
+can briefly block writes on a populated database; schedule it accordingly. No
+purge or evidence backfill is required.
+
+Group overview and timeline metadata now resolve from retained source events
+with the same engine, account and recorder-session ID, including startup files
+without events for that group. Existing accepted evidence benefits immediately,
+without rewriting uploads or rebuilding projections. Missing session IDs or
+deleted/unuploaded source segments remain unknown. File-level metadata remains
+an exact summary of that file rather than an inferred copy from another segment.
+
 ## Audit Evidence Retention
 
 Audit uploads and their events use one retention window, defaulting to **30 days

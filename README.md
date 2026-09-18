@@ -89,6 +89,16 @@ Goggles derives source metadata only from validated JSONL `source_context` or
 `context.source`; upload headers/form labels and filenames are ignored.
 Rotated segments without source context are valid. Engines display platform,
 hardware model when known, and an opaque engine identifier.
+Group overviews and timelines also resolve retained source context across files
+with the same engine, account, and nonempty recorder-session ID. This restores
+metadata when the startup segment is not attached to the viewed group. Versions
+from different sessions are not borrowed; the overview lists all versions
+observed in the group's sessions. Missing or expired source evidence remains
+unknown. File metadata and raw evidence continue to describe that file alone.
+
+The v4 schema includes MDK's optional `source.local_member_ref`, a pseudonymous
+producer-to-member reference. It is preserved as source evidence, not substituted
+for `account_ref` or treated as proof of membership.
 
 HTTP 400 rejections return a fixed operational error code and optional line
 number. They never echo values, unknown field names or JSON fragments. The

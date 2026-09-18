@@ -7199,7 +7199,14 @@ class GroupOverviewLazyContextTests(TestCase):
         overview.assert_called_once_with(self.group)
         self.assertIn("overview", context)
 
-    def test_engine_source_values_reads_file_columns_not_events(self):
+    def test_group_detail_shell_resolves_engine_metadata_once(self):
+        with mock.patch(
+            "forensics.views.engine_source_values", wraps=engine_source_values
+        ) as sources:
+            group_detail_shell_context(self.group)
+        self.assertEqual(sources.call_count, 1)
+
+    def test_engine_source_values_does_not_hydrate_raw_evidence(self):
         ingest_body(
             representative_audit_log(source={"hardware_model": "iPhone17,2", "platform": "ios"})
         )
@@ -7212,7 +7219,10 @@ class GroupOverviewLazyContextTests(TestCase):
         self.assertEqual(values[ENGINE_ALICE]["platforms"], ["ios"])
         self.assertFalse(
             any(
-                "forensics_auditevent" in query["sql"].lower()
+                any(
+                    column in query["sql"].lower()
+                    for column in ('"raw_text"', '"raw_line"', '"raw_kind"', '"raw_context"')
+                )
                 for query in captured.captured_queries
             )
         )
