@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.conf import settings
-from django.db import DatabaseError, IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, connection, transaction
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.models import Case, IntegerField, Value, When
 from django.template.defaultfilters import slugify
@@ -18,6 +18,7 @@ from django.utils import timezone
 from . import normalized_fields as normalized_field_config
 from .analysis import divergent_counts_for_group_ids
 from .audit_schema import schema_error_code
+from .ingestion_limits import IngestionBusy, begin_ingestion
 from .models import AuditEvent, AuditFile, AuditGroup, UploadRejection, UploadToken
 from .projections import rebuild_file_projections
 
@@ -168,7 +169,9 @@ class UploadRejected(ValueError):
     def __init__(self, code, line_number=None):
         self.code = code
         self.line_number = line_number
-        self.status_code = 503 if code == "ingest_failed" else 413 if code == "too_large" else 400
+        self.status_code = (
+            503 if code in {"ingest_failed", "ingest_busy"} else 413 if code == "too_large" else 400
+        )
         super().__init__(code)
 
 
@@ -241,6 +244,19 @@ def ingest_audit_log_bytes(
     source = body_source_metadata(parsed_lines)
     try:
         with transaction.atomic():
+            begin_ingestion(metadata["engine_ids"])
+            # Resolve and lock groups BEFORE deduplication and child writes.
+            # A conflicting request retries without waiting behind a rebuild.
+            groups_by_key = groups_for_parsed_lines(
+                parsed_lines,
+                fallback_group_slug=fallback_group_slug,
+                fallback_group_name=fallback_group_name,
+            )
+            list(
+                AuditGroup.objects.select_for_update(nowait=connection.vendor == "postgresql")
+                .filter(id__in=[group.id for group in groups_by_key.values()])
+                .order_by("id")
+            )
             audit_file = AuditFile.objects.create(
                 upload_token=upload_token,
                 uploaded_by=uploaded_by,
@@ -257,7 +273,7 @@ def ingest_audit_log_bytes(
                 audit_file,
                 parsed_lines,
                 fallback_group_slug=fallback_group_slug,
-                fallback_group_name=fallback_group_name,
+                groups_by_key=groups_by_key,
             )
             if duplicate_count:
                 audit_file.duplicate_event_count = duplicate_count
@@ -270,7 +286,17 @@ def ingest_audit_log_bytes(
             )
             refresh_group_rollups(locked_group_ids)
             return IngestionResult(audit_file=audit_file, created=True)
+    except IngestionBusy:
+        raise UploadRejected("ingest_busy") from None
     except Exception as exc:
+        # PostgreSQL's transaction/idle deadlines terminate the connection.
+        # Outside atomic(), discard it before best-effort rejection recording
+        # so an internal caller can retry too, without waiting for HTTP cleanup.
+        if not connection.in_atomic_block and not connection.is_usable():
+            connection.close()
+        if getattr(exc.__cause__, "sqlstate", None) == "55P03":
+            # NOWAIT or lock_timeout: the complete atomic write rolled back.
+            raise UploadRejected("ingest_busy") from None
         if isinstance(exc, IntegrityError):
             existing = (
                 AuditFile.objects.defer("raw_text", "user_agent")
@@ -654,15 +680,10 @@ def create_events(
     parsed_lines: list[ParsedLine],
     *,
     fallback_group_slug: str | None,
-    fallback_group_name: str,
+    groups_by_key: dict[tuple[str, str] | None, AuditGroup],
 ) -> tuple[int, set[int]]:
     duplicate_count = 0
     group_ids: set[int] = set()
-    groups_by_key = groups_for_parsed_lines(
-        parsed_lines,
-        fallback_group_slug=fallback_group_slug,
-        fallback_group_name=fallback_group_name,
-    )
     existing_duplicates = existing_duplicate_events(
         parsed_lines,
         ignore_invalid_files=audit_file.validation_status == AuditFile.STATUS_VALID,
@@ -752,16 +773,15 @@ def groups_for_parsed_lines(
     fallback_group_slug: str | None,
     fallback_group_name: str,
 ) -> dict[tuple[str, str] | None, AuditGroup]:
-    groups = {}
-    for parsed in parsed_lines:
-        group_key = group_key_for_parsed_line(
-            parsed,
-            fallback_group_slug=fallback_group_slug,
-        )
-        if group_key is None or group_key in groups:
-            continue
-        groups[group_key] = group_for_key(group_key, fallback_group_name=fallback_group_name)
-    return groups
+    keys = {
+        group_key_for_parsed_line(parsed, fallback_group_slug=fallback_group_slug)
+        for parsed in parsed_lines
+    }
+    # Stable creation order also bounds conflicts on previously unseen groups.
+    return {
+        key: group_for_key(key, fallback_group_name=fallback_group_name)
+        for key in sorted(key for key in keys if key is not None)
+    }
 
 
 def group_key_for_parsed_line(

@@ -26,6 +26,37 @@ goggles.ipf.dev {
 
 	encode zstd gzip
 
+	@audit_upload {
+		method POST
+		path /api/v1/audit-logs/ /api/v1/groups/*/audit-logs/
+	}
+	handle @audit_upload {
+		reverse_proxy 127.0.0.1:8002 {
+			# Shed excess work instead of building an HTTP upload backlog.
+			unhealthy_request_count 2
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 125s
+			}
+		}
+	}
+
+	handle_errors {
+		@upload_unavailable {
+			method POST
+			path /api/v1/audit-logs/ /api/v1/groups/*/audit-logs/
+			expression {http.error.status_code} in [502, 503, 504]
+		}
+		handle @upload_unavailable {
+			header Retry-After 30
+			respond "Audit ingestion unavailable; retry later." 503
+		}
+		handle {
+			# Preserve Caddy's default empty error response outside upload overload.
+			respond "" {http.error.status_code}
+		}
+	}
+
 	handle_path /static/* {
 		reverse_proxy 127.0.0.1:8001
 	}

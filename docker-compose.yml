@@ -30,7 +30,7 @@ services:
       retries: 20
       start_period: 5s
 
-  web:
+  web: &app
     build: .
     init: true
     restart: unless-stopped
@@ -43,6 +43,9 @@ services:
     cpus: ${GOGGLES_WEB_CPUS:-2.0}
     pids_limit: ${GOGGLES_WEB_PIDS_LIMIT:-256}
     env_file: ${GOGGLES_ENV_FILE:-.env}
+    # Fail closed if the proxy accidentally sends an upload to the read pool.
+    environment:
+      GOGGLES_UPLOADS_ENABLED: "0"
     depends_on:
       db:
         condition: service_healthy
@@ -73,6 +76,33 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  ingest:
+    <<: *app
+    # Two synchronous processes: a busy upload cannot consume a browsing slot.
+    # Transfer progress has a separate finite budget; validation/projection
+    # retain sync's hard deadline. Idle sockets cannot heartbeat indefinitely.
+    environment:
+      GOGGLES_UPLOADS_ENABLED: ${GOGGLES_UPLOADS_ENABLED:-1}
+    mem_limit: ${GOGGLES_INGEST_MEMORY_LIMIT:-4g}
+    memswap_limit: ${GOGGLES_INGEST_MEMORY_LIMIT:-4g}
+    cpus: ${GOGGLES_INGEST_CPUS:-1.0}
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes: []
+    depends_on:
+      web:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - >-
+        python manage.py check --deploy --database default --tag database &&
+        exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --worker-class deploy.ingest_worker.IngestWorker --workers $${GOGGLES_INGEST_WORKERS:-2} --threads 1 --timeout $${GOGGLES_INGEST_TIMEOUT_SECONDS:-120} --graceful-timeout 120 --backlog 8 --max-requests 100 --max-requests-jitter 10 --access-logfile - --access-logformat '%(t)s %(m)s %(s)s %(B)s %(L)s'
+    # Both slots may legitimately be ingesting. Probe health through web;
+    # monitor ingest process exits, 503s, durations and database transactions.
+    healthcheck:
+      disable: true
 
   retention:
     build: .

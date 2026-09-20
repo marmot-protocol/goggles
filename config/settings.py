@@ -318,6 +318,16 @@ GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
 )
 GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 50_000))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
+# PostgreSQL 17 upload-transaction limits, not session defaults for reads/pruning.
+# Keep the transaction deadline below the dedicated sync worker's 120s deadline.
+GOGGLES_INGEST_LOCK_TIMEOUT_MS = int(os.environ.get("GOGGLES_INGEST_LOCK_TIMEOUT_MS", 1000))
+GOGGLES_INGEST_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("GOGGLES_INGEST_STATEMENT_TIMEOUT_MS", 30000)
+)
+GOGGLES_INGEST_IDLE_TIMEOUT_MS = int(os.environ.get("GOGGLES_INGEST_IDLE_TIMEOUT_MS", 15000))
+GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS = int(
+    os.environ.get("GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS", 90000)
+)
 # How long raw audit evidence (uploaded files and their events) is kept. The
 # prune_audit_data management command runs at retention-service startup and
 # nightly. It deletes evidence older than this window and rebuilds the affected
@@ -339,10 +349,23 @@ for setting_name in (
     "GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST",
     "GOGGLES_AGENT_EXPORT_MAX_EVENTS",
     "GOGGLES_AUDIT_RETENTION_DAYS",
+    "GOGGLES_INGEST_LOCK_TIMEOUT_MS",
+    "GOGGLES_INGEST_STATEMENT_TIMEOUT_MS",
+    "GOGGLES_INGEST_IDLE_TIMEOUT_MS",
+    "GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS",
     "FILE_UPLOAD_MAX_MEMORY_SIZE",
 ):
     if globals()[setting_name] <= 0:
         raise ImproperlyConfigured(f"{setting_name} must be a positive integer.")
+if not (
+    GOGGLES_INGEST_LOCK_TIMEOUT_MS
+    < GOGGLES_INGEST_STATEMENT_TIMEOUT_MS
+    < GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS
+    and GOGGLES_INGEST_IDLE_TIMEOUT_MS < GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS
+):
+    raise ImproperlyConfigured(
+        "Ingest lock/statement/idle deadlines must precede the transaction deadline."
+    )
 # Audit uploads replace Django's default handlers with one bounded memory-only
 # handler. Unvalidated files must not spool to disk. This count also bounds
 # multipart parsing before application validation.
