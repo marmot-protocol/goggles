@@ -3222,6 +3222,7 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
         return JsonResponse(
             {"error": exc.code, "reason": exc.code, "line_number": exc.line_number},
             status=exc.status_code,
+            headers={"Retry-After": "30"} if exc.status_code == 503 else None,
         )
 
     token.mark_used()

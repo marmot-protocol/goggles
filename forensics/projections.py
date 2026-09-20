@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 
 from .analysis import structural_quarantine_exclusion
 from .models import (
@@ -184,25 +184,29 @@ def groups_with_out_of_order_convergence_backfill(
     Inferred-run stitching depends on processing convergence-relevant events in
     ``(wall_time_ms, engine_id, line_number)`` order. The incremental path only
     projects this file's events, so it can only stay correct when those events
-    are a chronological append. For each touched group we compare the earliest
-    convergence-relevant event in this upload against the latest already-stored
-    one (from prior uploads): if the upload sorts first, the group must be
-    rebuilt from full evidence instead of appended.
+    are a chronological append for that recorder. Runs are stitched per
+    (group, engine), not across devices: another engine's older timeline cannot
+    backfill this recorder's run. Only earlier evidence for the SAME recorder
+    requires chronological replay.
     """
-    earliest_uploaded: dict[int, tuple[bool, int, str, int]] = {}
+    earliest_uploaded: dict[tuple[int, str], tuple[bool, int, str, int]] = {}
     for event in events:
         if event.group_id is None or not event_may_need_inferred_convergence_state(event):
             continue
         key = convergence_order_key(event)
-        current = earliest_uploaded.get(event.group_id)
+        recorder = (event.group_id, event.engine_id)
+        current = earliest_uploaded.get(recorder)
         if current is None or key < current:
-            earliest_uploaded[event.group_id] = key
+            earliest_uploaded[recorder] = key
     if not earliest_uploaded:
         return set()
     backfilled: set[int] = set()
     stored = (
         AuditEvent.objects.filter(
-            group_id__in=earliest_uploaded.keys(),
+            Q(event_type__in=CONVERGENCE_EVENT_TYPES | {"epoch_state_changed"})
+            | ~Q(context_convergence={}),
+            group_id__in={group_id for group_id, _ in earliest_uploaded},
+            engine_id__in={engine_id for _, engine_id in earliest_uploaded},
             parse_status=AuditEvent.STATUS_VALID,
         )
         .exclude(audit_file=audit_file)
@@ -216,13 +220,16 @@ def groups_with_out_of_order_convergence_backfill(
         )
     )
     for event in stored.iterator(chunk_size=2_000):
+        recorder = (event.group_id, event.engine_id)
+        if recorder not in earliest_uploaded:
+            continue
         if event.group_id in backfilled:
             continue
         if not event_may_need_inferred_convergence_state(event):
             continue
         # A stored convergence event that sorts after this upload's earliest
         # convergence event means the upload backfills history out of order.
-        if earliest_uploaded[event.group_id] < convergence_order_key(event):
+        if earliest_uploaded[recorder] < convergence_order_key(event):
             backfilled.add(event.group_id)
     return backfilled
 

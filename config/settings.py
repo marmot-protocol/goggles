@@ -318,6 +318,26 @@ GOGGLES_MAX_ACTION_EVENTS_PER_REQUEST = int(
 )
 GOGGLES_AGENT_EXPORT_MAX_EVENTS = int(os.environ.get("GOGGLES_AGENT_EXPORT_MAX_EVENTS", 50_000))
 GOGGLES_UPLOADS_ENABLED = env_bool("GOGGLES_UPLOADS_ENABLED", True)
+# PostgreSQL 17 upload-transaction limits, not session defaults for reads/pruning.
+# Keep the transaction deadline below the dedicated sync worker's 120s deadline.
+GOGGLES_INGEST_LOCK_TIMEOUT_MS = int(os.environ.get("GOGGLES_INGEST_LOCK_TIMEOUT_MS", 1000))
+GOGGLES_INGEST_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("GOGGLES_INGEST_STATEMENT_TIMEOUT_MS", 30000)
+)
+GOGGLES_INGEST_IDLE_TIMEOUT_MS = int(os.environ.get("GOGGLES_INGEST_IDLE_TIMEOUT_MS", 15000))
+GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS = int(
+    os.environ.get("GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS", 90000)
+)
+if (
+    min(
+        GOGGLES_INGEST_LOCK_TIMEOUT_MS,
+        GOGGLES_INGEST_STATEMENT_TIMEOUT_MS,
+        GOGGLES_INGEST_IDLE_TIMEOUT_MS,
+        GOGGLES_INGEST_TRANSACTION_TIMEOUT_MS,
+    )
+    <= 0
+):
+    raise ImproperlyConfigured("Ingestion database deadlines must be positive.")
 # How long raw audit evidence (uploaded files and their events) is kept. The
 # prune_audit_data management command runs at retention-service startup and
 # nightly. It deletes evidence older than this window and rebuilds the affected

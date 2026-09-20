@@ -211,15 +211,42 @@ request path.
 
 ## Upload capacity model
 
-The default is three workers with **two threads each**, limiting concurrent
-requests to six across the container. This is lower than the previous four-thread
-setting because v4 multipart uploads must stay in RAM until validation. Update
-existing explicit `GOGGLES_WEB_THREADS=4` overrides too; rebuilding an image does
-not replace operator environment settings. Streaming exports share these slots.
+Compose runs separate pools. `web` has three workers with two threads each for
+browsing, exports and health, and always disables uploads. `ingest` has two
+synchronous workers on loopback port 8002. The Caddy upload matcher sends POSTs
+on **both** audit upload routes to that pool; other requests still use port 8000.
+Apply the route change with the application change: sending POSTs to `web` now
+returns 503. A bare Dockerfile invocation remains a combined development pool
+and is not the isolated production configuration.
+
+Caddy sheds excess uploads using `unhealthy_request_count 2`; upstream overload,
+connection failure and timeout on these routes return 503 with `Retry-After: 30`.
+Keep this cap aligned with `GOGGLES_INGEST_WORKERS`. There is no durable server
+queue and no asynchronous acceptance: 201 means evidence and projections have
+committed, 200 means an already committed identical file, and 503 means retry.
+Clients must retain their file and retry with jitter. A lost HTTP response can
+follow a successful commit; the file hash makes that retry safe.
+
+The sync upload worker has a 120s hard deadline (including body reading and
+Python computation), with a 125s upstream response-header deadline. The threaded
+read pool's 300s Gunicorn timeout is a worker heartbeat, **not** a request deadline.
+Inside upload atomic writes, PostgreSQL 17 enforces a 90s transaction deadline,
+30s per statement, 1s lock wait, and 15s idle transaction deadline. These are
+transaction-local and do not change browsing, export or retention settings.
+Recorder advisory locks and existing group NOWAIT locks reject contention before
+raw evidence writes. New-group uniqueness conflicts are bounded by the lock
+deadline. No global ingestion mutex serializes independent groups/recorders.
+
+These are protection limits, not acceptance latency targets. A true same-recorder
+historical rebuild can still exceed 90s and return 503; repeating an intrinsically
+over-budget file will not make it smaller. Investigate repeated failures with
+synthetic/authorized staging evidence before changing budgets. Do not reopen
+unbounded shared upload workers to process such a file. See
+[the incident investigation](upload-lock-investigation-2026-09-20.md).
 
 Budget for the multipart `BytesIO`, its bytes read copy, decoded text, parsed
 records, normalized values and projection/database work, plus worker baseline
-and concurrent exports. The pre-v4 capacity exercise measured approximately
+within the upload pool; exports have a separate pool. The pre-v4 capacity exercise measured approximately
 1.23 GiB RSS for a 64 MiB upload (about 19 times the body). That is historical
 baseline evidence, **not a v4 peak-memory measurement**. The extra in-memory
 multipart buffer and allocation transients require more headroom. The former
@@ -230,8 +257,8 @@ measurements.
 Before deployment, load-test synthetic near-limit v4 multipart and raw uploads
 at the configured concurrency together with representative exports. Record peak
 container RSS, latency, OOM/restart count and rejection outcomes. Keep substantial
-headroom below `GOGGLES_WEB_MEMORY_LIMIT`; reduce workers/threads or the upload
-ceiling if needed. The two-thread default is a conservative reduction, not a
+headroom below `GOGGLES_INGEST_MEMORY_LIMIT`; reduce upload workers or the upload
+ceiling if needed. The two-worker default is a conservative bound, not a
 substitute for that measurement. Never regain memory headroom by spooling
 unvalidated uploads to disk.
 
@@ -249,9 +276,9 @@ export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
 ```
 
 1. Set `GOGGLES_UPLOADS_ENABLED=0` in the production environment.
-2. Recreate the web service so the changed environment and Compose resource
+2. Recreate the web and ingest services so the changed environment and Compose resource
    limits take effect:
-   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web`.
+   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web ingest`.
 3. Confirm the container has the expected 16 GiB memory/no-swap boundary (or
    the value set in `GOGGLES_WEB_MEMORY_LIMIT`) by resolving the actual Compose
    container rather than assuming a project-specific name:
@@ -259,8 +286,9 @@ export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
    Wait for the health check to pass.
 4. While uploads remain paused, exercise an authenticated group overview,
    delivery tab, and evidence tab while watching `docker stats`.
-5. Set `GOGGLES_UPLOADS_ENABLED=1` and recreate the web service again with the
-   same `--env-file` command from step 2.
+5. Verify both POST routes use port 8002 in the current Caddy config, then set
+   `GOGGLES_UPLOADS_ENABLED=1` and recreate only `ingest` with the same `--env-file`.
+   The `web` service keeps uploads disabled regardless of this environment value.
 6. Perform a representative upload while watching `docker stats`, then recheck
    the group overview, delivery tab, and evidence tab.
 
@@ -271,9 +299,9 @@ The Compose service keeps three threaded workers by default, recycles each
 after a jittered 500-request budget, and constrains the whole web container to
 a configurable 16 GiB default (`GOGGLES_WEB_MEMORY_LIMIT`) with no additional
 swap. CPU, PID, and Docker log rotation limits are configurable through the
-adjacent `GOGGLES_WEB_*` settings. During an incident, set
-`GOGGLES_WEB_WORKERS=1` before the recreate to prevent concurrent amplification;
-restore the measured production worker count only after memory remains stable.
+adjacent `GOGGLES_WEB_*` settings. The ingest pool has its own CPU and memory
+limits. Shed uploads at the edge during an incident; changing the read pool's
+worker count is not an ingestion-concurrency control.
 
 ## Upload body integrity and operational diagnostics
 

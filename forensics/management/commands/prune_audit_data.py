@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from forensics.models import AuditEvent, AuditFile, AuditGroup, UploadRejection
 from forensics.projections import rebuild_group_projections
+from forensics.retention import retention_lock
 
 # PostgreSQL reclaims disk space from deleted raw_text/event rows only after a
 # VACUUM. Scope it to the two heavy tables rather than the whole database, and
@@ -44,6 +45,10 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        with retention_lock():
+            return self.prune(*args, **options)
+
+    def prune(self, *args, **options):
         retention_days = options["retention_days"]
         if retention_days is None:
             retention_days = settings.GOGGLES_AUDIT_RETENTION_DAYS

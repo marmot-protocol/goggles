@@ -1,0 +1,133 @@
+{
+  "split": true,
+  "messages_per_history": 100,
+  "gate_hold_seconds": 3.5,
+  "shared_pool": [
+    1,
+    6
+  ],
+  "history_uploads": [
+    {
+      "status": 201,
+      "seconds": 3.4938,
+      "bytes": 242200,
+      "events": 403
+    },
+    {
+      "status": 201,
+      "seconds": 1.7513,
+      "bytes": 128011,
+      "events": 202
+    },
+    {
+      "status": 201,
+      "seconds": 2.9555,
+      "bytes": 242200,
+      "events": 403
+    },
+    {
+      "status": 201,
+      "seconds": 1.3305,
+      "bytes": 128011,
+      "events": 202
+    }
+  ],
+  "reads_while_held": {
+    "health": {
+      "status": 200,
+      "seconds": 0.0051
+    },
+    "browse": {
+      "status": 200,
+      "seconds": 0.0305
+    },
+    "export": {
+      "status": 200,
+      "seconds": 0.3755
+    }
+  },
+  "concurrent_uploads": [
+    {
+      "status": 201,
+      "seconds": 3.5406
+    },
+    {
+      "status": 201,
+      "seconds": 3.5389
+    },
+    {
+      "status": 503,
+      "seconds": 0.0029
+    },
+    {
+      "status": 503,
+      "seconds": 0.0032
+    },
+    {
+      "status": 503,
+      "seconds": 0.0037
+    },
+    {
+      "status": 503,
+      "seconds": 0.0029
+    }
+  ],
+  "concurrent_wall_seconds": 3.5408,
+  "retry_uploads": [
+    {
+      "status": 200,
+      "seconds": 0.012
+    },
+    {
+      "status": 200,
+      "seconds": 0.0099
+    },
+    {
+      "status": 201,
+      "seconds": 0.0492
+    },
+    {
+      "status": 201,
+      "seconds": 0.0365
+    },
+    {
+      "status": 201,
+      "seconds": 0.0453
+    },
+    {
+      "status": 201,
+      "seconds": 0.0439
+    }
+  ],
+  "duplicate": {
+    "status": 200,
+    "seconds": 0.007
+  },
+  "read_samples_during_ingestion": {
+    "health": {
+      "count": 11,
+      "statuses": {
+        "200": 11
+      },
+      "max_seconds": 0.0051
+    },
+    "browse": {
+      "count": 11,
+      "statuses": {
+        "200": 11
+      },
+      "max_seconds": 0.0539
+    },
+    "export": {
+      "count": 11,
+      "statuses": {
+        "200": 11
+      },
+      "max_seconds": 0.3948
+    }
+  },
+  "max_transaction_seconds": 3.5187,
+  "max_lock_wait_seconds": 0.0,
+  "max_lock_waiters": 0,
+  "durable_queue_jobs": 0
+}

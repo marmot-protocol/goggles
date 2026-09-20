@@ -1,0 +1,110 @@
+{
+  "split": true,
+  "messages_per_history": 100,
+  "gate_hold_seconds": 3.5,
+  "shared_pool": [
+    1,
+    6
+  ],
+  "history_uploads": [
+    {
+      "status": 201,
+      "seconds": 1.4168,
+      "bytes": 242200,
+      "events": 403
+    },
+    {
+      "status": 201,
+      "seconds": 0.7177,
+      "bytes": 128011,
+      "events": 202
+    },
+    {
+      "status": 201,
+      "seconds": 1.5686,
+      "bytes": 242200,
+      "events": 403
+    },
+    {
+      "status": 201,
+      "seconds": 0.7445,
+      "bytes": 128011,
+      "events": 202
+    }
+  ],
+  "reads_while_held": {
+    "health": {
+      "status": 200,
+      "seconds": 0.0034
+    },
+    "browse": {
+      "status": 200,
+      "seconds": 0.0375
+    },
+    "export": {
+      "status": 200,
+      "seconds": 0.1598
+    }
+  },
+  "concurrent_uploads": [
+    {
+      "status": 201,
+      "seconds": 3.5404
+    },
+    {
+      "status": 201,
+      "seconds": 3.5402
+    },
+    {
+      "status": 503,
+      "seconds": 0.0012
+    },
+    {
+      "status": 503,
+      "seconds": 0.0015
+    },
+    {
+      "status": 503,
+      "seconds": 0.0012
+    },
+    {
+      "status": 503,
+      "seconds": 0.0012
+    }
+  ],
+  "concurrent_wall_seconds": 3.5406,
+  "retry_uploads": [
+    {
+      "status": 200,
+      "seconds": 0.0068
+    },
+    {
+      "status": 200,
+      "seconds": 0.0086
+    },
+    {
+      "status": 201,
+      "seconds": 0.0269
+    },
+    {
+      "status": 201,
+      "seconds": 0.0286
+    },
+    {
+      "status": 201,
+      "seconds": 0.0243
+    },
+    {
+      "status": 201,
+      "seconds": 0.0277
+    }
+  ],
+  "duplicate": {
+    "status": 200,
+    "seconds": 0.0116
+  },
+  "max_transaction_seconds": 3.528,
+  "max_lock_wait_seconds": 0.0,
+  "max_lock_waiters": 0,
+  "durable_queue_jobs": 0
+}

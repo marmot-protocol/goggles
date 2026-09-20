@@ -3191,6 +3191,85 @@ class RebuildAuditProjectionsCommandTests(TestCase):
 
 
 class IncrementalProjectionIngestTests(TestCase):
+    def test_older_new_recorder_projects_once_and_matches_full_rebuild(self):
+        # The old group-wide comparison replayed unrelated device history here.
+        # Inferred convergence state is keyed by (group, engine).
+        history = [
+            audit_session_event(
+                index,
+                wall_time_ms=1700000001000 + index,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": f"{index + 100:064x}",
+                    "new_state": "processed",
+                    "reason": "application_message",
+                },
+            )
+            for index in range(30)
+        ]
+        history.append(
+            audit_session_event(
+                31,
+                wall_time_ms=1700000002000,
+                kind={"type": "convergence_run_state", "phase": "stable"},
+            )
+        )
+        ingest_audit_log_bytes(dump_bytes=jsonl(*history).encode())
+        older = audit_session_event(
+            0,
+            engine_id=ENGINE_BOB,
+            wall_time_ms=1700000000000,
+            kind={"type": "convergence_run_state", "phase": "evaluating"},
+        )
+        with (
+            mock.patch.object(
+                projections_module,
+                "rebuild_locked_group_projections",
+                wraps=projections_module.rebuild_locked_group_projections,
+            ) as rebuild,
+            mock.patch.object(
+                projections_module, "project_event", wraps=projections_module.project_event
+            ) as project,
+        ):
+            ingest_audit_log_bytes(dump_bytes=jsonl(older).encode())
+        rebuild.assert_not_called()
+        self.assertEqual(project.call_count, 1)
+
+        def snapshot():
+            from .management.commands.rebuild_audit_projections import PROJECTION_MODELS
+
+            rows = {}
+            for model in PROJECTION_MODELS:
+                values = []
+                for obj in model.objects.all():
+                    value = {}
+                    for field in model._meta.fields:
+                        if field.primary_key or field.name in {"created_at", "updated_at"}:
+                            continue
+                        if field.name in {"artifact", "run"}:
+                            related = getattr(obj, field.name)
+                            value[field.name] = (
+                                (
+                                    getattr(related, "artifact_id", None)
+                                    or getattr(related, "run_id", None)
+                                )
+                                if related
+                                else None
+                            )
+                        else:
+                            value[field.name] = getattr(obj, field.attname)
+                    if hasattr(obj, "evidence_events"):
+                        value["evidence_events"] = sorted(
+                            obj.evidence_events.values_list("id", flat=True)
+                        )
+                    values.append(json.dumps(value, sort_keys=True, default=str))
+                rows[model.__name__] = sorted(values)
+            return rows
+
+        before = snapshot()
+        projections_module.rebuild_group_projections(AuditGroup.objects.get(slug=GROUP_REF))
+        self.assertEqual(snapshot(), before)
+
     """A small append must project only the uploaded file, not rebuild the group.
 
     Each test fails against the old clear-and-fully-reproject behavior

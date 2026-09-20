@@ -1,0 +1,119 @@
+{
+  "split": false,
+  "messages_per_history": 1,
+  "gate_hold_seconds": 3.5,
+  "shared_pool": [
+    1,
+    6
+  ],
+  "history_uploads": [
+    {
+      "status": 201,
+      "seconds": 0.1291,
+      "bytes": 3607,
+      "events": 7
+    },
+    {
+      "status": 201,
+      "seconds": 0.0367,
+      "bytes": 2086,
+      "events": 4
+    },
+    {
+      "status": 201,
+      "seconds": 0.0599,
+      "bytes": 3607,
+      "events": 7
+    },
+    {
+      "status": 201,
+      "seconds": 0.0384,
+      "bytes": 2086,
+      "events": 4
+    }
+  ],
+  "reads_while_held": {
+    "health": {
+      "status": "timeout",
+      "seconds": 1.0013
+    },
+    "browse": {
+      "status": "timeout",
+      "seconds": 1.0015
+    },
+    "export": {
+      "status": "timeout",
+      "seconds": 1.0013
+    }
+  },
+  "concurrent_uploads": [
+    {
+      "status": 201,
+      "seconds": 3.611
+    },
+    {
+      "status": 201,
+      "seconds": 3.6123
+    },
+    {
+      "status": 201,
+      "seconds": 3.7418
+    },
+    {
+      "status": 201,
+      "seconds": 3.742
+    },
+    {
+      "status": 201,
+      "seconds": 3.6612
+    },
+    {
+      "status": 201,
+      "seconds": 3.6599
+    }
+  ],
+  "concurrent_wall_seconds": 3.7883,
+  "retry_uploads": [
+    {
+      "status": 200,
+      "seconds": 0.0061
+    },
+    {
+      "status": 200,
+      "seconds": 0.0056
+    },
+    {
+      "status": 200,
+      "seconds": 0.006
+    },
+    {
+      "status": 200,
+      "seconds": 0.0055
+    },
+    {
+      "status": 200,
+      "seconds": 0.0059
+    },
+    {
+      "status": 200,
+      "seconds": 0.0065
+    }
+  ],
+  "duplicate": {
+    "status": 200,
+    "seconds": 0.0065
+  },
+  "large_bytes": 67108864,
+  "large_raw": {
+    "status": 201,
+    "seconds": 12.5161
+  },
+  "large_multipart_duplicate": {
+    "status": 200,
+    "seconds": 2.4511
+  },
+  "max_transaction_seconds": 9.9299,
+  "max_lock_wait_seconds": 3.6089,
+  "max_lock_waiters": 4,
+  "durable_queue_jobs": 0
+}
