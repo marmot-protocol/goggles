@@ -52,7 +52,8 @@ goggles.ipf.dev {
 			respond "Audit ingestion unavailable; retry later." 503
 		}
 		handle {
-			respond "{http.error.status_text}" {http.error.status_code}
+			# Preserve Caddy's default empty error response outside upload overload.
+			respond "" {http.error.status_code}
 		}
 	}
 

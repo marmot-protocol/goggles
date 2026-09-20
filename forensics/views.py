@@ -3203,6 +3203,7 @@ def api_audit_log_upload(request: HttpRequest, group_slug: str | None = None):
         return JsonResponse(
             {"error": "audit log uploads are temporarily disabled"},
             status=503,
+            headers={"Retry-After": "30"},
         )
 
     try:

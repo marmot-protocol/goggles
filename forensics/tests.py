@@ -3191,6 +3191,13 @@ class RebuildAuditProjectionsCommandTests(TestCase):
 
 
 class IncrementalProjectionIngestTests(TestCase):
+    """A small append must project only the uploaded file, not rebuild the group.
+
+    Each test fails against the old clear-and-fully-reproject behavior
+    (marmot-protocol/goggles#127), not merely on final row equality:
+    the broad delete + per-event re-insert is detected directly.
+    """
+
     def test_older_new_recorder_projects_once_and_matches_full_rebuild(self):
         # The old group-wide comparison replayed unrelated device history here.
         # Inferred convergence state is keyed by (group, engine).
@@ -3269,13 +3276,6 @@ class IncrementalProjectionIngestTests(TestCase):
         before = snapshot()
         projections_module.rebuild_group_projections(AuditGroup.objects.get(slug=GROUP_REF))
         self.assertEqual(snapshot(), before)
-
-    """A small append must project only the uploaded file, not rebuild the group.
-
-    Each test fails against the old clear-and-fully-reproject behavior
-    (marmot-protocol/goggles#127), not merely on final row equality:
-    the broad delete + per-event re-insert is detected directly.
-    """
 
     INCREMENTAL_T0 = 1_700_000_000_000
 
@@ -4031,6 +4031,7 @@ class UploadTokenLifecycleTests(TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"], "audit log uploads are temporarily disabled")
+        self.assertEqual(response.headers["Retry-After"], "30")
         self.assertEqual(AuditFile.objects.count(), 0)
         token.refresh_from_db()
         self.assertIsNone(token.last_used_at)

@@ -80,8 +80,8 @@ services:
   ingest:
     <<: *app
     # Two synchronous processes: a busy upload cannot consume a browsing slot.
-    # Sync's hard worker deadline also covers body reads and Python CPU work;
-    # gthread's heartbeat timeout does not bound individual requests.
+    # Transfer progress has a separate finite budget; validation/projection
+    # retain sync's hard deadline. Idle sockets cannot heartbeat indefinitely.
     environment:
       GOGGLES_UPLOADS_ENABLED: ${GOGGLES_UPLOADS_ENABLED:-1}
     mem_limit: ${GOGGLES_INGEST_MEMORY_LIMIT:-4g}
@@ -97,7 +97,8 @@ services:
       - sh
       - -c
       - >-
-        exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --worker-class sync --workers $${GOGGLES_INGEST_WORKERS:-2} --threads 1 --timeout $${GOGGLES_INGEST_TIMEOUT_SECONDS:-120} --graceful-timeout 120 --backlog 8 --max-requests 100 --max-requests-jitter 10 --access-logfile - --access-logformat '%(t)s %(m)s %(s)s %(B)s %(L)s'
+        python manage.py check --deploy --database default --tag database &&
+        exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --worker-class deploy.ingest_worker.IngestWorker --workers $${GOGGLES_INGEST_WORKERS:-2} --threads 1 --timeout $${GOGGLES_INGEST_TIMEOUT_SECONDS:-120} --graceful-timeout 120 --backlog 8 --max-requests 100 --max-requests-jitter 10 --access-logfile - --access-logformat '%(t)s %(m)s %(s)s %(B)s %(L)s'
     # Both slots may legitimately be ingesting. Probe health through web;
     # monitor ingest process exits, 503s, durations and database transactions.
     healthcheck:

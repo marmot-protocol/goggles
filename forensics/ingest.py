@@ -273,7 +273,6 @@ def ingest_audit_log_bytes(
                 audit_file,
                 parsed_lines,
                 fallback_group_slug=fallback_group_slug,
-                fallback_group_name=fallback_group_name,
                 groups_by_key=groups_by_key,
             )
             if duplicate_count:
@@ -681,17 +680,10 @@ def create_events(
     parsed_lines: list[ParsedLine],
     *,
     fallback_group_slug: str | None,
-    fallback_group_name: str,
-    groups_by_key=None,
+    groups_by_key: dict[tuple[str, str] | None, AuditGroup],
 ) -> tuple[int, set[int]]:
     duplicate_count = 0
     group_ids: set[int] = set()
-    if groups_by_key is None:
-        groups_by_key = groups_for_parsed_lines(
-            parsed_lines,
-            fallback_group_slug=fallback_group_slug,
-            fallback_group_name=fallback_group_name,
-        )
     existing_duplicates = existing_duplicate_events(
         parsed_lines,
         ignore_invalid_files=audit_file.validation_status == AuditFile.STATUS_VALID,

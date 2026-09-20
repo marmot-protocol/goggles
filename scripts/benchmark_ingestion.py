@@ -171,6 +171,8 @@ try:
                 "--timeout",
                 "120",
             ]
+            if split_ingest:
+                command += ["--worker-class", "deploy.ingest_worker.IngestWorker"]
             processes.append(
                 subprocess.Popen(
                     command,

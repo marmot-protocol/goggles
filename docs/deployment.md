@@ -36,6 +36,16 @@ runs retry every five minutes. Each run finishes before another begins within
 that service; keep one retention replica. Expired evidence can remain until the
 next nightly run (normally less than 31 days total), or longer during an outage.
 
+Pruning holds row locks while rebuilding each affected group's projections.
+Uploads touching those groups now fail fast with 503/`Retry-After: 30` instead
+of waiting behind retention. This can recur during the startup catch-up and at
+03:00 UTC; the singleton guard prevents overlapping pruners, not these upload
+conflicts. Wait for startup catch-up completion before lifting a deployment
+upload pause. Correlate upload 503s with prune duration, and investigate failures
+that persist after the prune completes. Reads remain on their separate pool.
+The singleton uses a session advisory lock: the retention connection must be
+direct to Postgres (as in Compose) or use session pooling, never transaction pooling.
+
 For existing installations, set `GOGGLES_AUDIT_RETENTION_DAYS=30` in the deployment
 environment: an existing value of 14 overrides the new default. Both catch-up and
 nightly runs use this same setting. Preview against the deployed database with:
@@ -227,12 +237,23 @@ committed, 200 means an already committed identical file, and 503 means retry.
 Clients must retain their file and retry with jitter. A lost HTTP response can
 follow a successful commit; the file hash makes that retry safe.
 
-The sync upload worker has a 120s hard deadline (including body reading and
-Python computation), with a 125s upstream response-header deadline. The threaded
+The custom sync upload worker allows up to 900s for body transfer, refreshing
+its watchdog only when a body read returns bytes (in chunks of at most 64 KiB).
+A socket wait or failure to complete a chunk for 120s remains bounded; progress
+cannot extend the total transfer budget. After the last body progress, validation
+and processing have a 120s hard watchdog, with a 125s upstream response-header
+deadline after the request has been sent upstream. This accommodates a 64 MiB
+transfer at 1 Mbps (about 537s before overhead) without extending DB work.
+Two slow transfers can occupy both upload slots until their budgets expire;
+excess clients receive 503 and must retry. No unvalidated body is spooled to disk
+or buffered by Caddy before its concurrency admission. The threaded
 read pool's 300s Gunicorn timeout is a worker heartbeat, **not** a request deadline.
 Inside upload atomic writes, PostgreSQL 17 enforces a 90s transaction deadline,
 30s per statement, 1s lock wait, and 15s idle transaction deadline. These are
 transaction-local and do not change browsing, export or retention settings.
+Ingest startup runs a database deployment check and refuses PostgreSQL before 17.
+Configuration must keep lock/statement and idle deadlines below the total
+transaction deadline, and the worker watchdog above it.
 Recorder advisory locks and existing group NOWAIT locks reject contention before
 raw evidence writes. New-group uniqueness conflicts are bounded by the lock
 deadline. No global ingestion mutex serializes independent groups/recorders.
@@ -278,16 +299,20 @@ export GOGGLES_ENV_FILE="${GOGGLES_ENV_FILE:-.env}"
 1. Set `GOGGLES_UPLOADS_ENABLED=0` in the production environment.
 2. Recreate the web and ingest services so the changed environment and Compose resource
    limits take effect:
-   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate web ingest`.
+   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --build --force-recreate --no-deps web ingest`.
 3. Confirm the container has the expected 16 GiB memory/no-swap boundary (or
    the value set in `GOGGLES_WEB_MEMORY_LIMIT`) by resolving the actual Compose
    container rather than assuming a project-specific name:
-   `web_container_id="$(docker compose --env-file "$GOGGLES_ENV_FILE" ps -q web)"; test -n "$web_container_id"; docker inspect "$web_container_id"`.
-   Wait for the health check to pass.
+   `docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}}' "$(docker compose --env-file "$GOGGLES_ENV_FILE" ps -q web)"`.
+   Repeat for `ingest` (default 4 GiB/no swap, 1 CPU). Do not print complete
+   container configuration, which includes credentials. Wait for web health and
+   verify ingest startup passed its PostgreSQL version and deadline checks.
 4. While uploads remain paused, exercise an authenticated group overview,
    delivery tab, and evidence tab while watching `docker stats`.
-5. Verify both POST routes use port 8002 in the current Caddy config, then set
-   `GOGGLES_UPLOADS_ENABLED=1` and recreate only `ingest` with the same `--env-file`.
+5. Verify both POST routes use port 8002 in the current Caddy config. Wait for
+   any startup retention catch-up to finish, then set
+   `GOGGLES_UPLOADS_ENABLED=1` and run
+   `docker compose --env-file "$GOGGLES_ENV_FILE" up -d --force-recreate --no-deps ingest`.
    The `web` service keeps uploads disabled regardless of this environment value.
 6. Perform a representative upload while watching `docker stats`, then recheck
    the group overview, delivery tab, and evidence tab.

@@ -155,8 +155,10 @@ after commit can still lose the response; retrying the identical file returns 20
    does not migrate, collect static assets or prune on startup.
 4. Set local database safeguards inside each ingestion transaction: 1s lock,
    30s statement, 15s idle, **90s total transaction**. A 120s sync worker deadline
-   covers body reads, validation and CPU stalls outside SQL. The proxy allows
-   125s for upstream response headers. The hierarchy leaves time for rollback
+   covers validation and CPU stalls outside SQL after the last body progress.
+   A separately bounded 900s body-transfer phase heartbeats only on reads of at
+   most 64 KiB; idle socket waits still have a 120s bound. The proxy allows
+   125s for upstream response headers after sending the body. The hierarchy leaves time for rollback
    and response handling; it is an initial protection budget, not an observed
    upper bound for every legitimate retained history. PostgreSQL terminates the
    connection on total/idle deadlines; the caller discards it before recording a
@@ -178,6 +180,50 @@ retry safety, not an asynchronous queue that promises eventual processing. Do no
 roll out without considering how clients retain/retry these 503s.
 
 ## Reproduction and measurements
+
+The original before/after measurements below belong to the initial PR head
+`a053fe5`. The self-review follow-up separates transfer and processing deadlines;
+its additional verification is recorded below without rewriting those results.
+
+### Self-review follow-up
+
+The original 120s sync timeout also charged slow client transfers. The upload
+worker now has a 900s total transfer budget, heartbeating only when bytes are
+read, while preserving the 120s processing watchdog and 90s DB transaction
+deadline. Raw and multipart parsing still uses the existing bounded RAM path.
+Two slow uploads can fill the isolated upload pool for a finite period; excess
+uploads are shed and browsing retains its own slots.
+
+Caddy `request_buffers` was considered but not used: its
+[proxy implementation](https://github.com/caddyserver/caddy/blob/v2.11.4/modules/caddyhttp/reverseproxy/reverseproxy.go)
+buffers during request preparation, before upstream selection/in-flight request
+counting. Therefore the configured two-request upstream cap would not bound
+concurrent pre-admission body buffers.
+
+Real Gunicorn subprocess regressions use scaled deadlines: a 4.8s progressing
+transfer succeeds with the same worker under a 2s watchdog; continued progress
+cannot defeat a 1.5s total transfer limit; idle body reads terminate; and CPU
+work after the completed body is killed and replaced. These prove deadline
+separation, not measured WAN throughput or production peak memory. Stream tests
+cover byte fidelity and WSGI read/iteration methods. Deployment checks reject
+PostgreSQL before 17 before accepting traffic; the per-ingest guard remains for
+internal callers. The retention windows, startup drain and explicit `--no-deps`
+service recreation are documented in the rollout instructions.
+
+The committed Caddyfile syntax was validated locally using Caddy 2.11.4 with
+synthetic unreachable upstreams. Both POST upload routes returned 503 with
+`Retry-After: 30`; health, static and non-POST upload routes retained empty 502
+responses without a retry header. No production request or config was changed.
+
+The revised worker also passed the real HTTP lab with `--split --messages 1
+--large`: exactly 67,108,864 raw bytes committed with 201, the multipart duplicate
+returned 200, all four shed requests succeeded on retry, and all 122 samples per
+read surface returned 200. No database lock waiters were observed. Numeric
+results are in [upload-worker-review.json](benchmarks/upload-worker-review.json).
+The host was also running the PostgreSQL test suite, so this is correctness
+coverage under additional load, not a latency comparison with the original run.
+
+### Original comparison
 
 `scripts/benchmark_ingestion.py` accepts only an empty `goggles_lab_*` database on
 loopback, never deletes existing evidence, and generates synthetic identities,
@@ -302,6 +348,10 @@ Rollout requires separate owner authorization:
    guard. Keep the 30-day retention setting and 03:00 UTC scheduler. No migration
    or historical purge is part of this patch. Verify effective positive DB
    deadlines, worker geometry, resource limits and loopback-only port 8002.
+   Use explicit service targets with `--no-deps` when recreating upload/web
+   containers. Ingest startup must pass its PostgreSQL 17 deployment check.
+   Wait for any startup retention catch-up to complete before unpausing uploads;
+   its rebuild locks cause fail-fast 503s for uploads touching affected groups.
 4. Merge the upload matcher/overload/error handling into the **current** Caddy
    route. Validate before reload. Preserve the current pause, logging, body cap,
    static/read routes and unrelated services. Never restore historical saved
@@ -317,8 +367,9 @@ Rollout requires separate owner authorization:
    rate and retry progress as well as read latency. A 401 probe alone proves
    routing/auth responsiveness, not working ingestion.
 
-Rollback: retain/reapply the scoped upload pause, drain the new sync pool within
-its 120s worker bound, and record unconfirmed client requests for retry. The patch
+Rollback: retain/reapply the scoped upload pause and drain the new sync pool.
+Transfers may take up to 900s plus the 120s processing watchdog; do not assume
+a 120s whole-request drain. Record unconfirmed client requests for retry. The patch
 has no schema/storage migration: deploy the verified prior application image to
 the read service and stop the isolated ingest service if necessary. Restore only
 the reviewed upload-route change under the pause; do **not** reopen uploads into
@@ -338,7 +389,10 @@ Use fixed labels such as service role, route name, status class and outcome:
 - Probe health plus authenticated index and a bounded export; alert on sustained
   latency/error changes rather than assuming health implies browsing works.
 - Track retention last success, duration and singleton contention. Scheduler
-  failures retry sequentially; multiple invocations now fail fast.
+  failures retry sequentially; multiple invocations now fail fast. Correlate
+  upload 503s with startup/nightly rebuild windows and alert if they persist
+  after pruning completes. The singleton requires a direct/session-pooled DB
+  connection, as configured by Compose.
 - Correlate CPU, memory and actual disk-latency/IOPS measurements with DB waits.
   Do not add arbitrary engine/group/file/message/account IDs as metric labels.
 
