@@ -63,7 +63,11 @@ def main(argv=None):
     django.setup()
     try:
         if args.bundle_path:
-            from forensics.investigation_bundle import validate_bundle_target, write_bundle
+            from forensics.investigation_bundle import (
+                BundlePublicationUncertain,
+                validate_bundle_target,
+                write_bundle,
+            )
 
             validate_bundle_target(args.bundle_path)
         acquisition_started_ns = time.time_ns()
@@ -95,6 +99,12 @@ def main(argv=None):
                     acquisition_completed_ns=acquisition_completed_ns,
                     supplied_file_count=len(args.jsonl) if args.jsonl else None,
                 )
+            except BundlePublicationUncertain as error:
+                result["bundle_written"] = None
+                result["bundle_artifact_status"] = "uncertain"
+                result["bundle_error"] = str(error)
+                print(json.dumps(result, sort_keys=True))
+                return 2
             except IncompleteEvidence as error:
                 bundle_error = str(error)
             except (OSError, ValueError):

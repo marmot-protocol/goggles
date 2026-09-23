@@ -27,7 +27,10 @@ The command prints aggregate JSON only. Exit code 2 with
 complete within the schema, file, response, query, or time budget. When a
 bundle write fails after retrieval, exit code 2 retains the aggregate result
 with `bounded_retrieval_completed: true`, `bundle_written: false`, and a fixed
-`bundle_error`. Neither error form prints raw bodies or identifiers from a
+`bundle_error`. If the filesystem cannot confirm rollback or cleanup, the
+result instead reports `bundle_written: null` and
+`bundle_artifact_status: "uncertain"`; inspect the private target directory
+before retrying. Neither error form prints raw bodies or identifiers from a
 failed record.
 
 To publish one private investigation artifact, add an explicit absolute
@@ -55,9 +58,12 @@ requested and effective Loki receipt window, the reader cutoff, and the same
 coverage limitations as the aggregate summary. It does not include input file
 paths or the Loki URL, and the command does not print either path.
 
-The target must not already exist, including as a symlink. Retrieval,
-validation, budget exhaustion, and write errors leave no final bundle. The
-bundle is sensitive local evidence: handle it only in a bounded private
+The target must not already exist, including as a symlink. The writer syncs
+the file and parent directory, publishes without overwrite, and rolls back a
+publication whose directory sync fails. Retrieval, validation, and budget
+exhaustion leave no final bundle; write failures normally do too. An
+`uncertain` status means filesystem failure prevented confirmation of cleanup,
+so a local artifact may remain. The bundle is sensitive local evidence: handle it only in a bounded private
 workspace and delete it manually when the investigation ends. This local file
 has no automatic expiry. Automatic 30-day deletion for any future server
 storage is a separate design and deployment gate. The bundle is not an

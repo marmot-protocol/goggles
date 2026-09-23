@@ -480,7 +480,10 @@ class InvestigationBundleTests(SimpleTestCase):
                         supplied_file_count=1,
                     )
             self.assertEqual(list(Path(directory).iterdir()), [])
-            with patch("forensics.investigation_bundle.os.fsync", side_effect=OSError("synthetic")):
+            with patch(
+                "forensics.investigation_bundle.os.fsync",
+                side_effect=[OSError("synthetic"), None],
+            ):
                 with self.assertRaisesRegex(IncompleteEvidence, "bundle_write_failed"):
                     write_bundle(
                         target,
@@ -527,6 +530,49 @@ class InvestigationBundleTests(SimpleTestCase):
                     validate_bundle_target(target)
             finally:
                 os.chmod(parent, 0o700)
+
+    def test_directory_sync_failure_rolls_back_or_reports_uncertain_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_bytes(body(1) + b"\n")
+            target = Path(directory) / "bundle.json"
+            args = ["--jsonl", str(source), "--group", GROUP, "--bundle-path", str(target)]
+
+            output = io.StringIO()
+            with patch(
+                "forensics.investigation_bundle._sync_directory",
+                side_effect=[OSError("synthetic"), None, None],
+            ):
+                with redirect_stdout(output):
+                    code = investigation_main(args)
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 2)
+            self.assertTrue(result["bounded_retrieval_completed"])
+            self.assertFalse(result["bundle_written"])
+            self.assertEqual(result["bundle_error"], "bundle_write_failed")
+            self.assertFalse(target.exists())
+            self.assertFalse(list(Path(directory).glob(".goggles-investigation-*.tmp")))
+
+            real_unlink = os.unlink
+
+            def reject_target(path, *args, **kwargs):
+                if Path(path) == target:
+                    raise OSError("synthetic rollback failure")
+                return real_unlink(path, *args, **kwargs)
+
+            output = io.StringIO()
+            with patch("forensics.investigation_bundle._sync_directory", side_effect=OSError):
+                with patch("forensics.investigation_bundle.os.unlink", side_effect=reject_target):
+                    with redirect_stdout(output):
+                        code = investigation_main(args)
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 2)
+            self.assertTrue(result["bounded_retrieval_completed"])
+            self.assertIsNone(result["bundle_written"])
+            self.assertEqual(result["bundle_artifact_status"], "uncertain")
+            self.assertEqual(result["bundle_error"], "bundle_publication_uncertain")
+            self.assertTrue(target.exists())
+            self.assertFalse(list(Path(directory).glob(".goggles-investigation-*.tmp")))
 
     def test_cli_bundle_is_opt_in_and_stdout_has_no_source_path(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import sys
 import tempfile
 import tomllib
 from collections import defaultdict
@@ -18,6 +19,18 @@ ORDERING = (
     "Within each engine/account/recorder session: sequence, then body SHA-256; "
     "no global causal order."
 )
+
+
+class BundlePublicationUncertain(IncompleteEvidence):
+    """The filesystem did not confirm cleanup; a local artifact may remain."""
+
+
+def _sync_directory(parent):
+    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def tool_version():
@@ -117,6 +130,7 @@ def write_bundle(
     }
 
     temporary = None
+    linked = False
     try:
         descriptor, temporary = tempfile.mkstemp(
             prefix=".goggles-investigation-", suffix=".tmp", dir=target.parent
@@ -185,13 +199,24 @@ def write_bundle(
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, target)
-    except FileExistsError as error:
-        raise IncompleteEvidence("bundle_target_exists") from error
+        linked = True
+        _sync_directory(target.parent)
     except OSError as error:
+        if linked:
+            try:
+                os.unlink(target)
+                _sync_directory(target.parent)
+            except OSError as rollback_error:
+                raise BundlePublicationUncertain("bundle_publication_uncertain") from rollback_error
+        if isinstance(error, FileExistsError):
+            raise IncompleteEvidence("bundle_target_exists") from error
         raise IncompleteEvidence("bundle_write_failed") from error
     finally:
         if temporary is not None:
+            pending_error = sys.exc_info()[1]
             try:
                 os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+                _sync_directory(target.parent)
+            except OSError as cleanup_error:
+                if not isinstance(pending_error, BundlePublicationUncertain):
+                    raise BundlePublicationUncertain("bundle_cleanup_uncertain") from cleanup_error
