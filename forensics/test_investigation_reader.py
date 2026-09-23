@@ -15,7 +15,6 @@ from unittest.mock import patch
 from django.test import SimpleTestCase
 
 from forensics.investigation_bundle import (
-    MAX_BUNDLE_BYTES,
     validate_bundle_target,
     write_bundle,
 )
@@ -450,8 +449,6 @@ class InvestigationBundleTests(SimpleTestCase):
                 remote_summary,
                 acquisition_started_ns=30,
                 acquisition_completed_ns=40,
-                requested_receipt_window_ns=(cutoff - 1, cutoff + 10),
-                reader_cutoff_ns=cutoff,
             )
             jsonl_bundle = json.loads(jsonl_target.read_bytes())
             loki_bundle = json.loads(loki_target.read_bytes())
@@ -507,7 +504,6 @@ class InvestigationBundleTests(SimpleTestCase):
                         supplied_file_count=1,
                     )
             self.assertEqual(list(Path(directory).iterdir()), [])
-        self.assertGreater(MAX_BUNDLE_BYTES, 64)
 
     def test_existing_symlink_and_nonprivate_parent_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -547,6 +543,28 @@ class InvestigationBundleTests(SimpleTestCase):
             self.assertNotIn(str(source), output.getvalue())
             self.assertNotIn(str(target), output.getvalue())
             self.assertTrue(json.loads(output.getvalue())["bundle_written"])
+
+            failed_target = Path(directory) / "budget-failed.json"
+            output = io.StringIO()
+            with patch("forensics.investigation_bundle.MAX_BUNDLE_BYTES", 64):
+                with redirect_stdout(output):
+                    code = investigation_main(
+                        [
+                            "--jsonl",
+                            str(source),
+                            "--group",
+                            GROUP,
+                            "--bundle-path",
+                            str(failed_target),
+                        ]
+                    )
+            failed = json.loads(output.getvalue())
+            self.assertEqual(code, 2)
+            self.assertTrue(failed["bounded_retrieval_completed"])
+            self.assertEqual(failed["group_records"], 1)
+            self.assertFalse(failed["bundle_written"])
+            self.assertEqual(failed["bundle_error"], "bundle_budget_exceeded")
+            self.assertFalse(failed_target.exists())
 
             source.write_bytes(b'{"schema_version":"invalid"}\n')
             invalid_target = Path(directory) / "invalid.json"

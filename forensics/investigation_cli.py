@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 from forensics.investigation_reader import (
-    READER_CUTOFF_NS,
     IncompleteEvidence,
     LocalLokiTransport,
     LokiReader,
@@ -78,29 +77,38 @@ def main(argv=None):
             result = reader.investigate(args.group, args.receipt_start_ns, args.receipt_end_ns)
             evidence = reader.evidence
         acquisition_completed_ns = time.time_ns()
-        if args.bundle_path:
-            write_bundle(
-                args.bundle_path,
-                evidence,
-                args.group,
-                result,
-                acquisition_started_ns=acquisition_started_ns,
-                acquisition_completed_ns=acquisition_completed_ns,
-                supplied_file_count=len(args.jsonl) if args.jsonl else None,
-                requested_receipt_window_ns=(args.receipt_start_ns, args.receipt_end_ns)
-                if args.loki_url
-                else None,
-                reader_cutoff_ns=reader.now_ns - READER_CUTOFF_NS if args.loki_url else None,
-            )
-            result["bundle_written"] = True
-        print(json.dumps(result, sort_keys=True))
-        return 0
     except IncompleteEvidence as error:
         reason = str(error)
     except OSError:
         reason = "source_read_failed"
     except ValueError:
         reason = "invalid_input"
+    else:
+        if args.bundle_path:
+            try:
+                write_bundle(
+                    args.bundle_path,
+                    evidence,
+                    args.group,
+                    result,
+                    acquisition_started_ns=acquisition_started_ns,
+                    acquisition_completed_ns=acquisition_completed_ns,
+                    supplied_file_count=len(args.jsonl) if args.jsonl else None,
+                )
+            except IncompleteEvidence as error:
+                bundle_error = str(error)
+            except (OSError, ValueError):
+                bundle_error = "bundle_write_failed"
+            else:
+                bundle_error = None
+            if bundle_error:
+                result["bundle_written"] = False
+                result["bundle_error"] = bundle_error
+                print(json.dumps(result, sort_keys=True))
+                return 2
+            result["bundle_written"] = True
+        print(json.dumps(result, sort_keys=True))
+        return 0
     print(json.dumps({"bounded_retrieval_completed": False, "reason": reason}))
     return 2
 

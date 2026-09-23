@@ -51,23 +51,30 @@ def validate_bundle_target(path):
     return target
 
 
-def _scope(summary, *, supplied_file_count, requested_receipt_window_ns, reader_cutoff_ns):
+def _scope(summary, *, supplied_file_count):
     if summary["source"] == "jsonl":
         if supplied_file_count is None:
-            raise ValueError("missing_file_count")
+            raise IncompleteEvidence("missing_bundle_scope")
         return {"type": "provided_files_only", "supplied_file_count": supplied_file_count}
     if summary["source"] == "loki":
-        if requested_receipt_window_ns is None or reader_cutoff_ns is None:
-            raise ValueError("missing_receipt_scope")
+        required = (
+            "requested_receipt_window_ns",
+            "queried_receipt_window_ns",
+            "reader_cutoff_ns",
+            "receipt_cutoff_omitted",
+            "query_count",
+        )
+        if any(key not in summary for key in required):
+            raise IncompleteEvidence("missing_bundle_scope")
         return {
             "type": "queried_receipt_window",
-            "requested_receipt_window_ns": list(requested_receipt_window_ns),
+            "requested_receipt_window_ns": summary["requested_receipt_window_ns"],
             "effective_receipt_window_ns": summary["queried_receipt_window_ns"],
-            "reader_cutoff_ns": reader_cutoff_ns,
+            "reader_cutoff_ns": summary["reader_cutoff_ns"],
             "receipt_cutoff_omitted": summary["receipt_cutoff_omitted"],
             "query_count": summary["query_count"],
         }
-    raise ValueError("unsupported_source")
+    raise IncompleteEvidence("unsupported_bundle_source")
 
 
 def write_bundle(
@@ -79,8 +86,6 @@ def write_bundle(
     acquisition_started_ns,
     acquisition_completed_ns,
     supplied_file_count=None,
-    requested_receipt_window_ns=None,
-    reader_cutoff_ns=None,
 ):
     """Publish a complete bundle once, without replacing an existing path."""
     target = validate_bundle_target(path)
@@ -102,16 +107,11 @@ def write_bundle(
             trace_refs[msg_id].add(digest)
     header = {
         "schema_version": BUNDLE_VERSION,
-        "tool": {"name": "goggles-investigation-reader", "version": tool_version()},
+        "tool": {"name": "goggles-investigation-reader", "package_version": tool_version()},
         "source_format_version": SCHEMA_VERSION,
         "group_ref": group,
         "acquisition_time_bounds_ns": [acquisition_started_ns, acquisition_completed_ns],
-        "scope": _scope(
-            summary,
-            supplied_file_count=supplied_file_count,
-            requested_receipt_window_ns=requested_receipt_window_ns,
-            reader_cutoff_ns=reader_cutoff_ns,
-        ),
+        "scope": _scope(summary, supplied_file_count=supplied_file_count),
         "ordering": ORDERING,
         "summary": summary,
     }
@@ -184,10 +184,10 @@ def write_bundle(
             emit("]}")
             stream.flush()
             os.fsync(stream.fileno())
-        os.link(temporary, target, follow_symlinks=False)
+        os.link(temporary, target)
     except FileExistsError as error:
         raise IncompleteEvidence("bundle_target_exists") from error
-    except (OSError, UnicodeError) as error:
+    except OSError as error:
         raise IncompleteEvidence("bundle_write_failed") from error
     finally:
         if temporary is not None:

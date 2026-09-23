@@ -22,9 +22,13 @@ uv run python -m forensics.investigation_cli \
   --group ab12
 ```
 
-The command prints aggregate JSON only. Exit code 2 and a fixed reason mean
-retrieval did not complete within the schema, file, response, query, or time
-budget. It does not print raw bodies or identifiers from a failed record.
+The command prints aggregate JSON only. Exit code 2 with
+`bounded_retrieval_completed: false` and a fixed reason means retrieval did not
+complete within the schema, file, response, query, or time budget. When a
+bundle write fails after retrieval, exit code 2 retains the aggregate result
+with `bounded_retrieval_completed: true`, `bundle_written: false`, and a fixed
+`bundle_error`. Neither error form prints raw bodies or identifiers from a
+failed record.
 
 To publish one private investigation artifact, add an explicit absolute
 `--bundle-path` under an existing directory that you own and that grants no
@@ -45,7 +49,8 @@ contributing evidence references. Re-encoding a decoded `body` string as
 UTF-8 reproduces the original JSON body bytes. Records are ordered within each
 engine/account/recorder session by sequence and then body digest. That ordering
 does not assert a global causal order. The bundle also records the source
-format and tool versions, acquisition time bounds, the supplied file count or
+format and Goggles package versions (the package version is not an exact
+source-commit identifier), acquisition time bounds, the supplied file count or
 requested and effective Loki receipt window, the reader cutoff, and the same
 coverage limitations as the aggregate summary. It does not include input file
 paths or the Loki URL, and the command does not print either path.
