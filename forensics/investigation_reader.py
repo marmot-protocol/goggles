@@ -97,13 +97,13 @@ class Evidence:
         }
         return selected, context_incomplete
 
-    def summary(self, group, *, source, receipt_cutoff_omitted=False):
+    def reconstruct(self, group):
         selected, context_incomplete = self.selected(group)
         from forensics.analysis import message_traces_from_events
         from forensics.ingest import normalize_event
         from forensics.models import AuditEvent
 
-        models = []
+        model_refs = []
         kinds = Counter()
         for digest in sorted(selected):
             event = self.events[digest]
@@ -112,9 +112,14 @@ class Evidence:
             normalized, errors = normalize_event(event)
             if errors:
                 raise IncompleteEvidence("normalization_rejected")
-            models.append(AuditEvent(**normalized))
+            model_refs.append((digest, AuditEvent(**normalized)))
             kinds[event["kind"]["type"]] += 1
+        models = [model for _, model in model_refs]
         traces = message_traces_from_events(models, {row.engine_id for row in models})
+        return selected, context_incomplete, model_refs, traces, kinds
+
+    def summary(self, group, *, source, receipt_cutoff_omitted=False):
+        selected, context_incomplete, model_refs, traces, kinds = self.reconstruct(group)
         source_times = [self.events[d]["wall_time_ms"] for d in selected]
         identities = defaultdict(set)
         for digest in selected:
@@ -124,8 +129,8 @@ class Evidence:
             "source": source,
             "scope": "provided_files_only" if source == "jsonl" else "queried_receipt_window",
             "selected_distinct_bodies": len(selected),
-            "group_records": len(models),
-            "supporting_groupless_context": len(selected) - len(models),
+            "group_records": len(model_refs),
+            "supporting_groupless_context": len(selected) - len(model_refs),
             "duplicate_occurrences": sum(self.occurrences[d] - 1 for d in selected),
             "conflicting_identities": conflicts,
             "kind_counts": dict(sorted(kinds.items())),

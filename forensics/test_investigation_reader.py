@@ -2,14 +2,24 @@
 
 import hashlib
 import http.client
+import io
 import json
+import os
 import re
+import stat
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
+from forensics.investigation_bundle import (
+    MAX_BUNDLE_BYTES,
+    validate_bundle_target,
+    write_bundle,
+)
+from forensics.investigation_cli import main as investigation_main
 from forensics.investigation_reader import (
     MAX_QUERIES,
     READER_CUTOFF_NS,
@@ -329,3 +339,230 @@ class InvestigationReaderTests(SimpleTestCase):
         transport.http = BadResponse()
         with self.assertRaisesRegex(IncompleteEvidence, "loki_request_failed"):
             transport('{service_name="test"}', 1, 2, 1, 1)
+
+
+class InvestigationBundleTests(SimpleTestCase):
+    def test_original_unicode_and_escapes_duplicates_conflicts_order_and_trace_refs(self):
+        event = json.loads(
+            body(
+                1,
+                engine="synthetic-é",
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": MESSAGE,
+                    "new_state": "seen",
+                    "reason": "synthetic",
+                },
+            )
+        )
+        raw_unicode = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode()
+        raw_escaped = json.dumps(event, ensure_ascii=True, separators=(",", ":")).encode()
+        context = body(2, group="", engine="synthetic-é")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_bytes(b"\n".join([raw_unicode, raw_unicode, raw_escaped, context]) + b"\n")
+            evidence = read_jsonl([source])
+            summary = evidence.summary(GROUP, source="jsonl")
+            target = Path(directory) / "bundle.json"
+            write_bundle(
+                target,
+                evidence,
+                GROUP,
+                summary,
+                acquisition_started_ns=10,
+                acquisition_completed_ns=20,
+                supplied_file_count=1,
+            )
+            bundle = json.loads(target.read_bytes())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        refs = {hashlib.sha256(raw).hexdigest() for raw in (raw_unicode, raw_escaped)}
+        self.assertEqual(bundle["schema_version"], "goggles-investigation-bundle/v1")
+        self.assertEqual(bundle["source_format_version"], "marmot-forensics-audit/v4")
+        self.assertEqual(bundle["acquisition_time_bounds_ns"], [10, 20])
+        self.assertEqual(bundle["scope"], {"type": "provided_files_only", "supplied_file_count": 1})
+        self.assertEqual(
+            {row["body"].encode() for row in bundle["evidence"]},
+            {raw_unicode, raw_escaped, context},
+        )
+        for row in bundle["evidence"]:
+            self.assertEqual(row["sha256"], hashlib.sha256(row["body"].encode()).hexdigest())
+        self.assertEqual([json.loads(row["body"])["seq"] for row in bundle["evidence"]], [1, 1, 2])
+        self.assertEqual(
+            [
+                (row["sha256"], row["occurrences"])
+                for row in bundle["evidence"]
+                if row["sha256"] in refs
+            ],
+            [
+                (digest, 2 if digest == hashlib.sha256(raw_unicode).hexdigest() else 1)
+                for digest in sorted(refs)
+            ],
+        )
+        self.assertEqual(bundle["summary"]["duplicate_occurrences"], 1)
+        self.assertEqual(bundle["summary"]["conflicting_identities"], 1)
+        self.assertEqual(bundle["conflicts"][0]["evidence_refs"], sorted(refs))
+        self.assertEqual(bundle["message_traces"][0]["evidence_refs"], sorted(refs))
+        self.assertEqual(bundle["message_traces"][0]["msg_id"], MESSAGE)
+
+    def test_jsonl_loki_bundle_evidence_trace_parity_and_cutoff_scope(self):
+        now = 2_000_000_000_000_000_000
+        cutoff = now - READER_CUTOFF_NS
+        records = [
+            body(
+                1,
+                kind={
+                    "type": "message_state_changed",
+                    "msg_id": MESSAGE,
+                    "new_state": "seen",
+                    "reason": "synthetic",
+                },
+            ),
+            body(1),
+            body(2, group=""),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_bytes(b"\n".join(records) + b"\n")
+            direct = read_jsonl([source])
+            direct_summary = direct.summary(GROUP, source="jsonl")
+            jsonl_target = Path(directory) / "direct.json"
+            write_bundle(
+                jsonl_target,
+                direct,
+                GROUP,
+                direct_summary,
+                acquisition_started_ns=10,
+                acquisition_completed_ns=20,
+                supplied_file_count=1,
+            )
+            reader = LokiReader(
+                FakeLoki([(cutoff + index + 1, raw) for index, raw in enumerate(records)]),
+                "synthetic-audit",
+                "isolated-test",
+                now_ns=now,
+            )
+            remote_summary = reader.investigate(GROUP, cutoff - 1, cutoff + 10)
+            loki_target = Path(directory) / "remote.json"
+            write_bundle(
+                loki_target,
+                reader.evidence,
+                GROUP,
+                remote_summary,
+                acquisition_started_ns=30,
+                acquisition_completed_ns=40,
+                requested_receipt_window_ns=(cutoff - 1, cutoff + 10),
+                reader_cutoff_ns=cutoff,
+            )
+            jsonl_bundle = json.loads(jsonl_target.read_bytes())
+            loki_bundle = json.loads(loki_target.read_bytes())
+        for key in ("evidence", "conflicts", "message_traces"):
+            self.assertEqual(jsonl_bundle[key], loki_bundle[key])
+        self.assertEqual(
+            loki_bundle["scope"]["requested_receipt_window_ns"], [cutoff - 1, cutoff + 10]
+        )
+        self.assertEqual(loki_bundle["scope"]["effective_receipt_window_ns"], [cutoff, cutoff + 10])
+        self.assertEqual(loki_bundle["scope"]["reader_cutoff_ns"], cutoff)
+        self.assertTrue(loki_bundle["scope"]["receipt_cutoff_omitted"])
+        self.assertFalse(loki_bundle["summary"]["complete_for_requested_scope"])
+
+    def test_bundle_budget_and_write_error_leave_no_artifact_or_temp(self):
+        evidence = Evidence()
+        evidence.add(body(1))
+        summary = evidence.summary(GROUP, source="jsonl")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "bundle.json"
+            with patch("forensics.investigation_bundle.MAX_BUNDLE_BYTES", 64):
+                with self.assertRaisesRegex(IncompleteEvidence, "bundle_budget_exceeded"):
+                    write_bundle(
+                        target,
+                        evidence,
+                        GROUP,
+                        summary,
+                        acquisition_started_ns=10,
+                        acquisition_completed_ns=20,
+                        supplied_file_count=1,
+                    )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            with patch("forensics.investigation_bundle.os.fsync", side_effect=OSError("synthetic")):
+                with self.assertRaisesRegex(IncompleteEvidence, "bundle_write_failed"):
+                    write_bundle(
+                        target,
+                        evidence,
+                        GROUP,
+                        summary,
+                        acquisition_started_ns=10,
+                        acquisition_completed_ns=20,
+                        supplied_file_count=1,
+                    )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            with patch("forensics.investigation_bundle.os.link", side_effect=FileExistsError):
+                with self.assertRaisesRegex(IncompleteEvidence, "bundle_target_exists"):
+                    write_bundle(
+                        target,
+                        evidence,
+                        GROUP,
+                        summary,
+                        acquisition_started_ns=10,
+                        acquisition_completed_ns=20,
+                        supplied_file_count=1,
+                    )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertGreater(MAX_BUNDLE_BYTES, 64)
+
+    def test_existing_symlink_and_nonprivate_parent_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "bundle.json"
+            target.write_text("existing")
+            with self.assertRaisesRegex(IncompleteEvidence, "bundle_target_exists"):
+                validate_bundle_target(target)
+            self.assertEqual(target.read_text(), "existing")
+            target.unlink()
+            victim = parent / "victim.json"
+            victim.write_text("victim")
+            target.symlink_to(victim)
+            with self.assertRaisesRegex(IncompleteEvidence, "bundle_target_exists"):
+                validate_bundle_target(target)
+            self.assertEqual(victim.read_text(), "victim")
+            target.unlink()
+            os.chmod(parent, 0o755)
+            try:
+                with self.assertRaisesRegex(IncompleteEvidence, "bundle_parent_not_private"):
+                    validate_bundle_target(target)
+            finally:
+                os.chmod(parent, 0o700)
+
+    def test_cli_bundle_is_opt_in_and_stdout_has_no_source_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "private-source.jsonl"
+            source.write_bytes(body(1) + b"\n")
+            target = Path(directory) / "bundle.json"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = investigation_main(
+                    ["--jsonl", str(source), "--group", GROUP, "--bundle-path", str(target)]
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(target.exists())
+            self.assertNotIn(str(source), output.getvalue())
+            self.assertNotIn(str(target), output.getvalue())
+            self.assertTrue(json.loads(output.getvalue())["bundle_written"])
+
+            source.write_bytes(b'{"schema_version":"invalid"}\n')
+            invalid_target = Path(directory) / "invalid.json"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = investigation_main(
+                    [
+                        "--jsonl",
+                        str(source),
+                        "--group",
+                        GROUP,
+                        "--bundle-path",
+                        str(invalid_target),
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(output.getvalue())["reason"], "invalid_v4_body")
+            self.assertFalse(invalid_target.exists())
+            self.assertFalse(list(Path(directory).glob(".goggles-investigation-*.tmp")))
