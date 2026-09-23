@@ -71,10 +71,12 @@ class Evidence:
         self.events = {}
         self.occurrences = Counter()
         self.body_bytes = 0
+        self._reconstruction = None
 
     def add(self, body, event=None):
         if event is None:
             event = parse_body(body)
+        self._reconstruction = None
         digest = hashlib.sha256(body).hexdigest()
         self.occurrences[digest] += 1
         if digest in self.records:
@@ -97,13 +99,15 @@ class Evidence:
         }
         return selected, context_incomplete
 
-    def summary(self, group, *, source, receipt_cutoff_omitted=False):
+    def reconstruct(self, group):
+        if self._reconstruction is not None and self._reconstruction[0] == group:
+            return self._reconstruction[1]
         selected, context_incomplete = self.selected(group)
         from forensics.analysis import message_traces_from_events
         from forensics.ingest import normalize_event
         from forensics.models import AuditEvent
 
-        models = []
+        model_refs = []
         kinds = Counter()
         for digest in sorted(selected):
             event = self.events[digest]
@@ -112,9 +116,16 @@ class Evidence:
             normalized, errors = normalize_event(event)
             if errors:
                 raise IncompleteEvidence("normalization_rejected")
-            models.append(AuditEvent(**normalized))
+            model_refs.append((digest, AuditEvent(**normalized)))
             kinds[event["kind"]["type"]] += 1
+        models = [model for _, model in model_refs]
         traces = message_traces_from_events(models, {row.engine_id for row in models})
+        result = selected, context_incomplete, model_refs, traces, kinds
+        self._reconstruction = group, result
+        return result
+
+    def summary(self, group, *, source, receipt_cutoff_omitted=False):
+        selected, context_incomplete, model_refs, traces, kinds = self.reconstruct(group)
         source_times = [self.events[d]["wall_time_ms"] for d in selected]
         identities = defaultdict(set)
         for digest in selected:
@@ -124,8 +135,8 @@ class Evidence:
             "source": source,
             "scope": "provided_files_only" if source == "jsonl" else "queried_receipt_window",
             "selected_distinct_bodies": len(selected),
-            "group_records": len(models),
-            "supporting_groupless_context": len(selected) - len(models),
+            "group_records": len(model_refs),
+            "supporting_groupless_context": len(selected) - len(model_refs),
             "duplicate_occurrences": sum(self.occurrences[d] - 1 for d in selected),
             "conflicting_identities": conflicts,
             "kind_counts": dict(sorted(kinds.items())),
@@ -239,6 +250,7 @@ class LokiReader:
         self.service_name = service_name
         self.environment_name = environment_name
         self.now_ns = time.time_ns() if now_ns is None else now_ns
+        self.reader_cutoff_ns = self.now_ns - READER_CUTOFF_NS
         self.page_size = page_size
         self.deadline = time.monotonic() + max_seconds
         self.queries = 0
@@ -313,12 +325,15 @@ class LokiReader:
             raise ValueError("group_ref_must_be_hex")
         if end_ns <= start_ns:
             raise ValueError("inverted_receipt_window")
-        cutoff = self.now_ns - READER_CUTOFF_NS
+        requested_window = [start_ns, end_ns]
+        cutoff = self.reader_cutoff_ns
         omitted = start_ns < cutoff
         start_ns = max(start_ns, cutoff)
         if start_ns >= end_ns:
             result = self.evidence.summary(group, source="loki", receipt_cutoff_omitted=True)
+            result["requested_receipt_window_ns"] = requested_window
             result["queried_receipt_window_ns"] = None
+            result["reader_cutoff_ns"] = cutoff
             result["query_count"] = self.queries
             return result
         selector = (
@@ -374,6 +389,8 @@ class LokiReader:
                     ),
                 )
         result = self.evidence.summary(group, source="loki", receipt_cutoff_omitted=omitted)
+        result["requested_receipt_window_ns"] = requested_window
         result["queried_receipt_window_ns"] = [start_ns, end_ns]
+        result["reader_cutoff_ns"] = cutoff
         result["query_count"] = self.queries
         return result

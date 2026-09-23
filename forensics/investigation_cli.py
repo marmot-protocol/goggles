@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 
 from forensics.investigation_reader import (
@@ -23,6 +24,7 @@ def main(argv=None):
     parser.add_argument("--environment-name", help="Exact Loki deployment_environment_name label")
     parser.add_argument("--receipt-start-ns", type=int)
     parser.add_argument("--receipt-end-ns", type=int)
+    parser.add_argument("--bundle-path", metavar="PATH", help="Explicit private output JSON path")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[0-9a-fA-F]+", args.group):
         parser.error("--group must be a hexadecimal group reference")
@@ -60,21 +62,63 @@ def main(argv=None):
 
     django.setup()
     try:
+        if args.bundle_path:
+            from forensics.investigation_bundle import (
+                BundlePublicationUncertain,
+                validate_bundle_target,
+                write_bundle,
+            )
+
+            validate_bundle_target(args.bundle_path)
+        acquisition_started_ns = time.time_ns()
         if args.jsonl:
-            result = read_jsonl(args.jsonl).summary(args.group, source="jsonl")
+            evidence = read_jsonl(args.jsonl)
+            result = evidence.summary(args.group, source="jsonl")
         else:
             reader = LokiReader(
                 LocalLokiTransport(args.loki_url), args.service_name, args.environment_name
             )
             result = reader.investigate(args.group, args.receipt_start_ns, args.receipt_end_ns)
-        print(json.dumps(result, sort_keys=True))
-        return 0
+            evidence = reader.evidence
+        acquisition_completed_ns = time.time_ns()
     except IncompleteEvidence as error:
         reason = str(error)
     except OSError:
         reason = "source_read_failed"
     except ValueError:
         reason = "invalid_input"
+    else:
+        if args.bundle_path:
+            try:
+                write_bundle(
+                    args.bundle_path,
+                    evidence,
+                    args.group,
+                    result,
+                    acquisition_started_ns=acquisition_started_ns,
+                    acquisition_completed_ns=acquisition_completed_ns,
+                    supplied_file_count=len(args.jsonl) if args.jsonl else None,
+                )
+            except BundlePublicationUncertain as error:
+                result["bundle_written"] = None
+                result["bundle_artifact_status"] = "uncertain"
+                result["bundle_error"] = str(error)
+                print(json.dumps(result, sort_keys=True))
+                return 2
+            except IncompleteEvidence as error:
+                bundle_error = str(error)
+            except (OSError, ValueError):
+                bundle_error = "bundle_write_failed"
+            else:
+                bundle_error = None
+            if bundle_error:
+                result["bundle_written"] = False
+                result["bundle_error"] = bundle_error
+                print(json.dumps(result, sort_keys=True))
+                return 2
+            result["bundle_written"] = True
+        print(json.dumps(result, sort_keys=True))
+        return 0
     print(json.dumps({"bounded_retrieval_completed": False, "reason": reason}))
     return 2
 

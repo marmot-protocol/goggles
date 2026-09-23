@@ -22,9 +22,52 @@ uv run python -m forensics.investigation_cli \
   --group ab12
 ```
 
-The command prints aggregate JSON only. Exit code 2 and a fixed reason mean
-retrieval did not complete within the schema, file, response, query, or time
-budget. It does not print raw bodies or identifiers from a failed record.
+The command prints aggregate JSON only. Exit code 2 with
+`bounded_retrieval_completed: false` and a fixed reason means retrieval did not
+complete within the schema, file, response, query, or time budget. When a
+bundle write fails after retrieval, exit code 2 retains the aggregate result
+with `bounded_retrieval_completed: true`, `bundle_written: false`, and a fixed
+`bundle_error`. If the filesystem cannot confirm rollback or cleanup, the
+result instead reports `bundle_written: null` and
+`bundle_artifact_status: "uncertain"`; inspect the private target directory
+before retrying. Neither error form prints raw bodies or identifiers from a
+failed record.
+
+To publish one private investigation artifact, add an explicit absolute
+`--bundle-path` under an existing directory that you own and that grants no
+group or other access (for example, mode `0700`):
+
+```sh
+mkdir -m 700 /absolute/private/path/bundles
+uv run python -m forensics.investigation_cli \
+  --jsonl /absolute/private/path/segment.jsonl --group ab12 \
+  --bundle-path /absolute/private/path/bundles/investigation.json
+```
+
+The output is one `goggles-investigation-bundle/v1` JSON file created with mode
+`0600`. It contains the exact original UTF-8 JSON body text for each selected
+distinct record, its SHA-256 reference and occurrence count, identities with
+conflicting body references, and Goggles' existing message traces with their
+contributing evidence references. Re-encoding a decoded `body` string as
+UTF-8 reproduces the original JSON body bytes. Records are ordered within each
+engine/account/recorder session by sequence and then body digest. That ordering
+does not assert a global causal order. The bundle also records the source
+format and Goggles package versions (the package version is not an exact
+source-commit identifier), acquisition time bounds, the supplied file count or
+requested and effective Loki receipt window, the reader cutoff, and the same
+coverage limitations as the aggregate summary. It does not include input file
+paths or the Loki URL, and the command does not print either path.
+
+The target must not already exist, including as a symlink. The writer syncs
+the file and parent directory, publishes without overwrite, and rolls back a
+publication whose directory sync fails. Retrieval, validation, and budget
+exhaustion leave no final bundle; write failures normally do too. An
+`uncertain` status means filesystem failure prevented confirmation of cleanup,
+so a local artifact may remain. The bundle is sensitive local evidence: handle it only in a bounded private
+workspace and delete it manually when the investigation ends. This local file
+has no automatic expiry. Automatic 30-day deletion for any future server
+storage is a separate design and deployment gate. The bundle is not an
+incident-replay export and does not add the nine legacy projections.
 
 Both inputs validate each original UTF-8 JSON body against this repository's
 current v4 schema, deduplicate identical **bytes**, preserve different bodies
@@ -55,9 +98,11 @@ extracted from the local Goggles feasibility snapshot
 `0a74fc32c54e389f4885af80f9acf0a4fca24471` (`scripts/feasibility/lab.py`,
 `bucket.py`, `investigate.py`, `retained_reader.py`, and `unique.py`). This
 snapshot is a local Git object, not a published dependency. Loki mode requires
-an already populated store using that exact out-of-tree bucket and label
-mapping; this PR does not supply a writer or a production route. This first
-slice tests those contracts with synthetic current-v4 records. It does
+an already populated store using the bucket and metadata mapping independently
+specified by [MDK's isolated receiver contract](https://github.com/marmot-protocol/mdk/pull/1997).
+That contract is loopback synthetic; this reader does not supply a deployed
+writer or a production route. The reader and bundle test these contracts with
+synthetic current-v4 records. They do
 not include the private corpus, experiment results, lab containers, persistent
 projections, or the later production access and retention design. The prior
 projection parity experiment covered selected cases but is not claimed here.
