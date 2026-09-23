@@ -6,6 +6,7 @@ import json
 import re
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
@@ -246,6 +247,24 @@ class InvestigationReaderTests(SimpleTestCase):
         reader = LokiReader(fake, "synthetic-audit", "isolated-test", now_ns=now, page_size=2)
         with self.assertRaises(IncompleteEvidence):
             reader.investigate(GROUP, stamp - 1, stamp + 1)
+
+    def test_dense_tie_stops_expanding_when_evidence_budget_is_exhausted(self):
+        now = 2_000_000_000_000_000_000
+        stamp = now - 10**9
+        rows = [(stamp, body(seq)) for seq in range(1, 41)]
+        complete = LokiReader(
+            FakeLoki(rows), "synthetic-audit", "isolated-test", now_ns=now, page_size=2
+        )
+        self.assertEqual(complete.investigate(GROUP, stamp - 1, stamp + 1)["group_records"], 40)
+
+        limited = LokiReader(
+            FakeLoki(rows), "synthetic-audit", "isolated-test", now_ns=now, page_size=2
+        )
+        with patch("forensics.investigation_reader.MAX_EVIDENCE_BYTES", 2 * len(body(1))):
+            with self.assertRaisesRegex(IncompleteEvidence, "evidence_budget_exceeded"):
+                limited.investigate(GROUP, stamp - 1, stamp + 1)
+        self.assertLess(limited.queries, complete.queries)
+        self.assertLessEqual(len(limited.evidence.records), 2)
 
     def test_query_budget_and_malformed_result_fail_closed(self):
         now = 2_000_000_000_000_000_000

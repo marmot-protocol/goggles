@@ -278,13 +278,20 @@ class LokiReader:
         suffix = f' | audit_sha256=~"{prefix}[0-9a-f]*"' if prefix else ""
         rows = self.query(expression + suffix, timestamp, timestamp + 1)
         if len(rows) < self.page_size:
-            return rows
+            yield from rows
+            return
+        del rows  # Do not retain a full page at every level of the hash trie.
         if len(prefix) >= 64:
             raise IncompleteEvidence("unresolvable_timestamp_tie")
-        result = []
         for char in "0123456789abcdef":
-            result.extend(self.tied(expression, timestamp, prefix + char))
-        return result
+            yield from self.tied(expression, timestamp, prefix + char)
+
+    def add_rows(self, rows, accept):
+        for _, _, body in rows:
+            event = parse_body(body)
+            if not accept(event):
+                raise IncompleteEvidence("loki_label_mismatch")
+            self.evidence.add(body, event)
 
     def retrieve(self, expression, start, end, accept):
         cursor = start
@@ -293,19 +300,13 @@ class LokiReader:
             if not rows:
                 break
             if len(rows) < self.page_size:
-                chosen = rows
-            else:
-                boundary = rows[-1][0]
-                chosen = [row for row in rows if row[0] < boundary]
-                chosen.extend(self.tied(expression, boundary))
-            for _, _, body in chosen:
-                event = parse_body(body)
-                if not accept(event):
-                    raise IncompleteEvidence("loki_label_mismatch")
-                self.evidence.add(body, event)
-            if len(rows) < self.page_size:
+                self.add_rows(rows, accept)
                 break
-            cursor = rows[-1][0] + 1
+            boundary = rows[-1][0]
+            self.add_rows((row for row in rows if row[0] < boundary), accept)
+            del rows
+            self.add_rows(self.tied(expression, boundary), accept)
+            cursor = boundary + 1
 
     def investigate(self, group, start_ns, end_ns):
         if not re.fullmatch(r"[0-9a-fA-F]+", group):
