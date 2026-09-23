@@ -1,6 +1,7 @@
 """Synthetic contracts for the offline and bounded local Loki readers."""
 
 import hashlib
+import http.client
 import json
 import re
 import tempfile
@@ -10,7 +11,7 @@ from django.test import SimpleTestCase
 
 from forensics.investigation_reader import (
     MAX_QUERIES,
-    RETENTION_NS,
+    READER_CUTOFF_NS,
     Evidence,
     IncompleteEvidence,
     LocalLokiTransport,
@@ -137,6 +138,19 @@ class InvestigationReaderTests(SimpleTestCase):
             with self.assertRaisesRegex(IncompleteEvidence, "invalid_v4_body"):
                 read_jsonl([source])
 
+    def test_crlf_and_blank_lines_use_the_original_json_body(self):
+        raw = body(1)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.jsonl"
+            source.write_bytes(raw + b"\r\n\r\n" + raw + b"\n")
+            evidence = read_jsonl([source])
+        self.assertEqual(set(evidence.records.values()), {raw})
+        self.assertEqual(evidence.summary(GROUP, source="jsonl")["duplicate_occurrences"], 1)
+
+    def test_historical_bucket_vectors(self):
+        self.assertEqual(bucket("group"), "b0c")
+        self.assertEqual(bucket("", "engine", "account"), "b39")
+
     def test_loki_timestamp_ties_and_matching_context(self):
         now = 2_000_000_000_000_000_000
         stamp = now - 10**9
@@ -181,18 +195,42 @@ class InvestigationReaderTests(SimpleTestCase):
         ):
             self.assertEqual(remote[key], reference[key], key)
 
+    def test_incomplete_session_does_not_join_unknown_context_or_skip_good_context(self):
+        now = 2_000_000_000_000_000_000
+        partial_group = json.loads(body(3))
+        partial_context = json.loads(body(4, group=""))
+        del partial_group["account_ref"]
+        del partial_context["account_ref"]
+        records = [
+            body(1),
+            body(2, group=""),
+            json.dumps(partial_group, separators=(",", ":")).encode(),
+            json.dumps(partial_context, separators=(",", ":")).encode(),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.jsonl"
+            source.write_bytes(b"\n".join(records) + b"\n")
+            direct = read_jsonl([source])
+        fake = FakeLoki([(now - 10**9 + index, raw) for index, raw in enumerate(records)])
+        reader = LokiReader(fake, "synthetic-audit", "isolated-test", now_ns=now)
+        remote = reader.investigate(GROUP, now - 2 * 10**9, now)
+        self.assertEqual(direct.selected(GROUP)[0], reader.evidence.selected(GROUP)[0])
+        self.assertEqual(remote["supporting_groupless_context"], 1)
+        self.assertTrue(remote["context_incomplete"])
+        self.assertFalse(remote["complete_for_requested_scope"])
+
     def test_expired_receipt_window_does_not_query(self):
         now = 2_000_000_000_000_000_000
         fake = FakeLoki([])
         reader = LokiReader(fake, "synthetic-audit", "isolated-test", now_ns=now)
-        result = reader.investigate(GROUP, now - RETENTION_NS - 10, now - RETENTION_NS - 1)
+        result = reader.investigate(GROUP, now - READER_CUTOFF_NS - 10, now - READER_CUTOFF_NS - 1)
         self.assertEqual(fake.calls, [])
         self.assertTrue(result["receipt_cutoff_omitted"])
         self.assertIsNone(result["queried_receipt_window_ns"])
 
     def test_crossing_receipt_cutoff_is_marked_incomplete(self):
         now = 2_000_000_000_000_000_000
-        cutoff = now - RETENTION_NS
+        cutoff = now - READER_CUTOFF_NS
         fake = FakeLoki([(cutoff + 1, body(1))])
         reader = LokiReader(fake, "synthetic-audit", "isolated-test", now_ns=now)
         result = reader.investigate(GROUP, cutoff - 1, cutoff + 2)
@@ -223,6 +261,30 @@ class InvestigationReaderTests(SimpleTestCase):
         with self.assertRaisesRegex(IncompleteEvidence, "invalid_loki_response"):
             reader.investigate(GROUP, stamp - 1, stamp + 1)
 
+    def test_loki_label_body_mismatch_fails_closed(self):
+        now = 2_000_000_000_000_000_000
+        stamp = now - 10**9
+        raw = body(1, group=OTHER_GROUP)
+        digest = hashlib.sha256(raw).hexdigest()
+
+        def wrong_label(*_):
+            return {
+                "status": "success",
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {
+                            "stream": {},
+                            "values": [[str(stamp), raw.decode(), {"audit_sha256": digest}]],
+                        }
+                    ],
+                },
+            }
+
+        reader = LokiReader(wrong_label, "synthetic-audit", "isolated-test", now_ns=now)
+        with self.assertRaisesRegex(IncompleteEvidence, "loki_label_mismatch"):
+            reader.investigate(GROUP, stamp - 1, stamp + 1)
+
     def test_context_without_complete_session_reports_gap(self):
         evidence = Evidence()
         event = json.loads(body(1))
@@ -237,3 +299,14 @@ class InvestigationReaderTests(SimpleTestCase):
             LocalLokiTransport("https://example.invalid")
         with self.assertRaises(ValueError):
             LocalLokiTransport("http://127.0.0.1:3100/path")
+
+    def test_malformed_http_response_is_bounded_failure(self):
+        transport = LocalLokiTransport("http://127.0.0.1:3100")
+
+        class BadResponse:
+            def open(self, *_args, **_kwargs):
+                raise http.client.BadStatusLine("synthetic")
+
+        transport.http = BadResponse()
+        with self.assertRaisesRegex(IncompleteEvidence, "loki_request_failed"):
+            transport('{service_name="test"}', 1, 2, 1, 1)

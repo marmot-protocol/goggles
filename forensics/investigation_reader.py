@@ -1,6 +1,7 @@
 """Bounded, on-demand v4 evidence reading. No ingestion or database writes."""
 
 import hashlib
+import http.client
 import ipaddress
 import json
 import re
@@ -8,18 +9,15 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
-from functools import cache
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
-
-SCHEMA = Path(__file__).resolve().parents[1] / "docs/schemas/audit-log-event.v4.schema.json"
-RETENTION_NS = 30 * 86400 * 10**9
+# This independent reader policy is not Goggles' database retention setting.
+READER_CUTOFF_NS = 30 * 86400 * 10**9
 MAX_LINE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_FILES = 256
 MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
-MAX_RECORDS = 100_000
+MAX_RECORDS = MAX_SOURCE_BYTES // 256
 MAX_QUERIES = 2_000
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_EXPRESSION_BYTES = 4_500
@@ -32,33 +30,19 @@ class IncompleteEvidence(Exception):
 
 
 def strict_json(raw):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate_json_member")
-            result[key] = value
-        return result
+    from forensics.ingest import loads_audit_json
 
-    def reject_constant(_):
-        raise ValueError("non_finite_json_number")
-
-    return json.loads(raw, object_pairs_hook=unique, parse_constant=reject_constant)
-
-
-@cache
-def validator():
-    schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-    Draft202012Validator.check_schema(schema)
-    return Draft202012Validator(schema)
+    return loads_audit_json(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
 
 
 def parse_body(body):
     try:
         if not isinstance(body, bytes) or len(body) > MAX_LINE_BYTES:
             raise ValueError
-        event = strict_json(body.decode("utf-8"))
-        if not isinstance(event, dict) or not validator().is_valid(event):
+        from forensics.audit_schema import schema_error_code
+
+        event = strict_json(body)
+        if schema_error_code(event):
             raise ValueError
         return event
     except (UnicodeError, ValueError, RecursionError, TypeError) as error:
@@ -88,8 +72,9 @@ class Evidence:
         self.occurrences = Counter()
         self.body_bytes = 0
 
-    def add(self, body):
-        event = parse_body(body)
+    def add(self, body, event=None):
+        if event is None:
+            event = parse_body(body)
         digest = hashlib.sha256(body).hexdigest()
         self.occurrences[digest] += 1
         if digest in self.records:
@@ -104,10 +89,11 @@ class Evidence:
         group_rows = {d for d, e in self.events.items() if e.get("group_ref") == group}
         sessions = {session(self.events[d]) for d in group_rows}
         context_incomplete = any(not all(item) for item in sessions)
+        complete_sessions = {item for item in sessions if all(item)}
         selected = {
             d: self.records[d]
             for d, e in self.events.items()
-            if d in group_rows or (not e.get("group_ref") and session(e) in sessions)
+            if d in group_rows or (not e.get("group_ref") and session(e) in complete_sessions)
         }
         return selected, context_incomplete
 
@@ -171,9 +157,11 @@ def read_jsonl(paths):
                 total += len(line)
                 if total > MAX_SOURCE_BYTES:
                     raise IncompleteEvidence("source_budget_exceeded")
-                if len(line) > MAX_LINE_BYTES + 1 or not line.endswith(b"\n"):
+                if len(line) > MAX_LINE_BYTES + 2 or not line.endswith(b"\n"):
                     raise IncompleteEvidence("incomplete_jsonl_line")
-                evidence.add(line[:-1])
+                body = line[:-1].removesuffix(b"\r")
+                if body:
+                    evidence.add(body)
     return evidence
 
 
@@ -220,7 +208,7 @@ class LocalLokiTransport:
         try:
             with self.http.open(request, timeout=timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
-        except OSError as error:
+        except (OSError, http.client.HTTPException) as error:
             raise IncompleteEvidence("loki_request_failed") from error
         if len(raw) > MAX_RESPONSE_BYTES:
             raise IncompleteEvidence("response_budget_exceeded")
@@ -312,8 +300,9 @@ class LokiReader:
                 chosen.extend(self.tied(expression, boundary))
             for _, _, body in chosen:
                 event = parse_body(body)
-                if accept(event):
-                    self.evidence.add(body)
+                if not accept(event):
+                    raise IncompleteEvidence("loki_label_mismatch")
+                self.evidence.add(body, event)
             if len(rows) < self.page_size:
                 break
             cursor = rows[-1][0] + 1
@@ -323,12 +312,13 @@ class LokiReader:
             raise ValueError("group_ref_must_be_hex")
         if end_ns <= start_ns:
             raise ValueError("inverted_receipt_window")
-        cutoff = self.now_ns - RETENTION_NS
+        cutoff = self.now_ns - READER_CUTOFF_NS
         omitted = start_ns < cutoff
         start_ns = max(start_ns, cutoff)
         if start_ns >= end_ns:
             result = self.evidence.summary(group, source="loki", receipt_cutoff_omitted=True)
             result["queried_receipt_window_ns"] = None
+            result["query_count"] = self.queries
             return result
         selector = (
             "{service_name="
@@ -343,19 +333,15 @@ class LokiReader:
             selector + " | audit_group=" + json.dumps(group),
             start_ns,
             end_ns,
-            lambda e: e.get("group_ref") == group,
+            lambda e: e.get("group_ref") == group and bucket(e["group_ref"]) == bucket(group),
         )
-        _, incomplete = self.evidence.selected(group)
-        if incomplete:
-            result = self.evidence.summary(group, source="loki", receipt_cutoff_omitted=omitted)
-            result["queried_receipt_window_ns"] = [start_ns, end_ns]
-            return result
         sessions = {
             session(e) for e in self.evidence.events.values() if e.get("group_ref") == group
         }
         pairs = defaultdict(set)
         for engine, account, recorder in sessions:
-            pairs[bucket("", engine, account)].add((engine, account, recorder))
+            if all((engine, account, recorder)):
+                pairs[bucket("", engine, account)].add((engine, account, recorder))
         for partition, identities in sorted(pairs.items()):
             base = (
                 "{service_name="
@@ -380,8 +366,13 @@ class LokiReader:
                     expression,
                     start_ns,
                     end_ns,
-                    lambda e: not e.get("group_ref") and session(e) in sessions,
+                    lambda e, expected=(engine, account, recorder), expected_bucket=partition: (
+                        not e.get("group_ref")
+                        and session(e) == expected
+                        and bucket("", e["engine_id"], e.get("account_ref", "")) == expected_bucket
+                    ),
                 )
         result = self.evidence.summary(group, source="loki", receipt_cutoff_omitted=omitted)
         result["queried_receipt_window_ns"] = [start_ns, end_ns]
+        result["query_count"] = self.queries
         return result

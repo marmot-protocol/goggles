@@ -3,7 +3,6 @@
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 from forensics.investigation_reader import (
@@ -68,19 +67,16 @@ def main(argv=None):
                 LocalLokiTransport(args.loki_url), args.service_name, args.environment_name
             )
             result = reader.investigate(args.group, args.receipt_start_ns, args.receipt_end_ns)
-            result["query_count"] = reader.queries
         print(json.dumps(result, sort_keys=True))
         return 0
-    except (IncompleteEvidence, OSError, ValueError) as error:
-        reason = (
-            str(error)
-            if isinstance(error, IncompleteEvidence)
-            else "source_read_failed"
-            if isinstance(error, OSError)
-            else "invalid_input"
-        )
-        print(json.dumps({"bounded_retrieval_completed": False, "reason": reason}), file=sys.stdout)
-        return 2
+    except IncompleteEvidence as error:
+        reason = str(error)
+    except OSError:
+        reason = "source_read_failed"
+    except ValueError:
+        reason = "invalid_input"
+    print(json.dumps({"bounded_retrieval_completed": False, "reason": reason}))
+    return 2
 
 
 if __name__ == "__main__":

@@ -30,27 +30,34 @@ Both inputs validate each original UTF-8 JSON body against this repository's
 current v4 schema, deduplicate identical **bytes**, preserve different bodies
 with the same `(engine, account, recorder session, sequence)` identity as a
 reported conflict, and select group records plus group-less records from their
-exact sessions. They then use Goggles' existing normalizer and message-trace
-analysis without database reads. JSONL line endings delimit records and are
-not part of the original JSON body. A missing final newline is reported as an
-incomplete file.
+exact complete `(engine, account, recorder session)` tuples. A group record
+without that tuple remains selected, but its group-less context is marked
+incomplete. They then use Goggles' existing normalizer and message-trace
+analysis without database reads. JSONL LF or CRLF endings delimit records and
+are not part of the original JSON body; blank lines are ignored. A missing
+final newline is reported as an incomplete file.
 
-Loki queries use server receipt timestamps and a 30-day reader cutoff. The
-original source `wall_time_ms` remains in the body and is reported separately.
+Loki queries use server receipt timestamps and an independent 30-day reader
+cutoff. The original source `wall_time_ms` remains in the body and is reported
+separately.
 The cutoff is a reader policy, not an access-control or physical-deletion
 guarantee. The command resolves timestamp ties, rejects unresolved ties and
 query-limit exhaustion, and explicitly reports expired windows or missing
 session identities. `bounded_retrieval_completed` means these local retrieval
-checks ended successfully. It does not establish an atomic Loki snapshot, a
-late-arrival watermark, historical absence, or full source coverage. A JSONL
-run covers only the files named on the command line and has no receipt-time
-coverage claim.
+checks ended successfully. `complete_for_requested_scope` is always false for
+Loki: this does not establish an atomic Loki snapshot, a late-arrival
+watermark, historical absence, or full source coverage. A JSONL run covers
+only the files named on the command line and has no receipt-time coverage
+claim.
 
 The retrieval, bucket mapping, byte deduplication, and context selection were
 extracted from the local Goggles feasibility snapshot
 `0a74fc32c54e389f4885af80f9acf0a4fca24471` (`scripts/feasibility/lab.py`,
 `bucket.py`, `investigate.py`, `retained_reader.py`, and `unique.py`). This
-first slice tests those contracts with synthetic current-v4 records. It does
+snapshot is a local Git object, not a published dependency. Loki mode requires
+an already populated store using that exact out-of-tree bucket and label
+mapping; this PR does not supply a writer or a production route. This first
+slice tests those contracts with synthetic current-v4 records. It does
 not include the private corpus, experiment results, lab containers, persistent
 projections, or the later production access and retention design. The prior
 projection parity experiment covered selected cases but is not claimed here.
