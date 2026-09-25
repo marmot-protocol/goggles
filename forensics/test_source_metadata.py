@@ -233,7 +233,43 @@ class LocalMemberRefExportTests(TestCase):
 
         self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "11" * 16)
 
-    def upload(self, *sources):
+    def test_backfill_recovers_a_ref_whose_source_event_was_deduplicated(self):
+        # A growing active file is re-uploaded: its leading source_context line
+        # duplicates the earlier upload's, so no event is stored for it.
+        first = self.upload({"local_member_ref": "Dd" * 16}, group_rows=1)
+        grown = self.upload({"local_member_ref": "Dd" * 16}, group_rows=2)
+        self.assertEqual(grown.duplicate_event_count, 2)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(
+            {row["id"]: row["source_local_member_ref"] for row in self.export_source_rows()},
+            {first.id: "Dd" * 16, grown.id: "Dd" * 16},
+        )
+
+    def test_backfill_and_ingest_both_read_an_event_context_source(self):
+        body = json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "seq": 0,
+                "wall_time_ms": 1700000000000,
+                "engine_id": "bb" * 16,
+                "account_ref": "aa" * 16,
+                "group_ref": "dd" * 16,
+                "context": {"source": {"local_member_ref": "33" * 16}},
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+        )
+        audit_file = ingest_audit_log_bytes(dump_bytes=f"{body}\n".encode()).audit_file
+        self.assertEqual(audit_file.source_local_member_ref, "33" * 16)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "33" * 16)
+
+    def upload(self, *sources, group_rows=1):
         base = {
             "schema_version": SCHEMA_VERSION,
             "wall_time_ms": 1700000000000,
@@ -245,13 +281,14 @@ class LocalMemberRefExportTests(TestCase):
             {**base, "seq": seq, "kind": {"type": "source_context", "source": source}}
             for seq, source in enumerate(sources)
         ]
-        events.append(
+        events.extend(
             {
                 **base,
-                "seq": len(sources),
+                "seq": seq,
                 "group_ref": "dd" * 16,
                 "kind": {"type": "recorder_started", "recorder": "synthetic"},
             }
+            for seq in range(len(sources), len(sources) + group_rows)
         )
         body = "".join(json.dumps(event) + "\n" for event in events)
         return ingest_audit_log_bytes(dump_bytes=body.encode()).audit_file

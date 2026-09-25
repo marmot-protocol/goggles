@@ -19,10 +19,12 @@ deleted/unuploaded source segments remain unknown. File-level metadata remains
 an exact summary of that file rather than an inferred copy from another segment.
 
 Migration 0018 adds `AuditFile.source_local_member_ref`. Migration 0019 fills
-it for existing files from each file's own retained `source_context` events,
-taking the first value by line order as ingest does, so existing evidence
-exports it without re-upload. The backfill reads events in batches and never
-loads raw upload text; it has a no-op reverse. Files whose events do not carry
+it for existing files from each file's own retained raw text, taking the first
+value by line order as ingest does, so existing evidence exports it without
+re-upload. It reads raw text rather than events because deduplication drops
+lines an earlier upload already stored, such as a re-uploaded file's leading
+`source_context`. Only files whose raw text mentions the key are loaded, one at
+a time; it has a no-op reverse. Files whose events do not carry
 the value stay blank and export `null` (unknown).
 
 ## Audit Evidence Retention
