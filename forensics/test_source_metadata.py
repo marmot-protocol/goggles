@@ -199,6 +199,13 @@ class LocalMemberRefExportTests(TestCase):
         self.assertIsNone(without_source["source_local_member_ref"])
         self.assertEqual(without_source["source_platform"], "")
 
+    def test_manifest_declares_member_refs_as_sensitive_export_content(self):
+        self.upload({"local_member_ref": "Dd" * 16})
+
+        manifest = self.export_records()[0]
+
+        self.assertIn("member_refs", manifest["sensitivity"]["contains"])
+
     def test_backfill_derives_historical_files_value_from_their_own_events(self):
         self.upload({"local_member_ref": "Dd" * 16})
         self.upload({"platform": "ios"})
@@ -254,10 +261,12 @@ class LocalMemberRefExportTests(TestCase):
         migration = import_module("forensics.migrations.0019_backfill_source_local_member_ref")
         migration.backfill_source_local_member_refs(global_apps, None)
 
-    def export_source_rows(self):
+    def export_records(self):
         group = AuditGroup.objects.get()
         response = self.client.get(reverse("api-group-export-stream", kwargs={"slug": group.slug}))
         self.assertEqual(response.status_code, 200)
         body = b"".join(response.streaming_content).decode()
-        records = [json.loads(line) for line in body.splitlines() if line]
-        return [record for record in records if record["t"] == "source"]
+        return [json.loads(line) for line in body.splitlines() if line]
+
+    def export_source_rows(self):
+        return [record for record in self.export_records() if record["t"] == "source"]

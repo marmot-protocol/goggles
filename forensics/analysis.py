@@ -70,6 +70,7 @@ EXPORT_SENSITIVITY = {
     "contains": [
         "engine_ids",
         "account_refs",
+        "member_refs",
         "group_refs",
         "message_ids",
         "payload_digests",
