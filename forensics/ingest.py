@@ -1027,6 +1027,7 @@ def body_source_metadata(parsed_lines: list[ParsedLine]) -> dict[str, str]:
         "platform": 120,
         "app_version": 120,
         "upload_trigger": 160,
+        "local_member_ref": 32,
     }
     result = {}
     for line in parsed_lines:

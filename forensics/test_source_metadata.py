@@ -1,14 +1,18 @@
 import json
 
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 
 from .analysis import timeline_engines, valid_events_for_group
 from .audit_schema import SCHEMA_VERSION
 from .ingest import ingest_audit_log_bytes
 from .models import AuditFile, AuditGroup
 from .views import engine_source_values, group_engine_rows
+
+User = get_user_model()
 
 
 class RotatedSourceMetadataTests(TestCase):
@@ -164,3 +168,61 @@ class RotatedSourceMetadataTests(TestCase):
         self.assertEqual(engine_source_values(group)["bb" * 16]["app_versions"], ["new"])
         engines, _ = timeline_engines(valid_events_for_group(group))
         self.assertEqual(engines[0]["label"], "New Model / bbbbbbbbbbbb")
+
+
+class LocalMemberRefExportTests(TestCase):
+    """A file's own source_context local_member_ref rides its t:"source" export row."""
+
+    def setUp(self):
+        user = User.objects.create_user(username="reader", password="pw")
+        self.client.force_login(user)
+
+    def test_source_row_exports_the_files_local_member_ref(self):
+        self.upload(source={"platform": "ios", "local_member_ref": "Dd" * 16})
+
+        row = self.export_source_rows()[0]
+
+        self.assertEqual(row["source_local_member_ref"], "Dd" * 16)
+        self.assertEqual(row["source_platform"], "ios")
+
+    def test_missing_local_member_ref_exports_null_and_leaves_the_row_unchanged(self):
+        self.upload(source={"platform": "ios", "app_version": "1.0"})
+        self.upload()
+
+        with_source, without_source = sorted(self.export_source_rows(), key=lambda row: row["id"])
+
+        self.assertIsNone(with_source["source_local_member_ref"])
+        self.assertEqual(with_source["source_platform"], "ios")
+        self.assertEqual(with_source["source_app_version"], "1.0")
+        self.assertIsNone(without_source["source_local_member_ref"])
+        self.assertEqual(without_source["source_platform"], "")
+
+    def upload(self, *, source=None):
+        base = {
+            "schema_version": SCHEMA_VERSION,
+            "wall_time_ms": 1700000000000,
+            "engine_id": "bb" * 16,
+            "account_ref": "aa" * 16,
+            "recorder_session_id": "session-1",
+        }
+        events = []
+        if source is not None:
+            events.append({**base, "seq": 0, "kind": {"type": "source_context", "source": source}})
+        events.append(
+            {
+                **base,
+                "seq": 1,
+                "group_ref": "dd" * 16,
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+        )
+        body = "".join(json.dumps(event) + "\n" for event in events)
+        return ingest_audit_log_bytes(dump_bytes=body.encode()).audit_file
+
+    def export_source_rows(self):
+        group = AuditGroup.objects.get()
+        response = self.client.get(reverse("api-group-export-stream", kwargs={"slug": group.slug}))
+        self.assertEqual(response.status_code, 200)
+        body = b"".join(response.streaming_content).decode()
+        records = [json.loads(line) for line in body.splitlines() if line]
+        return [record for record in records if record["t"] == "source"]

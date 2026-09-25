@@ -167,6 +167,7 @@ class AuditFile(models.Model):
     source_platform = models.CharField(max_length=120, blank=True)
     source_app_version = models.CharField(max_length=120, blank=True)
     source_upload_trigger = models.CharField(max_length=160, blank=True)
+    source_local_member_ref = models.CharField(max_length=32, blank=True)
     content_type = models.CharField(max_length=120, blank=True)
     file_sha256 = models.CharField(max_length=64)
     byte_size = models.PositiveBigIntegerField()
