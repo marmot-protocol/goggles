@@ -179,12 +179,12 @@ class LocalMemberRefExportTests(TestCase):
         user = User.objects.create_user(username="reader", password="pw")
         self.client.force_login(user)
 
-    def test_source_row_exports_the_files_local_member_ref(self):
+    def test_source_row_exports_the_files_local_member_ref_in_lowercase(self):
         self.upload({"platform": "ios", "local_member_ref": "Dd" * 16})
 
         row = self.export_source_rows()[0]
 
-        self.assertEqual(row["source_local_member_ref"], "Dd" * 16)
+        self.assertEqual(row["source_local_member_ref"], "dd" * 16)
         self.assertEqual(row["source_platform"], "ios")
 
     def test_missing_local_member_ref_exports_null_and_leaves_the_row_unchanged(self):
@@ -218,20 +218,52 @@ class LocalMemberRefExportTests(TestCase):
         self.backfill()
 
         rows = sorted(self.export_source_rows(), key=lambda row: row["id"])
-        self.assertEqual([row["source_local_member_ref"] for row in rows], ["Dd" * 16, None])
+        self.assertEqual([row["source_local_member_ref"] for row in rows], ["dd" * 16, None])
 
-    def test_backfill_and_ingest_both_take_the_first_ref_by_line_order(self):
-        audit_file = self.upload(
+    def test_backfill_and_ingest_both_leave_conflicting_refs_unknown(self):
+        repeated = self.upload(
             {"platform": "ios"},
+            {"local_member_ref": "Aa" * 16},
+            {"local_member_ref": "aa" * 16},
+        )
+        conflicting = self.upload(
             {"local_member_ref": "11" * 16},
             {"local_member_ref": "22" * 16},
         )
-        self.assertEqual(audit_file.source_local_member_ref, "11" * 16)
+        self.assertEqual(repeated.source_local_member_ref, "aa" * 16)
+        self.assertEqual(conflicting.source_local_member_ref, "")
         AuditFile.objects.update(source_local_member_ref="")
 
         self.backfill()
 
-        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "11" * 16)
+        self.assertEqual(
+            {row["id"]: row["source_local_member_ref"] for row in self.export_source_rows()},
+            {repeated.id: "aa" * 16, conflicting.id: None},
+        )
+
+    def test_backfill_leaves_untrusted_raw_refs_unknown(self):
+        def raw_source_line(ref, schema_version=SCHEMA_VERSION):
+            source = {"type": "source_context", "source": {"local_member_ref": ref}}
+            return json.dumps({"schema_version": schema_version, "kind": source}) + "\n"
+
+        over_long = self.upload({"platform": "ios"})
+        pre_v4 = self.upload({"platform": "android"})
+        invalid = self.upload({"platform": "linux"})
+        AuditFile.objects.filter(id=over_long.id).update(
+            raw_text=raw_source_line("ab" * 16 + "ffff-extra")
+        )
+        AuditFile.objects.filter(id=pre_v4.id).update(
+            raw_text=raw_source_line("ab" * 16, "marmot-forensics-audit/v3")
+        )
+        AuditFile.objects.filter(id=invalid.id).update(
+            raw_text=raw_source_line("ab" * 16), validation_status=AuditFile.STATUS_INVALID
+        )
+
+        self.backfill()
+
+        self.assertEqual(
+            list(AuditFile.objects.values_list("source_local_member_ref", flat=True)), ["", "", ""]
+        )
 
     def test_backfill_recovers_a_ref_whose_source_event_was_deduplicated(self):
         # A growing active file is re-uploaded: its leading source_context line
@@ -245,7 +277,7 @@ class LocalMemberRefExportTests(TestCase):
 
         self.assertEqual(
             {row["id"]: row["source_local_member_ref"] for row in self.export_source_rows()},
-            {first.id: "Dd" * 16, grown.id: "Dd" * 16},
+            {first.id: "dd" * 16, grown.id: "dd" * 16},
         )
 
     def test_backfill_and_ingest_both_read_an_event_context_source(self):

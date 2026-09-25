@@ -4,17 +4,19 @@
 # another segment, so the column stays an exact summary of that file. Events
 # are not a sufficient source: deduplication discards lines already stored by
 # an earlier upload, such as the leading source_context of a re-uploaded file.
-# The rule mirrors forensics.ingest.body_source_metadata: the first line whose
-# source carries a non-empty local_member_ref, truncated to the column length.
-# Migrations must not import app code, which drifts under future refactors; a
-# parity regression test keeps the two rules in step.
+# Only v4 lines of valid files are trusted. The rule mirrors
+# forensics.ingest.file_local_member_ref: refs compare lowercase, and a file
+# whose refs disagree or are malformed stays unknown. Migrations must not
+# import app code, which drifts under future refactors; parity regression tests
+# keep the two rules in step.
 
 import json
+import re
 
 from django.db import migrations
 
-FILE_BATCH_SIZE = 500
-LOCAL_MEMBER_REF_MAX_LENGTH = 32
+SCHEMA_VERSION = "marmot-forensics-audit/v4"
+LOCAL_MEMBER_REF_PATTERN = re.compile(r"[0-9a-f]{32}")
 
 
 def line_source(event):
@@ -26,42 +28,45 @@ def line_source(event):
     return source if isinstance(source, dict) else {}
 
 
-def first_local_member_ref(raw_text):
+def raw_sources(raw_text):
     for raw_line in raw_text.split("\n"):
         try:
             event = json.loads(raw_line)
         except ValueError:
             continue
-        if not isinstance(event, dict):
-            continue
-        ref = line_source(event).get("local_member_ref")
-        if isinstance(ref, str) and ref:
-            return ref[:LOCAL_MEMBER_REF_MAX_LENGTH]
-    return ""
+        if isinstance(event, dict) and event.get("schema_version") == SCHEMA_VERSION:
+            yield line_source(event)
+
+
+def file_local_member_ref(sources):
+    refs = {str(source.get("local_member_ref") or "").lower() for source in sources} - {""}
+    ref = refs.pop() if len(refs) == 1 else ""
+    return ref if LOCAL_MEMBER_REF_PATTERN.fullmatch(ref) else ""
 
 
 def backfill_source_local_member_refs(apps, _schema_editor):
     AuditFile = apps.get_model("forensics", "AuditFile")
 
-    files = AuditFile.objects.filter(
-        source_local_member_ref="",
-        raw_text__contains="local_member_ref",
-    ).values_list("id", "raw_text")
-    updates = []
+    # Collect ids first rather than update the table while iterating it.
+    file_ids = list(
+        AuditFile.objects.filter(
+            validation_status="valid",
+            source_local_member_ref="",
+            raw_text__contains="local_member_ref",
+        ).values_list("id", flat=True)
+    )
     # Uploads reach 64 MiB, so hold one raw body at a time.
-    for file_id, raw_text in files.iterator(chunk_size=1):
-        ref = first_local_member_ref(raw_text)
-        if not ref:
-            continue
-        updates.append(AuditFile(id=file_id, source_local_member_ref=ref))
-        if len(updates) == FILE_BATCH_SIZE:
-            AuditFile.objects.bulk_update(updates, ["source_local_member_ref"])
-            updates = []
-    if updates:
-        AuditFile.objects.bulk_update(updates, ["source_local_member_ref"])
+    for file_id in file_ids:
+        raw_text = AuditFile.objects.values_list("raw_text", flat=True).get(id=file_id)
+        ref = file_local_member_ref(raw_sources(raw_text))
+        if ref:
+            AuditFile.objects.filter(id=file_id).update(source_local_member_ref=ref)
 
 
 class Migration(migrations.Migration):
+    # Each update commits on its own; the backfill is idempotent if interrupted.
+    atomic = False
+
     dependencies = [
         ("forensics", "0018_auditfile_source_local_member_ref"),
     ]
