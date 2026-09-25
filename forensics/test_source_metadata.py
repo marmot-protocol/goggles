@@ -280,6 +280,27 @@ class LocalMemberRefExportTests(TestCase):
             {first.id: "dd" * 16, grown.id: "dd" * 16},
         )
 
+    def test_backfill_and_ingest_both_decode_an_escaped_key(self):
+        body = json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "seq": 0,
+                "wall_time_ms": 1700000000000,
+                "engine_id": "bb" * 16,
+                "account_ref": "aa" * 16,
+                "group_ref": "dd" * 16,
+                "context": {"source": {"local_member_ref": "44" * 16}},
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+        ).replace("local_member_ref", "local_\\u006dember_ref")
+        audit_file = ingest_audit_log_bytes(dump_bytes=f"{body}\n".encode()).audit_file
+        self.assertEqual(audit_file.source_local_member_ref, "44" * 16)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "44" * 16)
+
     def test_backfill_and_ingest_both_read_an_event_context_source(self):
         body = json.dumps(
             {

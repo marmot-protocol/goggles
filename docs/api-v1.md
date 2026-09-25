@@ -163,11 +163,11 @@ file's own body: `source_hardware_model`, `source_device_id`, `source_platform`,
 `source.local_member_ref`, a pseudonymous producer member reference (32
 lowercase hex characters; the schema also accepts `A-F`, so Goggles lowercases
 it). It is not an account ref or public key and does not prove membership. It
-is a scalar because a v4 file is rejected unless it has a single engine and a
-single account, so one source row speaks for exactly one engine and its ref
-never changes within the file. Repeats of one value are fine; a file whose
-refs disagree exports `null` rather than guess. `null` means unknown: the file
-carried no single valid value. It never means the value was removed, and it is
+is one scalar result per file: a v4 file is rejected unless it has a single
+engine and a single account, so one source row speaks for exactly one engine.
+The file may still carry conflicting refs; repeats of one value are fine, but
+a file whose refs disagree exports `null` rather than guess. `null` means
+unknown: the file carried no single valid value. It never means the value was removed, and it is
 not resolved from other segments. The
 agent-state export's `sources[]` uses the same row shape, and upload responses
 include `local_member_ref` in `source` when present. Adding the field kept

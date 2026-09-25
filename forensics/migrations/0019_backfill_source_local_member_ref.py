@@ -52,7 +52,6 @@ def backfill_source_local_member_refs(apps, _schema_editor):
         AuditFile.objects.filter(
             validation_status="valid",
             source_local_member_ref="",
-            raw_text__contains="local_member_ref",
         ).values_list("id", flat=True)
     )
     # Uploads reach 64 MiB, so hold one raw body at a time.

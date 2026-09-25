@@ -24,8 +24,8 @@ as ingest (lowercase; disagreeing or malformed refs stay unknown), so existing
 evidence exports it without re-upload. It reads raw text rather than events
 because deduplication drops lines an earlier upload already stored, such as a
 re-uploaded file's leading `source_context`. Only v4 lines of valid files are
-trusted. Finding candidates is an unindexed substring scan of every retained raw
-body; matches are then loaded one at a time. The migration is non-atomic: each
+trusted. Every valid file still blank is parsed in full, one raw body at a
+time, so the migration's cost grows with retained evidence. The migration is non-atomic: each
 file's update commits on its own, and re-running resumes safely. It has a no-op
 reverse. Files without a single valid value stay blank and export `null`
 (unknown).
