@@ -34,6 +34,7 @@ PEELER_OUTCOMES = {
 V4_PEELER_OUTCOMES = PEELER_OUTCOMES | {"invalid_signature", "wrong_recipient"}
 SAFE_ONLY_AUDIT_DATA_MODE = "safe_only"
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+LOCAL_MEMBER_REF_PATTERN = re.compile(r"[0-9a-f]{32}")
 
 # Upper bound for hex message identifiers (``msg_id``, ``outbound_msg_id``,
 # ``invalidated_msg_id``). ``AuditEvent.msg_id`` is an unbounded ``TextField``
@@ -1029,12 +1030,21 @@ def body_source_metadata(parsed_lines: list[ParsedLine]) -> dict[str, str]:
         "upload_trigger": 160,
     }
     result = {}
-    for line in parsed_lines:
-        source = line.normalized.get("context_source", {})
+    sources = [line.normalized.get("context_source", {}) for line in parsed_lines]
+    for source in sources:
         for key, limit in fields.items():
             if source.get(key):
                 result.setdefault("source_" + key, source[key][:limit])
+    result["source_local_member_ref"] = file_local_member_ref(sources)
     return result
+
+
+def file_local_member_ref(sources: list[dict[str, Any]]) -> str:
+    """One file speaks for one member: disagreeing or malformed refs stay unknown."""
+    # Migration 0019 mirrors this rule; keep the two in step.
+    refs = {str(source.get("local_member_ref") or "").lower() for source in sources} - {""}
+    ref = refs.pop() if len(refs) == 1 else ""
+    return ref if LOCAL_MEMBER_REF_PATTERN.fullmatch(ref) else ""
 
 
 def has_inconsistent_identity(parsed_lines: list[ParsedLine]) -> bool:

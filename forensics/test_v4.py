@@ -232,7 +232,9 @@ class V4BoundaryTests(TestCase):
         for multipart in (False, True):
             event = self.event(seq=int(multipart))
             event["kind"]["source"]["local_member_ref"] = "dd" * 16
-            self.assertEqual(self.post(event, multipart=multipart).status_code, 201)
+            response = self.post(event, multipart=multipart)
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(response.json()["source"]["local_member_ref"], "dd" * 16)
             stored = AuditEvent.objects.latest("id")
             self.assertEqual(stored.context_source["local_member_ref"], "dd" * 16)
             self.assertEqual(stored.account_ref, "aa" * 16)
@@ -498,12 +500,13 @@ class V4BoundaryTests(TestCase):
 
 class V4MigrationTests(TransactionTestCase):
     def test_upgrade_removes_metadata_without_implicitly_purging_evidence_or_credentials(self):
-        latest = ("forensics", "0015_remove_auditfile_source_account_label_and_more")
         previous = ("forensics", "0014_uploadrejection")
         user = User.objects.create_user("migration-user")
         raw_token, token = UploadToken.issue("migration-client")
         raw_pat, _ = PersonalAccessToken.issue("migration-reader", user=user)
         executor = MigrationExecutor(connection)
+        # Return to the real leaf: later migrations may add columns the ORM needs.
+        latest = executor.loader.graph.leaf_nodes("forensics")
         executor.migrate([previous])
         try:
             old_apps = executor.loader.project_state([previous]).apps
@@ -526,7 +529,7 @@ class V4MigrationTests(TransactionTestCase):
                 user_agent="PROHIBITED",
             )
         finally:
-            MigrationExecutor(connection).migrate([latest])
+            MigrationExecutor(connection).migrate(latest)
         self.assertEqual(AuditFile.objects.get(pk=old.pk).raw_text, raw)
         self.assertNotIn(
             "PROHIBITED", json.dumps(list(UploadRejection.objects.values()), default=str)

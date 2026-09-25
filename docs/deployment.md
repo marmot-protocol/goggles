@@ -18,6 +18,18 @@ without rewriting uploads or rebuilding projections. Missing session IDs or
 deleted/unuploaded source segments remain unknown. File-level metadata remains
 an exact summary of that file rather than an inferred copy from another segment.
 
+Migration 0018 adds `AuditFile.source_local_member_ref`. Migration 0019 fills
+it for existing files from each file's own retained raw text with the same rule
+as ingest (lowercase; disagreeing or malformed refs stay unknown), so existing
+evidence exports it without re-upload. It reads raw text rather than events
+because deduplication drops lines an earlier upload already stored, such as a
+re-uploaded file's leading `source_context`. Only v4 lines of valid files are
+trusted. Every valid file still blank is parsed in full, one raw body at a
+time, so the migration's cost grows with retained evidence. The migration is non-atomic: each
+file's update commits on its own, and re-running resumes safely. It has a no-op
+reverse. Files without a single valid value stay blank and export `null`
+(unknown).
+
 ## Audit Evidence Retention
 
 Audit uploads and their events use one retention window, defaulting to **30 days

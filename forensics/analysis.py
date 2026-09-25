@@ -70,6 +70,7 @@ EXPORT_SENSITIVITY = {
     "contains": [
         "engine_ids",
         "account_refs",
+        "member_refs",
         "group_refs",
         "message_ids",
         "payload_digests",
@@ -1053,6 +1054,8 @@ def agent_source_row(audit_file):
         "source_device_id": audit_file.source_device_id,
         "source_platform": audit_file.source_platform,
         "source_app_version": audit_file.source_app_version,
+        # Pseudonymous producer member ref; blank means unknown, never removed.
+        "source_local_member_ref": audit_file.source_local_member_ref or None,
         "validation_status": audit_file.validation_status,
         "validation_error": audit_file.validation_error,
         "total_line_count": audit_file.total_line_count,

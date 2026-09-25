@@ -3584,7 +3584,14 @@ def record_upload_rejection(
 def source_response(audit_file: AuditFile) -> dict[str, str]:
     return {
         key: getattr(audit_file, "source_" + key)
-        for key in ("platform", "hardware_model", "app_version", "device_id", "upload_trigger")
+        for key in (
+            "platform",
+            "hardware_model",
+            "app_version",
+            "device_id",
+            "upload_trigger",
+            "local_member_ref",
+        )
         if getattr(audit_file, "source_" + key)
     }
 

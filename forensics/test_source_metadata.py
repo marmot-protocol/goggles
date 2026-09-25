@@ -1,14 +1,20 @@
 import json
+from importlib import import_module
 
+from django.apps import apps as global_apps
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 
 from .analysis import timeline_engines, valid_events_for_group
 from .audit_schema import SCHEMA_VERSION
 from .ingest import ingest_audit_log_bytes
 from .models import AuditFile, AuditGroup
 from .views import engine_source_values, group_engine_rows
+
+User = get_user_model()
 
 
 class RotatedSourceMetadataTests(TestCase):
@@ -164,3 +170,193 @@ class RotatedSourceMetadataTests(TestCase):
         self.assertEqual(engine_source_values(group)["bb" * 16]["app_versions"], ["new"])
         engines, _ = timeline_engines(valid_events_for_group(group))
         self.assertEqual(engines[0]["label"], "New Model / bbbbbbbbbbbb")
+
+
+class LocalMemberRefExportTests(TestCase):
+    """A file's own source_context local_member_ref rides its t:"source" export row."""
+
+    def setUp(self):
+        user = User.objects.create_user(username="reader", password="pw")
+        self.client.force_login(user)
+
+    def test_source_row_exports_the_files_local_member_ref_in_lowercase(self):
+        self.upload({"platform": "ios", "local_member_ref": "Dd" * 16})
+
+        row = self.export_source_rows()[0]
+
+        self.assertEqual(row["source_local_member_ref"], "dd" * 16)
+        self.assertEqual(row["source_platform"], "ios")
+
+    def test_missing_local_member_ref_exports_null_and_leaves_the_row_unchanged(self):
+        self.upload({"platform": "ios", "app_version": "1.0"})
+        self.upload()
+
+        with_source, without_source = sorted(self.export_source_rows(), key=lambda row: row["id"])
+
+        self.assertIsNone(with_source["source_local_member_ref"])
+        self.assertEqual(with_source["source_platform"], "ios")
+        self.assertEqual(with_source["source_app_version"], "1.0")
+        self.assertIsNone(without_source["source_local_member_ref"])
+        self.assertEqual(without_source["source_platform"], "")
+
+    def test_manifest_declares_member_refs_as_sensitive_export_content(self):
+        self.upload({"local_member_ref": "Dd" * 16})
+
+        manifest = self.export_records()[0]
+
+        self.assertIn("member_refs", manifest["sensitivity"]["contains"])
+
+    def test_backfill_derives_historical_files_value_from_their_own_events(self):
+        self.upload({"local_member_ref": "Dd" * 16})
+        self.upload({"platform": "ios"})
+        # Simulate a file ingested before the column existed.
+        AuditFile.objects.update(source_local_member_ref="")
+        self.assertEqual(
+            [row["source_local_member_ref"] for row in self.export_source_rows()], [None, None]
+        )
+
+        self.backfill()
+
+        rows = sorted(self.export_source_rows(), key=lambda row: row["id"])
+        self.assertEqual([row["source_local_member_ref"] for row in rows], ["dd" * 16, None])
+
+    def test_backfill_and_ingest_both_leave_conflicting_refs_unknown(self):
+        repeated = self.upload(
+            {"platform": "ios"},
+            {"local_member_ref": "Aa" * 16},
+            {"local_member_ref": "aa" * 16},
+        )
+        conflicting = self.upload(
+            {"local_member_ref": "11" * 16},
+            {"local_member_ref": "22" * 16},
+        )
+        self.assertEqual(repeated.source_local_member_ref, "aa" * 16)
+        self.assertEqual(conflicting.source_local_member_ref, "")
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(
+            {row["id"]: row["source_local_member_ref"] for row in self.export_source_rows()},
+            {repeated.id: "aa" * 16, conflicting.id: None},
+        )
+
+    def test_backfill_leaves_untrusted_raw_refs_unknown(self):
+        def raw_source_line(ref, schema_version=SCHEMA_VERSION):
+            source = {"type": "source_context", "source": {"local_member_ref": ref}}
+            return json.dumps({"schema_version": schema_version, "kind": source}) + "\n"
+
+        over_long = self.upload({"platform": "ios"})
+        pre_v4 = self.upload({"platform": "android"})
+        invalid = self.upload({"platform": "linux"})
+        AuditFile.objects.filter(id=over_long.id).update(
+            raw_text=raw_source_line("ab" * 16 + "ffff-extra")
+        )
+        AuditFile.objects.filter(id=pre_v4.id).update(
+            raw_text=raw_source_line("ab" * 16, "marmot-forensics-audit/v3")
+        )
+        AuditFile.objects.filter(id=invalid.id).update(
+            raw_text=raw_source_line("ab" * 16), validation_status=AuditFile.STATUS_INVALID
+        )
+
+        self.backfill()
+
+        self.assertEqual(
+            list(AuditFile.objects.values_list("source_local_member_ref", flat=True)), ["", "", ""]
+        )
+
+    def test_backfill_recovers_a_ref_whose_source_event_was_deduplicated(self):
+        # A growing active file is re-uploaded: its leading source_context line
+        # duplicates the earlier upload's, so no event is stored for it.
+        first = self.upload({"local_member_ref": "Dd" * 16}, group_rows=1)
+        grown = self.upload({"local_member_ref": "Dd" * 16}, group_rows=2)
+        self.assertEqual(grown.duplicate_event_count, 2)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(
+            {row["id"]: row["source_local_member_ref"] for row in self.export_source_rows()},
+            {first.id: "dd" * 16, grown.id: "dd" * 16},
+        )
+
+    def test_backfill_and_ingest_both_decode_an_escaped_key(self):
+        body = json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "seq": 0,
+                "wall_time_ms": 1700000000000,
+                "engine_id": "bb" * 16,
+                "account_ref": "aa" * 16,
+                "group_ref": "dd" * 16,
+                "context": {"source": {"local_member_ref": "44" * 16}},
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+        ).replace("local_member_ref", "local_\\u006dember_ref")
+        audit_file = ingest_audit_log_bytes(dump_bytes=f"{body}\n".encode()).audit_file
+        self.assertEqual(audit_file.source_local_member_ref, "44" * 16)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "44" * 16)
+
+    def test_backfill_and_ingest_both_read_an_event_context_source(self):
+        body = json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "seq": 0,
+                "wall_time_ms": 1700000000000,
+                "engine_id": "bb" * 16,
+                "account_ref": "aa" * 16,
+                "group_ref": "dd" * 16,
+                "context": {"source": {"local_member_ref": "33" * 16}},
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+        )
+        audit_file = ingest_audit_log_bytes(dump_bytes=f"{body}\n".encode()).audit_file
+        self.assertEqual(audit_file.source_local_member_ref, "33" * 16)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "33" * 16)
+
+    def upload(self, *sources, group_rows=1):
+        base = {
+            "schema_version": SCHEMA_VERSION,
+            "wall_time_ms": 1700000000000,
+            "engine_id": "bb" * 16,
+            "account_ref": "aa" * 16,
+            "recorder_session_id": "session-1",
+        }
+        events = [
+            {**base, "seq": seq, "kind": {"type": "source_context", "source": source}}
+            for seq, source in enumerate(sources)
+        ]
+        events.extend(
+            {
+                **base,
+                "seq": seq,
+                "group_ref": "dd" * 16,
+                "kind": {"type": "recorder_started", "recorder": "synthetic"},
+            }
+            for seq in range(len(sources), len(sources) + group_rows)
+        )
+        body = "".join(json.dumps(event) + "\n" for event in events)
+        return ingest_audit_log_bytes(dump_bytes=body.encode()).audit_file
+
+    @staticmethod
+    def backfill():
+        migration = import_module("forensics.migrations.0019_backfill_source_local_member_ref")
+        migration.backfill_source_local_member_refs(global_apps, None)
+
+    def export_records(self):
+        group = AuditGroup.objects.get()
+        response = self.client.get(reverse("api-group-export-stream", kwargs={"slug": group.slug}))
+        self.assertEqual(response.status_code, 200)
+        body = b"".join(response.streaming_content).decode()
+        return [json.loads(line) for line in body.splitlines() if line]
+
+    def export_source_rows(self):
+        return [record for record in self.export_records() if record["t"] == "source"]
