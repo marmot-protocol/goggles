@@ -1,5 +1,7 @@
 import json
+from importlib import import_module
 
+from django.apps import apps as global_apps
 from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase
@@ -178,7 +180,7 @@ class LocalMemberRefExportTests(TestCase):
         self.client.force_login(user)
 
     def test_source_row_exports_the_files_local_member_ref(self):
-        self.upload(source={"platform": "ios", "local_member_ref": "Dd" * 16})
+        self.upload({"platform": "ios", "local_member_ref": "Dd" * 16})
 
         row = self.export_source_rows()[0]
 
@@ -186,7 +188,7 @@ class LocalMemberRefExportTests(TestCase):
         self.assertEqual(row["source_platform"], "ios")
 
     def test_missing_local_member_ref_exports_null_and_leaves_the_row_unchanged(self):
-        self.upload(source={"platform": "ios", "app_version": "1.0"})
+        self.upload({"platform": "ios", "app_version": "1.0"})
         self.upload()
 
         with_source, without_source = sorted(self.export_source_rows(), key=lambda row: row["id"])
@@ -197,7 +199,34 @@ class LocalMemberRefExportTests(TestCase):
         self.assertIsNone(without_source["source_local_member_ref"])
         self.assertEqual(without_source["source_platform"], "")
 
-    def upload(self, *, source=None):
+    def test_backfill_derives_historical_files_value_from_their_own_events(self):
+        self.upload({"local_member_ref": "Dd" * 16})
+        self.upload({"platform": "ios"})
+        # Simulate a file ingested before the column existed.
+        AuditFile.objects.update(source_local_member_ref="")
+        self.assertEqual(
+            [row["source_local_member_ref"] for row in self.export_source_rows()], [None, None]
+        )
+
+        self.backfill()
+
+        rows = sorted(self.export_source_rows(), key=lambda row: row["id"])
+        self.assertEqual([row["source_local_member_ref"] for row in rows], ["Dd" * 16, None])
+
+    def test_backfill_and_ingest_both_take_the_first_ref_by_line_order(self):
+        audit_file = self.upload(
+            {"platform": "ios"},
+            {"local_member_ref": "11" * 16},
+            {"local_member_ref": "22" * 16},
+        )
+        self.assertEqual(audit_file.source_local_member_ref, "11" * 16)
+        AuditFile.objects.update(source_local_member_ref="")
+
+        self.backfill()
+
+        self.assertEqual(self.export_source_rows()[0]["source_local_member_ref"], "11" * 16)
+
+    def upload(self, *sources):
         base = {
             "schema_version": SCHEMA_VERSION,
             "wall_time_ms": 1700000000000,
@@ -205,19 +234,25 @@ class LocalMemberRefExportTests(TestCase):
             "account_ref": "aa" * 16,
             "recorder_session_id": "session-1",
         }
-        events = []
-        if source is not None:
-            events.append({**base, "seq": 0, "kind": {"type": "source_context", "source": source}})
+        events = [
+            {**base, "seq": seq, "kind": {"type": "source_context", "source": source}}
+            for seq, source in enumerate(sources)
+        ]
         events.append(
             {
                 **base,
-                "seq": 1,
+                "seq": len(sources),
                 "group_ref": "dd" * 16,
                 "kind": {"type": "recorder_started", "recorder": "synthetic"},
             }
         )
         body = "".join(json.dumps(event) + "\n" for event in events)
         return ingest_audit_log_bytes(dump_bytes=body.encode()).audit_file
+
+    @staticmethod
+    def backfill():
+        migration = import_module("forensics.migrations.0019_backfill_source_local_member_ref")
+        migration.backfill_source_local_member_refs(global_apps, None)
 
     def export_source_rows(self):
         group = AuditGroup.objects.get()
