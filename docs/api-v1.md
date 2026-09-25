@@ -157,6 +157,19 @@ Line schema:
 {"t":"eof","complete":true,"counts":{"event":N, …}}
 ```
 
+`source` records describe one audit file with the fields validated from that
+file's own body: `source_hardware_model`, `source_device_id`, `source_platform`,
+`source_app_version` and `source_local_member_ref`. The last is MDK's
+`source.local_member_ref`, a pseudonymous producer member reference (32 hex
+characters, stored verbatim). It is not an account ref or public key and does
+not prove membership. It is a scalar because a v4 file is rejected unless it
+has a single engine and a single account, so one source row speaks for exactly
+one engine. `null` means unknown: the file carried no such value. It never
+means the value was removed, and it is not resolved from other segments. The
+agent-state export's `sources[]` uses the same row shape, and upload responses
+include `local_member_ref` in `source` when present. Adding the field kept
+`goggles-group-export/v1`.
+
 `event` records use the agent-state export shape; projection records use the
 projection-API shape — the export is a tagged union of the two, discriminated by the
 leading `t` on every line. Derived aggregates (`timeline`, `messages`, `actions`,
@@ -364,4 +377,5 @@ Historical `AuditFile.source_name`, `source_ip` and `user_agent` columns remain
 read-only until the separately approved audit-data purge. New uploads do not
 consume these values. Existing v1–v3 `context_source` public keys remain available
 only to internal legacy delivery matching until that purge; no new upload can
-recreate them, and v4 exports gain no public-key source fields.
+recreate them, and v4 exports gain no public-key source fields;
+`source_local_member_ref` is a pseudonymous member reference, not a public key.

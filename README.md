@@ -98,7 +98,9 @@ unknown. File metadata and raw evidence continue to describe that file alone.
 
 The v4 schema includes MDK's optional `source.local_member_ref`, a pseudonymous
 producer-to-member reference. It is preserved as source evidence, not substituted
-for `account_ref` or treated as proof of membership.
+for `account_ref` or treated as proof of membership. Each file's own first
+value is exported as `source_local_member_ref` on its group-export source row
+(`null` when the file carries none).
 
 HTTP 400 rejections return a fixed operational error code and optional line
 number. They never echo values, unknown field names or JSON fragments. The
